@@ -1,0 +1,16 @@
+[build]
+target = "index.html"
+dist = "dist"
+# `index.html` has its own ES module that imports `./quoin_web.js` by name. Trunk's default
+# `filehash = true` renames that file to `quoin_web-<hash>.js`, so the import 404s and the
+# page never starts. Keep the name stable; the wasm payload itself is still content-hashed
+# by wasm-bindgen when the JS glue asks for it.
+filehash = false
+# Trunk's injected initializer would call `init()` but cannot construct `WebHandle` or call
+# `start(canvas)`. One owner of the lifecycle is enough, and that owner is the module below:
+# it calls `init()` itself, reports failures, and tears the runner down on `pagehide`.
+inject_scripts = false
+
+[serve]
+address = "127.0.0.1"
+port = 8080

@@ -1,0 +1,44 @@
+# What a checkout must never pick up: build output, plus the third-party and proprietary material
+# this project talks about but does not ship.
+#
+# Rules that describe one developer's own scratch directories are deliberately **not** here. They
+# live in `.git/info/exclude`, which is per-clone and never committed: a reader of this repository
+# has no use for them, and a diff of them teaches nothing.
+
+# Build output. `/target` covers the whole workspace (root crate + libretro core),
+# so it is anchored to the root. The Web crate is outside the workspace and keeps
+# its own target directory, so it needs naming.
+/target
+/platform/web/target
+
+# Game packs, and the font containers built from a face a run is pointed at. Someone else's licensed
+# work, and the one category that must never reach the history even by accident.
+*.mod
+*.bbf
+/fonts/
+
+# A third-party font family kept on disk for experiments. No code, script or build target in this
+# tree references it, so it is dead weight rather than a dependency.
+/assets/fonts/
+
+# A locally extracted FFmpeg development package for the optional feature: a build input, not source.
+/ffmpeg-lib/
+
+# Runtime data written beside the executable (saves, manager state).
+/data/
+
+# Release archives from `build.ps1 -Package`: output, not source.
+/dist/
+
+# The maintainer's ABI tooling, and the SDK trees plus the extracted spec it reads. The tables it
+# produces are committed; none of the inputs are, and must not be.
+# The directories do not exist in a checkout; these rules are here for the day somebody copies one in.
+/tools/
+/SDK/
+/NEW_SDK/
+/spec/
+
+# Python bytecode from that tooling, and verbose run captures: both are regenerated or kept on disk,
+# never reviewed.
+__pycache__/
+/*.log

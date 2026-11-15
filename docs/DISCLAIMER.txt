@@ -1,0 +1,232 @@
+QUOINHLE DISCLAIMER AND ACCEPTABLE USE STATEMENT
+Version: 1.0
+
+IMPORTANT NOTICE
+
+This document is a usage and risk notice for the project. The rules governing
+emulators, reverse engineering, copyright, trademarks, patents, technical
+protection measures and software licenses differ between jurisdictions and may
+change over time. If you need to determine whether a particular act is lawful,
+consult a qualified lawyer in your jurisdiction.
+
+1. DEFINITIONS
+
+1.1 "Project" means QuoinHLE and its source code, documentation, build
+    products, release packages and related materials.
+
+1.2 "Rights Holder" means any copyright owner, trademark owner, patent owner,
+    licensor or other holder of rights in games, software, firmware, SDKs,
+    music, images, fonts, trademarks, patents or other legally protected
+    subject matter.
+
+1.3 "User" means any natural person, legal entity or other organization that
+    downloads, copies, compiles, runs, modifies, distributes or otherwise uses
+    the Project.
+
+1.4 "Game Data" means game software, ROMs, module files, resource packages,
+    saved data, firmware, system images, keys, signing materials and any other
+    content protected by copyright or other rights.
+
+2. NATURE OF THE PROJECT AND RELATIONSHIP TO RIGHTS HOLDERS
+
+2.1 QuoinHLE is an experimental project. It has not been formally released.
+
+2.2 The Project is not an official product of Qualcomm, Motorola, any game
+    publisher, device manufacturer or any other Rights Holder, and it is not
+    affiliated with, authorized by, sponsored by, certified by or endorsed by
+    any of them.
+
+2.3 The Project does not claim any authorization from any Rights Holder. Company
+    names, product names, game names, device names, trademarks and registered
+    trademarks appearing in the Project are used only for identification,
+    description, interoperability discussion or commentary and remain the
+    property of their respective owners. Such use does not assert any right in
+    any trademark, trade name or brand.
+
+2.4 The purpose of the Project is interoperability and compatibility research.
+    It is not intended to provide, promote or assist in obtaining unauthorized
+    games, firmware, system images or other copyrighted materials.
+
+3. NO COPYRIGHTED MATERIALS PROVIDED
+
+3.1 The Project repository does not contain commercial games, game ROMs, game
+    assets, firmware, system images, device keys, private signing keys,
+    authorization-server credentials or tools for circumventing authorization
+    or encryption.
+
+3.2 The Project is not intended to provide means for circumventing digital
+    rights management (DRM), signature verification, authorization servers,
+    device binding or other access controls, and it does not contain such tools
+    or instructions.
+
+3.3 The repository may contain public interface declarations, ABI constants,
+    compatibility notes and documentation for interoperability purposes. Those
+    materials describe interfaces and compatible behavior; they do not grant
+    any license to any original SDK, firmware or game code and do not grant any
+    right to use third-party software.
+
+3.4 To run a game or application, the User must provide software and data
+    obtained lawfully and must ensure that the User has the right to copy, run,
+    modify or otherwise use that content.
+
+4. USER'S LAWFUL USE OBLIGATIONS
+
+The User must independently verify and ensure that:
+
+4.1 Any games, firmware, SDKs, system images, ROMs, music, images, fonts and
+    other materials the User obtains were obtained lawfully, and that the
+    User's use is permitted by the Rights Holder or by law.
+
+4.2 The User's use, copying, modification, compilation, distribution,
+    commercial exploitation or provision of network services complies with
+    applicable law, software licenses, platform terms and device or service
+    contracts.
+
+4.3 The User does not use the Project to obtain, copy, distribute, sell or
+    assist in distributing unauthorized games, ROMs, firmware, keys or other
+    copyrighted materials.
+
+4.4 The User does not use the Project to circumvent DRM, signature
+    verification, authorization servers, device binding or other technical
+    measures, and does not assist others in doing so.
+
+4.5 The User does not use the Project as a tool to infringe copyright,
+    trademark rights, patent rights, trade secrets, engage in unfair
+    competition or commit any other unlawful act.
+
+5. PROHIBITED USES
+
+To the maximum extent permitted by applicable law, the Project must not be used
+for:
+
+5.1 piracy, unauthorized copying, distribution, sale or rental of games, ROMs,
+    firmware or system images;
+5.2 cracking, bypassing or circumventing DRM, signatures, authorization,
+    device binding or other technical measures;
+5.3 distributing keys, serial numbers, cracks, authorization-server emulators
+    or similar materials;
+5.4 infringing copyright, trademark rights, patent rights, trade secrets or
+    other rights;
+5.5 inducing, assisting or facilitating any of the foregoing; or
+5.6 any act that violates applicable law, regulations or public order.
+
+6. USER CONDUCT IS INDEPENDENT OF THE PROJECT
+
+6.1 The Project provides only software, documentation and build materials. It
+    does not participate in, control, direct or endorse any specific conduct of
+    any User.
+
+6.2 All conduct of the User in downloading, installing, copying, compiling,
+    running, modifying, distributing, commercially exploiting, connecting to
+    networks, obtaining or using games, firmware, resources and other materials
+    is independently decided by the User and is the User's sole responsibility.
+    To the maximum extent permitted by applicable law, such conduct and its
+    consequences are unrelated to the authors, contributors, maintainers and
+    distributors of the Project.
+
+6.3 The Project does not become, by reason of any User's use, a joint actor,
+    agent, employer, partner or guarantor of the User, and does not grant any
+    authorization, license or endorsement from any Rights Holder.
+
+6.4 This section does not exclude or limit any liability that cannot be
+    excluded or limited by law, and does not affect the right of any Rights
+    Holder or authority to assert rights or take action under applicable law.
+
+7. NO WARRANTY
+
+The Project is provided "AS IS" and "AS AVAILABLE." To the maximum extent
+permitted by applicable law, the authors, contributors, maintainers and
+distributors make no express or implied warranty regarding the Project,
+including but not limited to:
+
+7.1 merchantability;
+7.2 fitness for a particular purpose;
+7.3 non-infringement;
+7.4 accuracy, completeness or reliability;
+7.5 freedom from errors, interruptions or timely repair;
+7.6 compatibility with any game, firmware, device, operating system, audio
+    device or third-party service; or
+7.7 data security or freedom from data loss.
+
+The Project may contain errors, incomplete features, performance problems,
+compatibility defects, risks of data corruption or security issues. The User
+should back up data and evaluate the risks in an isolated environment.
+
+8. LIMITATION OF LIABILITY
+
+To the maximum extent permitted by applicable law, the authors, contributors,
+maintainers, distributors and their affiliates of the Project are not liable for
+any direct, indirect, incidental, special, punitive or consequential damages
+arising from the use of, or inability to use, the Project, including but not
+limited to:
+
+8.1 data loss, save corruption, loss of configuration or business interruption;
+8.2 damage to devices, systems, software, hardware or storage media;
+8.3 loss of profits, goodwill or opportunity;
+8.4 legal disputes, administrative penalties, claims, litigation costs or
+    third-party rights claims;
+8.5 liability arising from the use of third-party games, firmware, SDKs,
+    resources, services or networks; or
+8.6 liability arising from the User's violation of law, license terms or
+    third-party rights.
+
+This section does not exclude or limit liability that cannot be excluded or
+limited by law. If a jurisdiction does not allow the exclusion of certain
+implied warranties or the limitation of certain damages, this section applies
+to the maximum extent permitted by law in that jurisdiction.
+
+9. RELATIONSHIP TO THE LICENSE
+
+9.1 The Project is released under the GNU General Public License, version 2 or
+    later (GPL-2.0-or-later). Its SPDX identifier is GPL-2.0-or-later.
+
+9.2 This disclaimer is a risk notice and usage statement. It does not modify,
+    replace or restrict the rights granted by GPL-2.0-or-later, and it does not
+    impose additional restrictions on software licensed under the GPL.
+
+9.3 If this statement conflicts with the terms of GPL-2.0-or-later,
+    GPL-2.0-or-later controls. This statement is not an additional license
+    condition and is not an amendment to the GPL.
+
+9.4 Third-party crates, audio libraries, graphics libraries, fonts, SoundFonts,
+    device interfaces and other components used by the Project are governed by
+    their respective licenses and terms. A User distributing the Project or a
+    derivative work must also comply with those third-party licenses and satisfy
+    the corresponding GPL source-code obligations.
+
+10. THIRD-PARTY MATERIALS AND NOTICE TO RIGHTS HOLDERS
+
+10.1 The Project may mention or link to third-party projects, documentation,
+     tools, game names or interface descriptions. Such references do not grant
+     the Project any rights in third-party materials and do not mean that a
+     third party authorizes or endorses the Project.
+
+10.2 If a Rights Holder believes that any material in the Project infringes its
+     rights, it may contact the Project through the public contact channel of the
+     repository and provide the basis of the claim, the specific material, its
+     location and contact information. The maintainers will review the matter
+     within a reasonable scope and take appropriate measures, including
+     correction, removal or discontinuation of distribution of the relevant
+     material.
+
+10.3 This section does not affect the right of any Rights Holder to pursue other
+     remedies available under applicable law.
+
+11. SEVERABILITY AND ENTIRE STATEMENT
+
+11.1 If any provision of this statement is held invalid, unlawful or
+     unenforceable by a court or competent authority of competent jurisdiction,
+     that provision shall be adjusted or removed to the minimum extent necessary,
+     and the remaining provisions shall remain in effect.
+
+11.2 This statement, together with the Project license, third-party licenses and
+     applicable law, constitutes the complete statement regarding use of the
+     Project. This statement does not guarantee the lawfulness, infringement
+     risk or legal liability of any particular use.
+
+12. EFFECTIVENESS AND ACCEPTANCE
+
+By downloading, copying, compiling, running, modifying, distributing or
+otherwise using the Project, you are deemed to have read and understood this
+statement. If you do not agree with any part of this statement, do not use,
+copy, distribute or otherwise exploit the Project.

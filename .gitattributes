@@ -1,0 +1,15 @@
+# Every source in this repository is stored and worked in with LF, including on Windows where a
+# global `core.autocrlf` would otherwise smudge it to CRLF. That matters most for
+# `src/abi/generated.rs`: it is a generated file, and a checkout whose line endings differ from what
+# the generator writes makes `git status` report it dirty immediately after a faithful
+# regeneration — which teaches people to ignore a signal that is supposed to mean "the tables and
+# the spec disagree".
+#
+# The `*` is load-bearing: git reads the first whitespace-separated word of each line as the
+# pattern, so a line that begins with `text` sets an attribute on a file named "text" and quietly
+# applies to nothing else.
+* text eol=lf
+
+# Not text: nothing here should be converted, and a diff of these is meaningless anyway.
+*.png binary
+*.bin binary

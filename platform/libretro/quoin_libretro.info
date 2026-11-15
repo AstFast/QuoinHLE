@@ -1,0 +1,32 @@
+# Software Information
+display_name = "BREW (QuoinHLE)"
+categories = "Emulator"
+authors = "QuoinHLE contributors"
+corename = "QuoinHLE"
+supported_extensions = "breq|mod"
+license = "GPL-2.0-or-later"
+permissions = ""
+display_version = "0.0.1-alpha"
+
+# Hardware Information
+manufacturer = "Qualcomm"
+systemname = "BREW"
+systemid = "brew"
+
+# Libretro Features
+savestate = "false"
+savestate_features = "non-deterministic"
+cheats = "false"
+input_descriptors = "false"
+memory_descriptors = "false"
+libretro_saves = "true"
+core_options = "true"
+load_subsystem = "false"
+supports_no_game = "false"
+hw_render = "false"
+needs_fullpath = "true"
+disk_control = "false"
+
+notes = "Load a BREW pack: a .mod or .breq file with its .bar/.par files in the same folder. Prefer .breq so a front end does not hand the pack to a music player. Screen size comes from the content folder name (for example game-320x240) or the 'Screen size' core option; restart the content after changing it."
+
+description = "A libretro core for QuoinHLE, a high-level emulator of the classic BREW application runtime (1.x-4.x). Guest ARM code runs for real; the host implements the AEE runtime."

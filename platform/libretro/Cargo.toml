@@ -1,0 +1,18 @@
+[package]
+name = "quoin_libretro"
+version.workspace = true
+edition = "2021"
+description = "A libretro core for QuoinHLE (classic BREW 1.x-4.x HLE)"
+# Inherited: this cdylib links `quoin` statically, so it is the same work under the
+# same licence, and `quoin_libretro.info` already tells front ends GPL-2.0-or-later.
+license.workspace = true
+
+# A separate cdylib crate: linking `quoin` itself as a cdylib fails on this
+# toolchain, and a core should export only the `retro_*` symbols.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The front end owns the window, audio device and clock, so none of the
+# desktop features are needed here.
+quoin = { path = "../..", default-features = false }

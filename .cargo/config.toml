@@ -1,0 +1,2 @@
+# No target is pinned here. Cargo builds for the host triple unless `-Target`
+# is passed explicitly; the workspace shares one target directory for all members.

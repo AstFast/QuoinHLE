@@ -1,0 +1,379 @@
+[package]
+name = "quoin"
+version.workspace = true
+edition = "2021"
+description = "QuoinHLE — a high-level emulation (HLE) core for the BREW application runtime (classic 1.x–4.x, Brew MP)"
+license.workspace = true
+
+# One workspace, one target directory, one lock file. Everything a front end lives under
+# `platform/`: the libretro core is a member, not a second crate with its own build output,
+# while `platform/web` stays outside because Trunk builds it for wasm32 with its own lock file.
+[workspace]
+resolver = "2"
+members = ["platform/libretro"]
+exclude = ["platform/web", "third_party/rynarmic"]
+
+# The one place a workspace version is written. Members inherit it with
+# `version.workspace = true`, so one edit moves every crate together instead of
+# three literals that can drift apart; `build/Version.psm1` writes this line from
+# `VERSION` before a build. `platform/web` is outside this workspace and keeps its
+# own literal, which the same script updates.
+#
+# The licence is written once for the same reason, and it has to stay `or-later`:
+# `cpal`, `winit`, `glutin` and the glyph crates are Apache-2.0 alone, which is
+# compatible with GPL-3.0 and not with GPL-2.0-only.
+[workspace.package]
+version = "0.0.1-alpha"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+# Optional execution backend (`jit`, on by default): the `rynarmic/` crate in the
+# `third_party/rynarmic` submodule, pinned to a release snapshot. Cargo resolves
+# this path dependency while reading the manifest even when the feature is off,
+# so a checkout without the submodule cannot build at all: clone with
+# `--recurse-submodules`, or run `git submodule update --init` afterwards.
+rynarmic = { path = "third_party/rynarmic/rynarmic", optional = true }
+# The dependencies below, and the line between them is worth keeping straight. No count is written
+# here on purpose: it has been "nine" for long enough that three more entries arrived without anyone
+# updating the sentence, which is exactly the kind of claim a reader trusts and a diff never checks.
+#
+# Some are behind a part of the *machine* rather than a part of the emulator — `cpal` and `rustysynth`
+# are the sound card, `eframe` and `rfd` are the window and its file dialog, and a headless run uses
+# none of them. Others serve the *guest's own data and code*, used by the emulator rather than by a
+# device the guest talks to: `flate2` inflates what a pack wraps its module in, `png`, `jpeg-decoder`
+# and `gif` decode the pictures a pack carries (`gif` is the one with no delivered decoder behind it —
+# see `resource::gif` for what that costs and where the widening stops), `yaxpeax-arm` (with its
+# `yaxpeax-arch` trait
+# crate under it) disassembles what the guest is running, `midly` and `symphonia` decode the audio the
+# sound path plays, `des` answers the DES/3DES `ICipher` slots (SEED is first-party, `src/seed.rs`),
+# and `mlua` runs the manager's own scripts.
+#
+# Two stand for a *device the guest talks to*: `ureq` is the network, reached only when a run is told
+# where to send its requests (`--net-proxy`), and `rustls` with `rustls-webpki` is the handshake
+# behind `ISSL`. A guest's own `ISocket` traffic is still this host's loopback model, so a pack
+# that speaks HTTP over a raw socket never reaches either one - a gap not papered over here.
+#
+# What stays hand-written is everything on the guest's execution path: the CPU, the ABI tables and the
+# whole of `runtime.rs` have no dependency at all, which is the property that makes those tables worth
+# trusting. A decoder is not on that path — it never decides what an instruction does, only what to
+# call it — so lending it out costs nothing the interpreter's own decoder would protect.
+#
+# The rule for adding to the list is simple: **a crate gets added whenever the
+# function needs one.** Several interface slots used to be recorded as not served
+# only because serving them would have meant one more dependency here; that reason
+# is withdrawn, and the number of dependencies is no longer a decision worth
+# escalating. What is still not delegable is the
+# execution path above — and a new crate must say why it is here, in this file, so the list stays countable.
+#
+# There is one optional cargo feature, `ffmpeg`: it links the system FFmpeg decoder and is
+# off by default, so the tree above still builds and tests without a C toolchain. The
+# dependency that only some builds have is exactly why the feature is explicit rather than
+# a second always-on decoder.
+
+# A stream to hand rendered frames to: WASAPI, CoreAudio and ALSA from one piece of code. What this
+# host has is a stream it renders rather than a file it opens, so the bottom of the audio stack wants
+# a callback to fill. On Windows it needs no feature flag and no C toolchain, which matters here —
+# this repository builds with mingw, and a C toolchain in the audio path would be one more thing that
+# can fail before a note is heard.
+cpal = { version = "0.18.2", optional = true }
+
+# A SoundFont MIDI synthesizer: pure Rust, and no dependencies of its own. The corpus is 616 payloads
+# this host plays as `audio/mid` and not one waveform (both corpora, 827 packs; an earlier
+# figure here under-reported by 2.7x), so the sound to make is a score played by an
+# instrument, and the instrument is not something a pack carries. The `.sf2` bank is deliberately
+# *not* vendored: a General MIDI bank is a large binary asset with its own terms, and the built-in
+# tables below are enough to keep a run without `--soundfont` audible. Since `#19` a run without a
+# bank is not silent — `src/soundbank.rs` generates eight waveform tables at start-up and hands this
+# same engine a SoundFont built in memory.
+#
+# ⚠ `"1.3.6"` is a caret requirement, and that bank is *byte arithmetic against this reader*: record
+# widths, which FourCCs are recognised, the terminator conventions, and the units of six generators are
+# all read out of 1.3.6's sources (they are listed in `src/soundbank.rs`'s module docs). `Cargo.lock`
+# pins the checksum today; a `cargo update` that moves this crate moves the authority the bank was
+# written against. `the_bank_loads_and_no_instrument_is_left_without_a_voice` is the tripwire — it
+# counts presets and instruments and insists none is left without a region, which is the failure that
+# would otherwise look like a clean load and total silence.
+rustysynth = "1.3.6"
+
+# A MIDI file decoder, used by the sequencer below to read events and tempo changes without
+# depending on rustysynth's private `MidiFile` tables. `midly` is pure Rust and decodes both SMF
+# files and real-time events; rustysynth remains the only synthesizer.
+midly = { version = "0.5.3", default-features = false, features = ["std"] }
+
+# Vector and matrix arithmetic for the software OpenGL ES core. Column-major `Mat4` matches the
+# GL convention, so a guest's `LoadMatrixf` bytes go in without a transpose. Pure Rust and outside
+# the guest execution path: it decides what a vertex becomes, never what an instruction does.
+glam = "0.29"
+
+# Shift-JIS, for the `FD FE`-marked strings the KDDI containers carry. Turning one encoding into
+# another is a decoder's job and sits outside the guest execution path; the alternative was a
+# transcription table this host would have had to own. Pure Rust, no C toolchain.
+encoding_rs = "0.8"
+
+# Pure-Rust audio container/codec decoding for the formats the QCP/MIDI paths do not cover:
+# MP3, AAC, RIFF/WAV, and ADPCM. Keep the feature list explicit — the default set pulls in
+# FLAC/Ogg/Vorbis as well, which this host has no handler for yet. `symphonia` is a *decoder*,
+# not a player: it returns interleaved samples that the existing PCM mixer already knows how to
+# render. Formats it cannot decode are left for an optional external backend (FFmpeg/VLC), never
+# guessed at in `sniff`.
+symphonia = { version = "0.5.4", default-features = false, features = [
+    "mp3",
+    "aac",
+    "adpcm",
+    "pcm",
+    "wav",
+    "isomp4",
+] }
+
+# Optional second decoder backend. `ffmpeg-next` is the Rust binding formerly known as
+# rust-ffmpeg; it needs system FFmpeg development libraries (libavcodec/libavformat and
+# pkg-config on Unix) and is therefore behind the non-default `ffmpeg` feature. A default
+# build never links it, and the GUI/CLI mark the FFmpeg backend unavailable when it is off.
+ffmpeg-next = { version = "9.0.0", optional = true }
+
+# The window, for `--window`: a screen and a keyboard for a person to play a run with. `eframe` is
+# egui's desktop backend, and the only one of the three that is not on the sound path.
+#
+# `default-features = false` is not tidiness — the defaults pull in the accessibility stack and the
+# wgpu path, which together are 404 packages against these 277, and `glow` (OpenGL) is the one that
+# still works on a machine with weak or virtualised drivers.
+eframe = { version = "0.31", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+# The deflate half of `IUnzipAStream`, and the gzip container a pack wraps its own module in. Pure
+# Rust (miniz_oxide) by default, so it adds no C toolchain to a build that already has to link with
+# mingw; a pack in the corpus ships its `program.bin` as a gzip stream, and
+# inflating that stream is what produces the module the pack runs.
+flate2 = "1.1.10"
+
+# Disassembly, for `--disasm` and for the listing a fault report prints of its own program counter.
+#
+# `yaxpeax-arm` is a decoder and not an emulator, and it is pure Rust with no C toolchain — which is
+# the reason it is here rather than `capstone`, whose C sources would be one more thing to get built
+# before anything runs. The alternative was a hand-written ARMv5TE disassembler, and that is a second,
+# quieter copy of `src/cpu/arm.rs`: two decoders that disagree are worse than one that says it does not
+# know, which is what this one does when it meets a word it cannot read.
+#
+# `yaxpeax-arch` is its trait crate, listed because `Decoder`, `Reader` and `U8Reader` — the API the
+# two calls in `src/disasm.rs` are written against — live there rather than in the ARM crate.
+yaxpeax-arm = { version = "0.5.0", default-features = false }
+yaxpeax-arch = { version = "0.3.2", default-features = false }
+
+# A pack's pictures are not always BMPs. One pack in the corpus keeps every image
+# as a PNG (and as four private formats this host still has no decoder for), so a
+# viewer request for one of its resources used to be answered with a null - which
+# the app stored and dereferenced. Pure Rust, like the rest, so the mingw build
+# gains no C toolchain.
+png = "0.18.1"
+
+# The other picture format the corpus declares. `aeejpeg/AEEJPEGViewer.o` is the shipped JPEG decoder and
+# its own bodies are delivered (`objs/aeejpeg/jpegdecoder.o`, `idct.o`, `h2v2.o`), so the class
+# `AEECLSID_JPEGDECODER` has always been servable — what this host lacked was only a JPEG decoder of its
+# own. Pure Rust, so the mingw build gains no C toolchain. `default-features = false` keeps `rayon` out:
+# a guest picture has to decode the same way on every run, and a thread pool in the middle of that is a
+# determinism claim this host does not want to have to defend.
+jpeg-decoder = { version = "0.3.2", default-features = false }
+
+# `ICipher`'s four classes — `AEECLSID_DES_ENCRYPT`/`DES_DECRYPT`/`3DES_ENCRYPT`/`3DES_DECRYPT`
+# (`src/cipher.rs`): the block primitive the guest's own encryption objects run. Like `md5` below,
+# it answers a function the guest asks the *host* for rather than a step on the guest's execution
+# path.
+des = "0.9.0"
+
+# `IHash`'s MD5 class (`AEECLSID_MD5`, `src/hash.rs`). Pure Rust with no dependencies of its own, and
+# like `des` it answers a function the guest asks the *host* for rather than a step on the guest's
+# execution path. The corpus asks for MD5 and for no other hash: the S7 client behind Sprint Mail and
+# Mobile Email creates one while building its platform layer, and treats the refusal as fatal.
+md5 = "0.7.0"
+# `rustls` is the TLS state machine `aeessl/AEESSL.o` implements: `ISSL::Negotiate` is a
+# handshake the delivered member runs through an OpenSSL 0.9.x port, and this host had none, so
+# those slots answered nothing. `ring` instead of `aws-lc-rs` keeps the C build to what mingw
+# already provides; `tls12` is on because a 2005-era handset stack negotiates it. `src/tls.rs`
+# is the pump — it owns no socket and blocks nothing, so the ABI side decides when bytes move.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0.11"
+# The chain verifier `tls::ChainOnly` needs the raw webpki API: `verify_for_usage` validates the
+# path without the subject-name check, which is exactly what the delivered member does (it sends
+# no SNI and never sets a host). rustls itself only re-exports its `RootCertStore`.
+rustls-webpki = "0.103"
+# The third picture format the corpus declares: `GIF87a`/`GIF89a` to an indexed `IBitmap`
+# (`resource::gif`). No delivered member decodes it, so what this decoder backs is the host's own
+# answer rather than a class the guest can reach. Pure Rust, so the mingw build gains no C toolchain.
+gif = "0.14.2"
+
+# Pure-Rust SMAF container/event parser (MIT). It decodes MMMD/Mtsu/Mtsq and the two
+# Mobile dialects, including the Huffman body; the synthesis, voice decoding and the
+# timeline mapping to the MA player are ours. Kept separate from `smaf-player`, whose
+# output is GM-mapped MIDI and would lose the file's own voice selection.
+smaf = "0.1.4"
+
+# Outline rasterization for `--make-bbf`: a system TrueType/OpenType face becomes the bitmap
+# container BBF v2, which is the format the guest's own `IFont` bodies read. Both crates are pure
+# Rust and sit outside the guest execution path — they decide what a glyph looks like, never what
+# an instruction does. `ttf-parser` reads the outline and `ab_glyph_rasterizer` turns it into
+# coverage; neither is reachable from `runtime.rs`.
+ttf-parser = "0.25"
+ab_glyph_rasterizer = "0.1"
+
+# The compressed texture formats the software GLES core is asked to upload — ATC, PVRTC and ETC1
+# (`src/gl/dispatch.rs`). `texture2ddecoder` turns each block into RGBA8, which is the shape the
+# sampler already reads; without it those `glCompressedTexImage2D` calls would answer nothing.
+texture2ddecoder = "0.1.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The real transport behind a guest `ISocket`: `socket2` rather than bare `std::net`, because the
+# ABI asks for what `std::net` hides -- non-blocking mode with its `EWOULDBLOCK`, `getpeername`
+# and `getsockname` in the sockaddr shape the model stores, and the `SO_REUSEADDR` /
+# `TCP_NODELAY` / `SO_ERROR` options behind `GetOpt`, `SetOpt` and `IOCtl`. Used by
+# `socket::Real` -- the host's own connection underneath the loopback model -- never by the ABI
+# tables. Real host sockets are a device feature and cannot build on wasm32.
+socket2 = "0.6"
+
+# The HTTP client a run reaches for when it is pointed at a local proxy (`--net-proxy`): the guest's
+# own requests are then really sent and the answer is handed back through `IWebResp`. Like `cpal` and
+# `eframe` this is something a *device* needs rather than something on the guest's execution path,
+# and a run without `--net-proxy` never calls into it. A device feature, so it cannot build on
+# wasm32 and `net_stub.rs` refuses it.
+ureq = "3.4.2"
+
+# Embedded Lua 5.4 for per-application scripting. `vendored` builds the interpreter with the
+# tree's own C compiler, so a run does not depend on a system Lua installation. Scripts are trusted
+# local files; the host APIs are the boundary, not the Lua sandbox. Desktop-only: wasm uses
+# `src/script_stub.rs`.
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
+# Native confirm/information dialogs for the script trust prompt and the Lua `popup` API. Kept out of
+# the guest path: only a package that asks for write access, or a script that calls popup, reaches it.
+# Desktop-only for the same reason as `mlua`.
+rfd = { version = "0.15", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# `Platform/android/entry.rs` uses both to request media permissions through JNI.
+android-activity = "0.6"
+jni = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+# The system UI language, read through one Win32 call when no `LANG`/`LC_ALL` is set. Desktop-only
+# and outside the guest path; the manager uses it to pick Chinese or English on first open.
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+
+# The Web entry template in `platform/web/` needs these on wasm32. They are already in the lock
+# through eframe/web-sys; the desktop build does not compile them.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Window", "Navigator", "Storage"] }
+# `platform/web/entry.rs` installs a panic hook before starting `WebRunner`.
+console_error_panic_hook = "0.1"
+# `getrandom` refuses wasm32-unknown-unknown unless its JS backend is selected. ring has the same
+# switch; without it `SystemRandom` is not a `SecureRandom` and rustls cannot compile.
+getrandom = { version = "0.2", features = ["js"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1.15", features = ["std", "web"] }
+
+[build-dependencies]
+# The icon is committed as SVG; the window PNG and Windows ICO are generated from it.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = ["script", "ui", "device", "jit"]
+# Device backend: `Speaker::new` is wired to a sound card (WASAPI / CoreAudio /
+# ALSA through `cpal`). With this off, `Speaker::without_device` still works - a
+# host that drives the clock itself (libretro core, headless rendering,
+# `--dump-audio`) never needs that half, and keeping it would link a device stack
+# the core never calls. On by default because the desktop shell wants sound;
+# `--no-default-features` builds do not carry it.
+device = ["dep:cpal"]
+# Execution backend: hands instruction execution to Rynarmic's block cache and
+# x64 JIT (see `src/cpu/jit.rs`). On by default for the desktop binary. The JIT
+# emits x86-64 code only, so a non-x86-64 build must disable default features
+# and name the ones it does want; `build.ps1 -NoJit` does that, and `--no-jit` at
+# runtime keeps the interpreter even in a build that has the backend.
+# `platform/libretro` and `platform/web` depend with `default-features = false`, so
+# they never pull this in and stay on the pure interpreter path.
+jit = ["dep:rynarmic"]
+# Desktop shell: `--window` and the game library screen. `eframe` is its only
+# extra dependency, and none of the emulation path needs it - a libretro core or
+# an embedded frontend built with `--no-default-features --features script`
+# links no UI toolkit. That boundary is what lets another frontend attach: the
+# core knows nothing about windows, and the window calls into the core.
+ui = ["dep:eframe"]
+# Lua packages (`manifest.lua` + hooks) and the native consent dialog. Turning this off replaces
+# `src/script.rs` with `src/script_stub.rs` and drops `mlua`/`rfd` from the binary.
+script = ["dep:mlua", "dep:rfd"]
+# Decode through system FFmpeg (`ffmpeg-next`). Requires FFmpeg development libraries; the
+# default Rust backend does not.
+ffmpeg = ["dep:ffmpeg-next"]
+# Same decoder, but `ffmpeg-next/build` clones FFmpeg's matching release branch and compiles
+# it with `--enable-static --disable-shared`. It removes the runtime DLL dependency, at the
+# cost of needing git, make, nasm/yasm and a C toolchain at build time.
+ffmpeg-static = ["ffmpeg", "ffmpeg-next/build"]
+
+[[bin]]
+name = "quoin"
+path = "src/main.rs"
+
+# Interpreter throughput on hand-written guest bytes - no pack, no HLE, no window,
+# so nothing here needs an external corpus. `harness = false` keeps it on the
+# stable toolchain and adds no dependency: `#[bench]` would need nightly. Run
+# *this target only*: a bare `cargo bench` also builds the corpus-gated
+# integration tests under `tests/`.
+[[bench]]
+name = "interp"
+path = "benches/interp.rs"
+harness = false
+
+# The same loop on the Rynarmic backend; `required-features` keeps this target
+# out of builds that disable `jit`.
+[[bench]]
+name = "jit"
+path = "benches/jit.rs"
+harness = false
+required-features = ["jit"]
+
+# One screenshot per turn, once per presentation. Only a hand-constructed
+# framebuffer is used; no pack is loaded and no guest code runs.
+# `cargo bench --bench screenshot` (this target only).
+[[bench]]
+name = "screenshot"
+path = "benches/screenshot.rs"
+harness = false
+
+# Two host-side costs inside a JIT frame: the burst of compiling a large stretch
+# of new code for the first time, and one round trip out of and back into an SVC
+# trap. Hand-written ARM words only - no pack, no window, no HLE services.
+# `cargo bench --features jit --bench jit_frame` (this target only).
+[[bench]]
+name = "jit_frame"
+path = "benches/jit_frame.rs"
+harness = false
+required-features = ["jit"]
+
+[profile.release]
+opt-level = 3
+# Full LTO, not thin: the interpreter and the guest/host helpers are in the same crate, and the
+# extra cross-unit inlining is the cheapest remaining win before a decoded-block cache.
+lto = "fat"
+codegen-units = 1
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+
+# A past attempt (2026-10-11): a `[lib] crate-type = ["rlib", "cdylib"]` section
+# was tried here so this crate alone could emit a frontend-loadable dynamic
+# library. It does not link on the default windows-gnu toolchain:
+#
+#     ld.exe: error: export ordinal too large: 80288
+#     error: could not compile `quoin` (lib)
+#
+# GNU ld on Windows exports every global symbol by default, and this crate's rlib
+# defines 16 374 of them (measured with `nm --defined-only`; most come from the
+# generated ABI tables under `src/abi/generated/`). Their ordinals exceed the PE
+# limit of 65 535, so a core must be a separate small crate rather than the whole
+# lib as a cdylib: it exports only a handful of `#[no_mangle] extern "C"` symbols,
+# cannot see those tables, and never approaches the limit. An MSVC toolchain is a
+# different matter; the release baseline here is built with gnu. The line count of
+# this note does not affect any `Cargo.toml:NN` references above - they all sit
+# earlier in the file.

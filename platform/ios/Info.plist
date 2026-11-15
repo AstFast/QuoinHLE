@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template only: merge into the Xcode project's Info.plist. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>QuoinHLE</string>
+  <key>CFBundleName</key>
+  <string>QuoinHLE</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.quoin.quoin</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.0.1-alpha</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>UILaunchScreen</key>
+  <dict/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>QuoinHLE uses the local network only when a run is pointed at a network proxy.</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>UIFileSharingEnabled</key>
+  <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key>
+  <true/>
+</dict>
+</plist>
