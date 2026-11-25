@@ -36,7 +36,6 @@ function Get-BuildEnvironment {
     $llvmCandidates = @()
     if ($env:ProgramFiles) { $llvmCandidates += (Join-Path $env:ProgramFiles 'LLVM\bin') }
     if (${env:ProgramFiles(x86)}) { $llvmCandidates += (Join-Path ${env:ProgramFiles(x86)} 'LLVM\bin') }
-    $llvmCandidates += 'C:\Program Files\LLVM\bin'
     $llvmBin = $llvmCandidates | Where-Object { Test-Path (Join-Path $_ 'clang.exe') } | Select-Object -First 1
     $clang = if ($llvmBin) { Join-Path $llvmBin 'clang.exe' } else { Get-CommandPath 'clang' }
     $llvmAr = if ($llvmBin -and (Test-Path (Join-Path $llvmBin 'llvm-ar.exe'))) {

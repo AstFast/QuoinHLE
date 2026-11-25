@@ -12,6 +12,21 @@ impl Gles {
         }
     }
 
+    /// The texture unit an `ActiveTexture`/`ClientActiveTexture` enum names, or `None` when the
+    /// profile's `GL_MAX_TEXTURE_UNITS` does not reach it. The software pipeline stores four.
+    pub(super) fn texture_unit(&self, texture: u32) -> Option<usize> {
+        let units = self.texture_units();
+        texture
+            .checked_sub(GL_TEXTURE0)
+            .map(|n| n as usize)
+            .filter(|n| *n < units)
+    }
+
+    /// How many texture units this profile has, capped by the four the pipeline stores.
+    pub(super) fn texture_units(&self) -> usize {
+        (self.caps.max_texture_units as usize).clamp(1, 4)
+    }
+
     /// Reject a count that would make the host allocate or loop without bound. The guest's
     /// `GLsizei` arrives as an unsigned word, so a negative count is a very large one.
     pub(super) fn check_count(&mut self, count: u32, max: u32) -> bool {
@@ -26,9 +41,17 @@ impl Gles {
     /// how they read the value; the state they write is the same four enums.
     pub(super) fn set_tex_parameter(&mut self, pname: u32, value: u32) {
         let valid = match pname {
+            // The anisotropic extension makes a ratio outside the supported range a value error,
+            // not a name the enum does not contain.
+            GL_TEXTURE_MAX_ANISOTROPY_EXT => {
+                if value < 1 || value > self.caps.max_texture_max_anisotropy {
+                    self.set_error(GL_INVALID_VALUE);
+                    return;
+                }
+                true
+            }
             GL_TEXTURE_MAG_FILTER | GL_TEXTURE_MIN_FILTER => is_filter(value),
             GL_TEXTURE_WRAP_S | GL_TEXTURE_WRAP_T => is_wrap(value),
-            GL_TEXTURE_MAX_ANISOTROPY_EXT => (1..=16).contains(&value),
             _ => false,
         };
         if !valid {
@@ -85,6 +108,7 @@ impl Gles {
             color: self.current.color,
             tex: self.current.tex,
             tex_r: self.current.tex_r,
+            tex_q: self.current.tex_q,
             normal: self.current.normal,
             point_size: self.point_size,
             matrix_indices: self.current.matrix_indices,
@@ -155,7 +179,8 @@ impl Gles {
             };
             let mut tex = self.current.tex;
             let mut tex_r = self.current.tex_r;
-            for unit in 0..4 {
+            let mut tex_q = self.current.tex_q;
+            for unit in 0..self.texture_units() {
                 if let Some(t) = self.client_tex[unit] {
                     let step = type_size(t.ty);
                     let s = if t.stride > 0 {
@@ -176,6 +201,9 @@ impl Gles {
                     }
                     if n > 2 {
                         tex_r[unit] = read_normalized_component(mem, b + 2 * step, t.ty)?;
+                    }
+                    if n > 3 {
+                        tex_q[unit] = read_normalized_component(mem, b + 3 * step, t.ty)?;
                     }
                     tex[unit] = coord;
                 }
@@ -264,6 +292,7 @@ impl Gles {
                 color,
                 tex,
                 tex_r,
+                tex_q,
                 normal,
                 point_size,
                 matrix_indices,
@@ -478,6 +507,7 @@ impl Gles {
                 if let Some(t) = self.textures.get_mut(&color) {
                     if let Some(face) = cube_face(color_target) {
                         if color_level == 0 {
+                            t.uploaded = true;
                             let count = (surface.width * surface.height * 4) as usize;
                             if t.faces.len() < 6 {
                                 t.faces.resize(6, vec![0u8; count]);
@@ -499,6 +529,7 @@ impl Gles {
                             faces[face] = surface.rgba.clone();
                         }
                     } else if color_level == 0 {
+                        t.uploaded = true;
                         t.rgba = surface.rgba.clone();
                     } else if let Some(level) = t.levels.get_mut(color_level as usize - 1) {
                         *level = surface.rgba.clone();
@@ -513,7 +544,13 @@ impl Gles {
         }
     }
 
-    pub(super) fn clear(&mut self, mask: u32, egl: &mut Egl, _mem: &mut Mem) -> HResult<()> {
+    pub(super) fn clear(&mut self, mut mask: u32, egl: &mut Egl, _mem: &mut Mem) -> HResult<()> {
+        // A profile whose surface has no stencil bits drops that part of the mask rather than
+        // clearing a plane the handset does not have. The device does the same: its clear removes
+        // the bit before the request reaches the command stream.
+        if self.caps.stencil_bits == 0 {
+            mask &= !0x0400;
+        }
         let Some(mut target) = self.take_draw_surface(egl) else {
             return Ok(());
         };
@@ -532,7 +569,13 @@ impl Gles {
                         continue;
                     };
                     if mask & 0x4000 != 0 {
-                        s.rgba[idx * 4..idx * 4 + 4].copy_from_slice(&c);
+                        // Clear obeys the colour write mask, but not the viewport: only scissor
+                        // bounds it. That asymmetry is GL's §4.2.3, and packs rely on it.
+                        for ch in 0..4 {
+                            if self.color_mask[ch] {
+                                s.rgba[idx * 4 + ch] = c[ch];
+                            }
+                        }
                     }
                     if mask & 0x0100 != 0 {
                         s.depth[idx] = self.clear_depth;
@@ -619,6 +662,7 @@ impl Gles {
         }
         texture.width = width.max(1);
         texture.height = height.max(1);
+        texture.uploaded = true;
         texture.rgba = rgba;
         texture.generate_mipmaps();
     }
@@ -639,41 +683,86 @@ impl Gles {
             let modelview = self.vertex_matrix(v);
             let eye = modelview * v.pos.extend(v.w);
             let normal = modelview.transform_vector3(v.normal);
-            let color = self.shade(eye.truncate(), normal, v.color);
+            let color = self.shade_face(eye.truncate(), normal, v.color, false);
+            let back_color = if self.two_sided {
+                self.shade_face(eye.truncate(), normal, v.color, true)
+            } else {
+                color
+            };
             let mut tex = v.tex;
-            for coord in 0..2 {
-                if self.tex_gen_enabled[coord] {
-                    let mode = self.tex_gen_mode[coord];
-                    if mode == GL_SPHERE_MAP {
-                        let n = normal.normalize_or_zero();
-                        tex[0][coord] = if coord == 0 {
-                            (n.x + 1.0) * 0.5
-                        } else {
-                            (n.y + 1.0) * 0.5
-                        };
+            let mut tex_r = v.tex_r;
+            let mut tex_q = v.tex_q;
+            for coord in 0..4 {
+                if !self.tex_gen_enabled[coord] {
+                    continue;
+                }
+                let mode = self.tex_gen_mode[coord];
+                if mode == GL_SPHERE_MAP {
+                    // Sphere mapping defines S and T only; R and Q keep what the vertex carried.
+                    if coord >= 2 {
                         continue;
                     }
-                    let slot = if mode == GL_EYE_LINEAR { 1 } else { 0 };
-                    let plane = self.tex_gen_plane[coord][slot];
-                    let p = if mode == GL_EYE_LINEAR {
-                        eye.truncate()
+                    let n = normal.normalize_or_zero();
+                    tex[0][coord] = if coord == 0 {
+                        (n.x + 1.0) * 0.5
                     } else {
-                        v.pos
+                        (n.y + 1.0) * 0.5
                     };
-                    tex[0][coord] = plane[0] * p.x + plane[1] * p.y + plane[2] * p.z + plane[3];
+                    continue;
+                }
+                let slot = if mode == GL_EYE_LINEAR { 1 } else { 0 };
+                let plane = self.tex_gen_plane[coord][slot];
+                let p = if mode == GL_EYE_LINEAR {
+                    eye.truncate()
+                } else {
+                    v.pos
+                };
+                let value = plane[0] * p.x + plane[1] * p.y + plane[2] * p.z + plane[3];
+                match coord {
+                    0 => tex[0][0] = value,
+                    1 => tex[0][1] = value,
+                    2 => tex_r[0] = value,
+                    _ => tex_q[0] = value,
                 }
             }
             cvs.push(ClipVertex {
                 clip: projection * eye,
                 eye: eye.truncate(),
                 color,
+                back_color,
                 tex,
-                tex_r: v.tex_r,
+                tex_r,
+                tex_q,
                 fog: self.fog_factor(eye.z),
                 point_size: v.point_size,
             });
         }
         let tx: Vec<Option<TxVertex>> = cvs.iter().map(|v| self.to_screen(v)).collect();
+        // `--gl-log`'s geometry: where the vertices landed on screen and how deep they were. Both
+        // are what tells "a full-screen quad was drawn" from "a sprite that missed the viewport",
+        // which no amount of state can answer on its own.
+        if let Some(probe) = self.probe.as_ref() {
+            let mut bbox = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            let (mut near, mut far) = (f32::MAX, f32::MIN);
+            for (i, v) in cvs.iter().enumerate() {
+                near = near.min(v.eye.z);
+                far = far.max(v.eye.z);
+                if let Some(Some(t)) = tx.get(i) {
+                    bbox[0] = bbox[0].min(t.screen.x);
+                    bbox[1] = bbox[1].min(t.screen.y);
+                    bbox[2] = bbox[2].max(t.screen.x);
+                    bbox[3] = bbox[3].max(t.screen.y);
+                }
+            }
+            if bbox[0] > bbox[2] {
+                bbox = [0.0; 4];
+            }
+            if near > far {
+                near = 0.0;
+                far = 0.0;
+            }
+            probe.note_geometry(bbox, (near, far));
+        }
         let Some(mut target) = self.take_draw_surface(egl) else {
             return Ok(());
         };
@@ -682,7 +771,7 @@ impl Gles {
         let saved_depth = self.depth_test;
         let saved_stencil = self.stencil_test;
         self.depth_test = target.depth_tested(saved_depth);
-        self.stencil_test = target.stencil_tested(saved_stencil);
+        self.stencil_test = target.stencil_tested(saved_stencil, self.caps.stencil_bits != 0);
         let mut surface = std::mem::take(&mut target.surface);
         match primitive {
             GL_POINTS => {
@@ -769,8 +858,10 @@ impl Gles {
             eye: v.eye,
             inv_w,
             color: v.color,
+            back_color: v.back_color,
             tex: v.tex,
             tex_r: v.tex_r,
+            tex_q: v.tex_q,
             fog: v.fog,
             point_size: v.point_size,
         })
@@ -886,15 +977,19 @@ impl Gles {
         let saved_depth = self.depth_test;
         let saved_stencil = self.stencil_test;
         self.depth_test = target.depth_tested(saved_depth);
-        self.stencil_test = target.stencil_tested(saved_stencil);
+        self.stencil_test = target.stencil_tested(saved_stencil, self.caps.stencil_bits != 0);
         let mut s = std::mem::take(&mut target.surface);
         for row in 0..h {
             for col in 0..w {
                 let u = (col as f32 + 0.5) / w as f32;
                 let v = (row as f32 + 0.5) / h as f32;
-                let tex = t.sample(u, v, 0.0);
-                let color = self.combine(unit, self.current.color, tex);
-                self.plot(x0 + col, y0 + row, self.depth_range[0], color, 0.0, &mut s);
+                let tex = if t.uploaded {
+                    t.sample(u, v, 0.0)
+                } else {
+                    [0.0, 0.0, 0.0, 1.0]
+                };
+                let color = self.combine_one(unit, self.current.color, tex, self.current.color);
+                self.plot(x0 + col, y0 + row, self.depth_range[0], color, 1.0, &mut s);
             }
         }
         target.surface = s;
@@ -929,15 +1024,17 @@ impl Gles {
         let unit = self.active_texture;
         let sprite = self.point_sprite
             && self.point_sprite_coord_replace
-            && self.texture_2d[unit]
-            && self.bound_texture[unit] != 0;
+            && self.texture_2d[unit];
         for dy in 0..size {
             for dx in 0..size {
                 let mut color = if sprite {
                     let u = (dx as f32 + 0.5) / size as f32;
                     let t = (dy as f32 + 0.5) / size as f32;
                     match self.textures.get(&self.bound_texture[unit]) {
-                        Some(texture) => self.combine(unit, v.color, texture.sample(u, t, 0.0)),
+                        Some(texture) if texture.uploaded => {
+                            self.combine_one(unit, v.color, texture.sample(u, t, 0.0), v.color)
+                        }
+                        Some(_) => self.combine_one(unit, v.color, [0.0, 0.0, 0.0, 1.0], v.color),
                         None => v.color,
                     }
                 } else {
@@ -1034,6 +1131,72 @@ impl Gles {
             && y < self.scissor[1].saturating_add(self.scissor[3])
     }
 
+    /// The common tail of points/lines/DrawTex and triangles: blend or logic-op the shaded
+    /// colour into the framebuffer, then apply the write masks.
+    ///
+    /// Logic op and blending are mutually exclusive in ES 1.x (§4.1): a logic op takes the
+    /// *unblended* fragment and combines it with the framebuffer. Keeping the two in one place
+    /// also keeps `--gl-log`'s first-fragment record from drifting between the two rasterisers.
+    fn write_fragment(
+        &self,
+        x: i32,
+        y: i32,
+        idx: usize,
+        z: f32,
+        color: [f32; 4],
+        s: &mut Surface,
+    ) {
+        let dst = [
+            s.rgba[idx * 4],
+            s.rgba[idx * 4 + 1],
+            s.rgba[idx * 4 + 2],
+            s.rgba[idx * 4 + 3],
+        ];
+        let mut out = [
+            (color[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (color[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (color[2].clamp(0.0, 1.0) * 255.0) as u8,
+            (color[3].clamp(0.0, 1.0) * 255.0) as u8,
+        ];
+        if self.logic_op_enabled {
+            for ch in 0..4 {
+                out[ch] = logic_op_byte(self.logic_op, out[ch], dst[ch]);
+            }
+        } else if self.blend {
+            for ch in 0..4 {
+                let src = out[ch] as f32 / 255.0;
+                let d = dst[ch] as f32 / 255.0;
+                let (sf, df) =
+                    self.blend_factor(ch, src, d, out[3] as f32 / 255.0, dst[3] as f32 / 255.0);
+                let equation = if ch == 3 {
+                    self.blend_equation_alpha
+                } else {
+                    self.blend_equation
+                };
+                let blended = match equation {
+                    GL_FUNC_SUBTRACT => src * sf - d * df,
+                    GL_FUNC_REVERSE_SUBTRACT => d * df - src * sf,
+                    GL_MIN => src.min(d),
+                    GL_MAX => src.max(d),
+                    _ => src * sf + d * df,
+                };
+                out[ch] = (blended.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+        if let Some(probe) = self.probe.as_ref() {
+            probe.note_written(out[3] >= 128);
+            probe.note_fragment(x, y, dst, color, out);
+        }
+        for ch in 0..4 {
+            if self.color_mask[ch] {
+                s.rgba[idx * 4 + ch] = out[ch];
+            }
+        }
+        if self.depth_mask {
+            s.depth[idx] = z;
+        }
+    }
+
     pub(super) fn plot(&self, x: i32, y: i32, z: f32, color: [f32; 4], fog: f32, s: &mut Surface) {
         let Some(idx) = s.index(x, y) else {
             return;
@@ -1041,9 +1204,26 @@ impl Gles {
         if !self.scissor_allows(x, y) {
             return;
         }
-        let mut z = z;
-        if self.polygon_offset_fill {
-            z += self.polygon_offset_factor * 1e-5 + self.polygon_offset_units * 1e-6;
+        // No polygon offset here: the state applies to filled polygons only, and a point or a line
+        // is not one. Applying a constant bias to them was the symptom of the constant bias itself.
+        let mut color = color;
+        if self.fog {
+            // Fog is applied to RGB only; alpha is a coverage value, not a colour channel.
+            for ch in 0..3 {
+                color[ch] = color[ch] * fog + self.fog_color[ch] * (1.0 - fog);
+            }
+        }
+        if self.sample_coverage {
+            let coverage = if self.sample_coverage_invert {
+                1.0 - self.sample_coverage_value
+            } else {
+                self.sample_coverage_value
+            };
+            color[3] = (color[3] * coverage).clamp(0.0, 1.0);
+        }
+        // Alpha test precedes stencil/depth updates: a discarded fragment must not write stencil.
+        if self.alpha_test && !alpha_pass(self.alpha_func, color[3], self.alpha_ref) {
+            return;
         }
         let depth_ok = !self.depth_test || self.depth_pass(z, s.depth[idx]);
         let stencil_ok = if self.stencil_test {
@@ -1073,73 +1253,47 @@ impl Gles {
         if !depth_ok || !stencil_ok {
             return;
         }
-        let mut color = color;
-        if self.fog {
-            for ch in 0..4 {
-                color[ch] = color[ch] * fog + self.fog_color[ch] * (1.0 - fog);
-            }
-        }
-        if self.sample_coverage {
-            let coverage = if self.sample_coverage_invert {
-                1.0 - self.sample_coverage_value
-            } else {
-                self.sample_coverage_value
-            };
-            color[3] = (color[3] * coverage).clamp(0.0, 1.0);
-        }
-        let mut out = [
-            (color[0].clamp(0.0, 1.0) * 255.0) as u8,
-            (color[1].clamp(0.0, 1.0) * 255.0) as u8,
-            (color[2].clamp(0.0, 1.0) * 255.0) as u8,
-            (color[3].clamp(0.0, 1.0) * 255.0) as u8,
-        ];
-        let dst = &mut s.rgba[idx * 4..idx * 4 + 4];
-        if self.blend {
-            for ch in 0..4 {
-                let src = out[ch] as f32 / 255.0;
-                let d = dst[ch] as f32 / 255.0;
-                let (sf, df) =
-                    self.blend_factor(ch, src, d, out[3] as f32 / 255.0, dst[3] as f32 / 255.0);
-                let equation = if ch == 3 {
-                    self.blend_equation_alpha
-                } else {
-                    self.blend_equation
-                };
-                let blended = match equation {
-                    GL_FUNC_SUBTRACT => src * sf - d * df,
-                    GL_FUNC_REVERSE_SUBTRACT => d * df - src * sf,
-                    GL_MIN => src.min(d),
-                    GL_MAX => src.max(d),
-                    _ => src * sf + d * df,
-                };
-                out[ch] = (blended.clamp(0.0, 1.0) * 255.0) as u8;
-            }
-        }
-        if self.logic_op_enabled {
-            for ch in 0..4 {
-                out[ch] = logic_op_byte(self.logic_op, out[ch], dst[ch]);
-            }
-        }
-        for ch in 0..4 {
-            if self.color_mask[ch] {
-                dst[ch] = out[ch];
-            }
-        }
-        if self.depth_mask {
-            s.depth[idx] = z;
-        }
+        self.write_fragment(x, y, idx, z, color, s);
     }
 
     /// One texture unit's TexEnv stage: `previous` is the fragment colour the earlier units left
     /// behind, `tex` is this unit's sample. GLES 1.0 gives each unit its own mode.
-    pub(super) fn combine(&self, unit: usize, previous: [f32; 4], tex: [f32; 4]) -> [f32; 4] {
+    /// One unit's stage with no other samples to reach for, which is what `DrawTex` and a point
+    /// sprite need.
+    pub(super) fn combine_one(
+        &self,
+        unit: usize,
+        previous: [f32; 4],
+        tex: [f32; 4],
+        primary: [f32; 4],
+    ) -> [f32; 4] {
+        let mut samples = [[0.0f32, 0.0, 0.0, 1.0]; 4];
+        samples[unit] = tex;
+        self.combine(unit, previous, &samples, primary)
+    }
+
+    pub(super) fn combine(
+        &self,
+        unit: usize,
+        previous: [f32; 4],
+        samples: &[[f32; 4]; 4],
+        primary: [f32; 4],
+    ) -> [f32; 4] {
+        let tex = samples[unit];
         match self.tex_env_mode[unit] {
             GL_COMBINE => {
                 let env = self.tex_env_color[unit];
+                // `GL_TEXTURE` is this unit's own sample; a numbered name reaches another unit's,
+                // which is the crossbar the handset advertises.
                 let src = |which: u32| -> [f32; 4] {
                     match which {
                         GL_TEXTURE => tex,
+                        GL_TEXTURE0 => samples[0],
+                        GL_TEXTURE1 => samples[1],
+                        GL_TEXTURE2 => samples[2],
+                        GL_TEXTURE3 => samples[3],
                         GL_CONSTANT => env,
+                        GL_PRIMARY_COLOR => primary,
                         _ => previous, // GL_PREVIOUS
                     }
                 };
@@ -1203,7 +1357,8 @@ impl Gles {
                 (previous[0] + tex[0]).min(1.0),
                 (previous[1] + tex[1]).min(1.0),
                 (previous[2] + tex[2]).min(1.0),
-                (previous[3] + tex[3]).min(1.0),
+                // ADD sums RGB but multiplies alpha (ES 1.0 §3.7.12).
+                previous[3] * tex[3],
             ],
             GL_BLEND => {
                 let env = self.tex_env_color[unit];
@@ -1211,7 +1366,8 @@ impl Gles {
                     previous[0] * (1.0 - tex[0]) + env[0] * tex[0],
                     previous[1] * (1.0 - tex[1]) + env[1] * tex[1],
                     previous[2] * (1.0 - tex[2]) + env[2] * tex[2],
-                    previous[3] * (1.0 - tex[3]) + env[3] * tex[3],
+                    // BLEND interpolates RGB with the env colour but multiplies alpha.
+                    previous[3] * tex[3],
                 ]
             }
             GL_DECAL => {
@@ -1250,11 +1406,34 @@ impl Gles {
                 return;
             }
         }
+        // Two-sided lighting selects front/back by triangle winding, the same winding cull uses;
+        // the per-vertex colours for both faces were prepared during submit().
+        let use_back = self.two_sided && !front;
         let minx = a.screen.x.min(b.screen.x).min(c.screen.x).floor() as i32;
         let maxx = a.screen.x.max(b.screen.x).max(c.screen.x).ceil() as i32;
         let miny = a.screen.y.min(b.screen.y).min(c.screen.y).floor() as i32;
         let maxy = a.screen.y.max(b.screen.y).max(c.screen.y).ceil() as i32;
         let inv_area = 1.0 / area;
+        // Window-space depth gradient of the plane the three vertices span. `GL_POLYGON_OFFSET_FILL`
+        // pushes a polygon away by `factor * m + units * r`, where `m` is the larger of the two
+        // gradients and `r` the smallest difference the depth buffer can hold. A flat polygon
+        // therefore takes no offset at all, which a constant bias cannot express.
+        let polygon_offset = if self.polygon_offset_fill {
+            let dw0dx = (b.screen.y - c.screen.y) * inv_area;
+            let dw0dy = (c.screen.x - b.screen.x) * inv_area;
+            let dw1dx = (c.screen.y - a.screen.y) * inv_area;
+            let dw1dy = (a.screen.x - c.screen.x) * inv_area;
+            let dz_dx =
+                a.screen.z * dw0dx + b.screen.z * dw1dx - c.screen.z * (dw0dx + dw1dx);
+            let dz_dy =
+                a.screen.z * dw0dy + b.screen.z * dw1dy - c.screen.z * (dw0dy + dw1dy);
+            let slope = dz_dx.abs().max(dz_dy.abs());
+            let bits = self.caps.depth_bits.clamp(1, 24);
+            let resolution = 1.0 / ((1u32 << bits) as f32 - 1.0);
+            self.polygon_offset_factor * slope + self.polygon_offset_units * resolution
+        } else {
+            0.0
+        };
         for y in miny..=maxy {
             for x in minx..=maxx {
                 let px = x as f32 + 0.5;
@@ -1276,8 +1455,111 @@ impl Gles {
                     continue;
                 }
                 let mut z = w0 * a.screen.z + w1 * b.screen.z + w2 * c.screen.z;
-                if self.polygon_offset_fill {
-                    z += self.polygon_offset_factor * 1e-5 + self.polygon_offset_units * 1e-6;
+                z += polygon_offset;
+                let (ca, cb, cc) = if use_back {
+                    (a.back_color, b.back_color, c.back_color)
+                } else {
+                    (a.color, b.color, c.color)
+                };
+                let mut color = if self.shade_model == GL_FLAT {
+                    // GLES 1.0 uses the last vertex as the provoking vertex.
+                    cc
+                } else {
+                    let mut color = [0.0f32; 4];
+                    for ch in 0..4 {
+                        color[ch] = w0 * ca[ch] + w1 * cb[ch] + w2 * cc[ch];
+                    }
+                    color
+                };
+                let iw = w0 * a.inv_w + w1 * b.inv_w + w2 * c.inv_w;
+                // Sample every enabled unit before combining any: a combine stage may name another
+                // unit's texture through the crossbar the handset advertises, so the sources have to
+                // exist before the first stage runs. The number of lookups is unchanged.
+                let mut samples = [[0.0f32, 0.0, 0.0, 1.0]; 4];
+                let mut sampled = [false; 4];
+                for unit in 0..self.texture_units() {
+                    // Texture object 0 is the default object, not "no texture": an uploaded image
+                    // on it must reach the screen. An incomplete one still samples as black.
+                    if !self.texture_2d[unit] {
+                        continue;
+                    }
+                    if iw.abs() <= 1e-9 {
+                        continue;
+                    }
+                    // The lookup uses s/q, t/q and r/q. A pack that leaves q alone gets the
+                    // coordinates it wrote; one that projects a texture gets the divide it asked
+                    // for, and neither case needs the other to be special-cased.
+                    let q = (w0 * a.tex_q[unit] * a.inv_w
+                        + w1 * b.tex_q[unit] * b.inv_w
+                        + w2 * c.tex_q[unit] * c.inv_w)
+                        / iw;
+                    let scale = if q.abs() > 1e-9 { 1.0 / q } else { 1.0 };
+                    let u = (w0 * a.tex[unit][0] * a.inv_w
+                        + w1 * b.tex[unit][0] * b.inv_w
+                        + w2 * c.tex[unit][0] * c.inv_w)
+                        / iw
+                        * scale;
+                    let v = (w0 * a.tex[unit][1] * a.inv_w
+                        + w1 * b.tex[unit][1] * b.inv_w
+                        + w2 * c.tex[unit][1] * c.inv_w)
+                        / iw
+                        * scale;
+                    let r = (w0 * a.tex_r[unit] * a.inv_w
+                        + w1 * b.tex_r[unit] * b.inv_w
+                        + w2 * c.tex_r[unit] * c.inv_w)
+                        / iw
+                        * scale;
+                    if let Some(t) = self.textures.get(&self.bound_texture[unit]) {
+                        // An object with no level-zero image is incomplete: the lookup returns
+                        // opaque black (OpenGL ES 1.1 §3.7.x), not the 1x1 white placeholder this
+                        // host keeps until an upload arrives. That distinction is what turns a
+                        // missed upload into a black surface rather than a white one.
+                        let tex = if t.uploaded {
+                            let lod = lod_of(a, b, c, t.width, t.height, unit);
+                            if self.bound_target[unit] == GL_TEXTURE_CUBE_MAP {
+                                t.sample_cube(u, v, r, lod, t.mag == GL_LINEAR)
+                            } else if t.max_anisotropy > 1.0 {
+                                let (major, minor, du, dv) =
+                                    crate::gl::helpers::lod_axes(a, b, c, t.width, t.height, unit);
+                                t.sample_aniso(u, v, major, minor, du, dv)
+                            } else {
+                                t.sample(u, v, lod)
+                            }
+                        } else {
+                            [0.0, 0.0, 0.0, 1.0]
+                        };
+                        if unit == 0 {
+                            if let Some(probe) = self.probe.as_ref() {
+                                probe.note_texel(tex);
+                            }
+                        }
+                        samples[unit] = tex;
+                        sampled[unit] = true;
+                    }
+                }
+                let primary = color;
+                for unit in 0..self.texture_units() {
+                    if !sampled[unit] {
+                        continue;
+                    }
+                    color = self.combine(unit, color, &samples, primary);
+                }
+                if self.fog {
+                    let fog = w0 * a.fog + w1 * b.fog + w2 * c.fog;
+                    for ch in 0..3 {
+                        color[ch] = color[ch] * fog + self.fog_color[ch] * (1.0 - fog);
+                    }
+                }
+                if self.sample_coverage {
+                    let coverage = if self.sample_coverage_invert {
+                        1.0 - self.sample_coverage_value
+                    } else {
+                        self.sample_coverage_value
+                    };
+                    color[3] = (color[3] * coverage).clamp(0.0, 1.0);
+                }
+                if self.alpha_test && !alpha_pass(self.alpha_func, color[3], self.alpha_ref) {
+                    continue;
                 }
                 let depth_ok = !self.depth_test || self.depth_pass(z, s.depth[idx]);
                 let stencil_ok = if self.stencil_test {
@@ -1307,119 +1589,18 @@ impl Gles {
                 if !depth_ok || !stencil_ok {
                     continue;
                 }
-                let mut color = if self.shade_model == GL_FLAT {
-                    // GLES 1.0 uses the last vertex as the provoking vertex.
-                    c.color
-                } else {
-                    let mut color = [0.0f32; 4];
-                    for ch in 0..4 {
-                        color[ch] = w0 * a.color[ch] + w1 * b.color[ch] + w2 * c.color[ch];
-                    }
-                    color
-                };
-                let iw = w0 * a.inv_w + w1 * b.inv_w + w2 * c.inv_w;
-                for unit in 0..4 {
-                    if !self.texture_2d[unit] || self.bound_texture[unit] == 0 {
-                        continue;
-                    }
-                    if iw.abs() <= 1e-9 {
-                        continue;
-                    }
-                    let u = (w0 * a.tex[unit][0] * a.inv_w
-                        + w1 * b.tex[unit][0] * b.inv_w
-                        + w2 * c.tex[unit][0] * c.inv_w)
-                        / iw;
-                    let v = (w0 * a.tex[unit][1] * a.inv_w
-                        + w1 * b.tex[unit][1] * b.inv_w
-                        + w2 * c.tex[unit][1] * c.inv_w)
-                        / iw;
-                    let r = (w0 * a.tex_r[unit] * a.inv_w
-                        + w1 * b.tex_r[unit] * b.inv_w
-                        + w2 * c.tex_r[unit] * c.inv_w)
-                        / iw;
-                    if let Some(t) = self.textures.get(&self.bound_texture[unit]) {
-                        let lod = lod_of(a, b, c, t.width, t.height, unit);
-                        let tex = if self.bound_target[unit] == GL_TEXTURE_CUBE_MAP {
-                            t.sample_cube(u, v, r, lod, t.mag == GL_LINEAR)
-                        } else if t.max_anisotropy > 1.0 {
-                            let (major, minor, du, dv) =
-                                crate::gl::helpers::lod_axes(a, b, c, t.width, t.height, unit);
-                            t.sample_aniso(u, v, major, minor, du, dv)
-                        } else {
-                            t.sample(u, v, lod)
-                        };
-                        color = self.combine(unit, color, tex);
-                    }
-                }
-                if self.fog {
-                    let fog = w0 * a.fog + w1 * b.fog + w2 * c.fog;
-                    for ch in 0..4 {
-                        color[ch] = color[ch] * fog + self.fog_color[ch] * (1.0 - fog);
-                    }
-                }
-                if self.sample_coverage {
-                    let coverage = if self.sample_coverage_invert {
-                        1.0 - self.sample_coverage_value
-                    } else {
-                        self.sample_coverage_value
-                    };
-                    color[3] = (color[3] * coverage).clamp(0.0, 1.0);
-                }
-                if self.alpha_test && !alpha_pass(self.alpha_func, color[3], self.alpha_ref) {
-                    continue;
-                }
-                let dst = &mut s.rgba[idx * 4..idx * 4 + 4];
-                let mut out = [
-                    (color[0].clamp(0.0, 1.0) * 255.0) as u8,
-                    (color[1].clamp(0.0, 1.0) * 255.0) as u8,
-                    (color[2].clamp(0.0, 1.0) * 255.0) as u8,
-                    (color[3].clamp(0.0, 1.0) * 255.0) as u8,
-                ];
-                if self.blend {
-                    for ch in 0..4 {
-                        let src = out[ch] as f32 / 255.0;
-                        let d = dst[ch] as f32 / 255.0;
-                        let (sf, df) = self.blend_factor(
-                            ch,
-                            src,
-                            d,
-                            out[3] as f32 / 255.0,
-                            dst[3] as f32 / 255.0,
-                        );
-                        let equation = if ch == 3 {
-                            self.blend_equation_alpha
-                        } else {
-                            self.blend_equation
-                        };
-                        let blended = match equation {
-                            GL_FUNC_SUBTRACT => src * sf - d * df,
-                            GL_FUNC_REVERSE_SUBTRACT => d * df - src * sf,
-                            GL_MIN => src.min(d),
-                            GL_MAX => src.max(d),
-                            _ => src * sf + d * df,
-                        };
-                        out[ch] = (blended.clamp(0.0, 1.0) * 255.0) as u8;
-                    }
-                }
-                if self.logic_op_enabled {
-                    for ch in 0..4 {
-                        out[ch] = logic_op_byte(self.logic_op, out[ch], dst[ch]);
-                    }
-                }
-                for ch in 0..4 {
-                    if self.color_mask[ch] {
-                        dst[ch] = out[ch];
-                    }
-                }
-                if self.depth_mask {
-                    s.depth[idx] = z;
-                }
+                self.write_fragment(x, y, idx, z, color, s);
             }
         }
     }
 
     pub(super) fn light_mut(&mut self, light: u32) -> Option<&mut Light> {
         let i = light.checked_sub(GL_LIGHT0)? as usize;
+        // A profile that reports fewer lights than the array holds still has slots for them, so the
+        // count has to be checked here; otherwise a pack writes state no light can ever read.
+        if i as u32 >= self.caps.max_lights {
+            return None;
+        }
         self.lights.get_mut(i)
     }
 
@@ -1452,22 +1633,38 @@ impl Gles {
         }
     }
 
-    /// Fixed-function per-vertex lighting in eye space: the material's emission plus the model
-    /// ambient, then each enabled light's ambient, diffuse and specular terms. A pack that never
-    /// enables `GL_LIGHTING` keeps its vertex colours untouched.
+    /// Fixed-function per-vertex lighting for callers that have no triangle winding yet (points,
+    /// lines, and the unit tests). Triangle rasterisation instead selects the winding-derived
+    /// colour prepared by [`Gles::shade_face`].
     pub(super) fn shade(&self, eye: Vec3, normal: Vec3, color: [f32; 4]) -> [f32; 4] {
-        if !self.lighting {
-            return color;
-        }
-        // `glColorMaterial` substitutes the vertex colour into one material slot while the
-        // light equation still runs. A two-sided surface reads the back material for a
-        // back-facing normal; the face field decides which copy the substitution touches.
         let view = if eye.length_squared() > 0.0 {
             (-eye).normalize()
         } else {
             Vec3::new(0.0, 0.0, 1.0)
         };
         let back = self.two_sided && normal.dot(view) < 0.0;
+        self.shade_face(eye, normal, color, back)
+    }
+
+    /// The lighting equation for one explicitly chosen face. `GL_LIGHT_MODEL_TWO_SIDE` selects
+    /// the back material by triangle winding, not by the vertex normal's relation to the eye.
+    pub(super) fn shade_face(
+        &self,
+        eye: Vec3,
+        normal: Vec3,
+        color: [f32; 4],
+        back: bool,
+    ) -> [f32; 4] {
+        if !self.lighting {
+            return color;
+        }
+        // `glColorMaterial` substitutes the vertex colour into one material slot while the
+        // light equation still runs. The face field decides which copy the substitution touches.
+        let view = if eye.length_squared() > 0.0 {
+            (-eye).normalize()
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
         let mut material = if back {
             self.back_material
         } else {
@@ -1527,8 +1724,16 @@ impl Gles {
                 Vec3::new(0.0, 0.0, 1.0)
             };
             let spec = if ndotl > 0.0 && material.shininess > 0.0 {
-                let r = (2.0 * n.dot(lvec) * n - lvec).normalize();
-                r.dot(spec_view).max(0.0).powf(material.shininess)
+                // GL ES 1.x fixed-function specular uses the half-angle vector (Blinn-Phong),
+                // not the reflected light vector. With an infinite viewer the half vector is
+                // still taken against (0,0,1) in eye space.
+                let half = lvec + spec_view;
+                let h = if half.length_squared() > 0.0 {
+                    half.normalize()
+                } else {
+                    spec_view
+                };
+                n.dot(h).max(0.0).powf(material.shininess)
             } else {
                 0.0
             };

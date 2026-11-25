@@ -3,6 +3,7 @@
 //! Latin and ideographs, and the two widths come from the format's half-width rule.
 
 use super::*;
+use crate::encoding::TextEncoding;
 use crate::font::Face;
 use crate::makebbf::Cell;
 
@@ -37,9 +38,13 @@ fn cjk_face(size: u16) -> Arc<bbf::Bbf> {
 #[test]
 fn one_rasterized_face_answers_latin_and_ideographs_at_their_own_widths() {
     let face = Face::Bbf(cjk_face(SIZE));
-    assert_eq!(face.advance_of(0x4E2D), 16, "an ideograph is a full cell");
     assert_eq!(
-        face.advance_of(0x41),
+        face.advance_of_char('\u{4e2d}', TextEncoding::Unicode),
+        16,
+        "an ideograph is a full cell"
+    );
+    assert_eq!(
+        face.advance_of_char('A', TextEncoding::Unicode),
         8,
         "Latin is half of one, by code point"
     );
@@ -50,7 +55,7 @@ fn one_rasterized_face_answers_latin_and_ideographs_at_their_own_widths() {
         "a cell is already the size it was drawn at"
     );
     assert_eq!(
-        face.measure_chars(&[0x41, 0x4E2D]),
+        face.measure_text("A\u{4e2d}", TextEncoding::Unicode),
         8 + 16,
         "a BBF face measures a run as the sum of its own advances; its cell already carries the gap"
     );
@@ -62,8 +67,8 @@ fn one_rasterized_face_answers_latin_and_ideographs_at_their_own_widths() {
 fn the_large_designator_comes_from_its_own_rasterization() {
     let face = Face::Bbf(cjk_face(LARGE_SIZE));
     assert_eq!(face.height(), 32);
-    assert_eq!(face.advance_of(0x4E2D), 32);
-    assert_eq!(face.advance_of(0x41), 16);
+    assert_eq!(face.advance_of_char('\u{4e2d}', TextEncoding::Unicode), 32);
+    assert_eq!(face.advance_of_char('A', TextEncoding::Unicode), 16);
 }
 
 /// The cell the synthetic face carries is where the face says it is: the advance and the bitmap
@@ -85,7 +90,7 @@ fn the_cell_is_what_the_face_parsed() {
 }
 
 /// The whole path a run takes: a real font file on this machine → a BBF face with ideographs in
-/// it. Named through the environment like the corpus audio samples, because a machine without the
+/// it. Named through the environment like the sample set audio samples, because a machine without the
 /// font is not a failure of this host.
 #[test]
 fn a_named_system_font_rasterizes_into_a_face() {
@@ -100,12 +105,12 @@ fn a_named_system_font_rasterizes_into_a_face() {
     );
     assert_eq!(face.height(), u32::from(SIZE));
     assert_eq!(
-        face.advance_of(0x4E2D),
+        face.advance_of_char('\u{4e2d}', TextEncoding::Unicode),
         u32::from(SIZE),
         "the face has a full-width cell for a CJK character"
     );
     assert_eq!(
-        face.advance_of(0x41),
+        face.advance_of_char('A', TextEncoding::Unicode),
         u32::from(SIZE) / 2,
         "and a half-width one for A"
     );
@@ -113,7 +118,7 @@ fn a_named_system_font_rasterizes_into_a_face() {
     let large = Face::Bbf(wide_face(&path, LARGE_SIZE).expect("the large face rasterizes"));
     assert_eq!(large.height(), u32::from(LARGE_SIZE));
     assert_eq!(
-        large.advance_of(0x41),
+        large.advance_of_char('A', TextEncoding::Unicode),
         u32::from(LARGE_SIZE) / 2,
         "the large designator is its own file, not a magnified one"
     );

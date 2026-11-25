@@ -22,10 +22,13 @@ impl Runtime {
         };
         let w = u16::try_from(img.width).map_err(|_| too_big(img.width))?;
         let h = u16::try_from(img.height).map_err(|_| too_big(img.height))?;
-        // 16 bits because that is the depth `rgb_to_native` packs, and the device's own.
+        // The picture is laid into the destination's own format, not a fixed 16 bpp: a 32-bpp frame's
+        // `SetupNativeImage`/`LoadResObject` bitmap is a four-byte surface, and a pack that composes
+        // into the bitmap it was handed writes at that stride.
+        let depth = self.display.device.depth;
         let src = self
             .display
-            .new_bitmap(&mut self.cpu.mem, &mut self.hle, w, h, 16)?;
+            .new_bitmap(&mut self.cpu.mem, &mut self.hle, w, h, depth)?;
         let dst = self
             .display
             .bitmap(src)
@@ -33,15 +36,20 @@ impl Runtime {
         for y in 0..img.height {
             for x in 0..img.width {
                 let (r, g, b) = img.rgb(x, y);
-                let px = rgb_to_native(device::make_rgb(r, g, b)) as u16;
-                self.cpu.mem.write_u16(
-                    dst.px + (y as i32 * dst.pitch) as u32 + x as u32 * 2,
-                    px as u32,
-                )?;
+                let at = dst.px + (y as i32 * dst.pitch) as u32 + x as u32 * u32::from(depth) / 8;
+                if depth == 32 {
+                    self.cpu
+                        .mem
+                        .write_u32(at, ((r as u32) << 16) | ((g as u32) << 8) | b as u32)?;
+                } else {
+                    self.cpu
+                        .mem
+                        .write_u16(at, rgb_to_native(device::make_rgb(r, g, b)) as u16 as u32)?;
+                }
             }
         }
         // The picture's own transparency goes onto the bitmap the blitter will read. Flattening to
-        // 565 above keeps the *colours* the pack shipped, and this is the other half of the same
+        // 565 above keeps the *colours* the pack provides, and this is the other half of the same
         // file: a PNG's `tRNS` entry or alpha channel says which of those pixels let the screen show
         // through, and without it a see-through tile background paints as its stored white.
         let map = if img.alpha.any_transparent() {
@@ -69,7 +77,13 @@ impl Runtime {
     /// paragraph is the one place in this header that says its input is in the screen system while
     /// every other `IGraphics` input is in the world system, so the two callers transform before
     /// arriving rather than sharing one assumption about the space.
-    pub(crate) fn paint_region(&mut self, st: &State, origin: (i32, i32), size: (i32, i32), flag: u32) {
+    pub(crate) fn paint_region(
+        &mut self,
+        st: &State,
+        origin: (i32, i32),
+        size: (i32, i32),
+        flag: u32,
+    ) {
         let (x, y) = origin;
         let (w, h) = size;
         let mut cv = self.canvas(*st);
@@ -89,14 +103,20 @@ impl Runtime {
 
     /// The `ITransform` slots. `TransformBltSimple` is a blit whose source rectangle is read through a
     /// reflection or a turn first — the geometry is in [`Display::transform_in`] — and the composite
-    /// mode maps exactly the way melange's own shortcut maps it: `COMPOSITE_KEYCOLOR` is the
+    /// mode maps exactly the way a reference front end's own shortcut maps it: `COMPOSITE_KEYCOLOR` is the
     /// transparent raster op, and the header says outright that every other value is to be treated as
     /// opaque.
     ///
     /// `TransformBltComplex` is the matrix form of the same question, and it is the one a pack uses:
     /// 1356 calls in a single run, every one of them a horizontal mirror (`A=-256, D=+256` in
     /// The header sheet. The maths is in [`Display::transform_complex_in`].
-    pub(crate) fn itransform(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn itransform(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let Some(transform) = self.transforms.get(&this).copied() else {
             return Err(HleError::NotAnObject { addr: this });
         };
@@ -210,7 +230,7 @@ impl Runtime {
             // corresponding to the specified symbol value", and its Comments name the answer
             // for a symbol the device does not have: "If the symbol does not exist on the device a space
             // character will be returned `(AECHAR)' '`". This host's font comes from the pack's
-            // own resource, so it carries no device-defined symbol glyphs: the SDK defines the symbol **values**
+            // own resource, so it carries no device-defined symbol glyphs: the platform defines the symbol **values**
             // (`AEE_SYM_*`, 22 of them) but the mapping from a symbol to a character is a property of the
             // device's font, and there is none here to consult. So every symbol is one that "does not exist on
             // the device", which the header already says what to do with.
@@ -248,6 +268,9 @@ impl Runtime {
             }
             "Update" => {
                 let [posted] = self.args()?;
+                // A page that changed since the last frame is the viewer's own debt, and this is
+                // the last moment before the pixels leave: see `paint_html_views`.
+                self.paint_html_views(this)?;
                 self.display.update(&self.cpu.mem, this, posted)?;
                 Ok(0)
             }
@@ -258,7 +281,7 @@ impl Runtime {
                 // to draw into. A pack may ask for 8 bpp and fill it before blitting it out, so 8 bpp
                 // has to be a depth this host backs — see `display::check_depth`.
                 //
-                // `w` and `h` pass straight through: the shipped 3.1.2 wrapper is exactly
+                // `w` and `h` pass straight through: the reference 3.1.2 wrapper is exactly
                 // `DIB_New(colorDepth, w, h, 0)`, and `DIB_NewEx` keys the pixel pointer on `w * h`,
                 // so both zero names an empty DIB. This host used to
                 // substitute the screen size here, inferred from twins asking `8, 0, 0` — withdrawn.
@@ -286,7 +309,7 @@ impl Runtime {
                 // extra numbers are **read and said** rather than assumed: a caller that asked for a
                 // palette size this host would not build learns that here instead of finding out
                 // from pixels that came out wrong. `w`/`h` pass through as they do for
-                // `CreateDIBitmap`: the shipped Ex wrapper allocates a 32-bpp DIB scaled to hold the
+                // `CreateDIBitmap`: the reference Ex wrapper allocates a 32-bpp DIB scaled to hold the
                 // bytes it needs and then restates `cx`/`cy`/`nDepth`/`nPitch`/`pRGB`/`cntRGB` itself,
                 // with no screen-size substitution anywhere in it.
                 let [ppv, depth, h, w, palette, extra]: [u32; 6] = self.args()?;
@@ -391,16 +414,16 @@ impl Runtime {
                 )
             }
             "SetPrefs" => {
-                // `IDISPLAY_SetPrefs(pi, pchSettings, cSettings)`. The header does publish the list
-                // of names — `w` screen width, `h` screen height, `c` colour scheme, `a` annunciators
-                // — and this host has no behaviour for any of them, so the contract's own answer
-                // applies: "EUNSUPPORTED if the destination is not a device bitmap **or the display
-                // does not support display settings**". Answering SUCCESS while doing nothing is the
-                // shape this repository keeps having to hunt: a caller that checks the code learns
-                // nothing, and a caller that does not believes its screen just changed size. The
-                // string is still recorded, because which names a shipped pack actually sends is how
-                // we would learn which of the four deserves real behaviour. Measured: none of the 35
-                // packs in the sweep calls this at all.
+                // `IDISPLAY_SetPrefs(pi, pchSettings, cSettings)` hands the list to the device
+                // bitmap's own `IBitmapDev2_SetPrefs`, which is where the four names are defined:
+                // `w` screen width, `h` screen height, `c` colour scheme, `a` annunciators.
+                //
+                // The height is the one a guest pack actually uses, and the reason this slot had
+                // to be served rather than refused: a pack whose frame is laid out for a taller
+                // panel asks for that height, and then clears the frame it believes it was given.
+                // Refusing while a pack does not check the answer left it writing past the screen
+                // the host had made. The string is still recorded, because which names a pack sends
+                // is how this stays honest about the ones still unserved.
                 let [settings, count] = self.args()?;
                 let cap = if count as i32 <= 0 {
                     256
@@ -415,11 +438,12 @@ impl Runtime {
                     }
                     bytes.push(b);
                 }
-                let asked = String::from_utf8_lossy(&bytes).into_owned();
+                let asked = crate::encoding::stream_text(u32::from(self.device.encoding), &bytes);
                 if !self.display_prefs.contains(&asked) {
-                    self.display_prefs.push(asked);
+                    self.display_prefs.push(asked.clone());
                 }
-                Ok(g::AEE_EUNSUPPORTED)
+                self.display
+                    .set_prefs(&mut self.cpu.mem, &mut self.hle, &asked)
             }
             "DrawText" => {
                 let [nfont, text, nchars, x, y, prc, flags] = self.args()?;
@@ -440,7 +464,7 @@ impl Runtime {
             // `IDisplay::NotifyEnable(pcb)` is the same delivered body as
             // `IBitmapDev::NotifyEnable` — `IDisplay`'s vtable begins with `IBitmapDev`'s, and this is
             // slot 5 of it — so it answers the same two things and registers nothing. Read it in
-            // [`Runtime::ibitmapdev`], where the shipped body and the disassembly that shows the
+            // [`Runtime::ibitmapdev`], where the documented behaviour and the inspection that shows the
             // forward carrying `pcb` in r1 are written out: `AEE_EBADPARM` for a null callback,
             // `AEE_EUNSUPPORTED` for a real one, because this host has no device object at record
             // `+124` to hand it to.
@@ -478,7 +502,13 @@ impl Runtime {
     /// been rotated relative to …". This host's device bitmap is never
     /// rotated, so the number is `0` — and that is the answer the slot exists to give, not a placeholder:
     /// a caller that lays out an unrotated screen is correct here.
-    pub(crate) fn ibitmaprot(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn ibitmaprot(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -505,14 +535,14 @@ impl Runtime {
     ///
     /// Three slots, all documented:
     ///
-    /// * `Update` — the shipped body decides, and its last line is the answer here.
+    /// * `Update` — the documented behaviour decides, and its last line is the answer here.
     ///   `OEMBitmap_Update` pushes the dirty rectangle
     ///   through `IDISPLAYDEV_Update` when the bitmap has a display device, and otherwise merges it
     ///   into a parent with `IBITMAP_Invalidate` + `IBITMAPDEV_Update(m_pParentDev)`; a bitmap with
     ///   **neither** falls to `return SUCCESS` having copied nothing. This host exports the face on
     ///   one object — the screen bitmap, which is what the display presents, so it has no device to
     ///   push to and no parent to merge into — and that fall-through is therefore this slot's whole
-    ///   behaviour, not a shortcut around it. One layer out the shipped wrapper agrees:
+    ///   behaviour, not a shortcut around it. One layer out the reference wrapper agrees:
     ///   `PWBitmapDev_Update` is twelve bytes that load the wrapped
     ///   object's own slot 3 and tail-call it, keeping its return. `Update` takes **no** `bDefer`
     ///   (`spec` slot 3 with one parameter); that argument belongs to
@@ -523,7 +553,13 @@ impl Runtime {
     ///   otherwise a registration ("It is desirable to reregister for this notification in the callback
     ///   function …"). The bitmap neither changes state nor goes away here, so it is kept and
     ///   never fired.
-    pub(crate) fn ibitmapdev(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn ibitmapdev(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -534,7 +570,16 @@ impl Runtime {
                 let [iid, ppv] = self.args()?;
                 self.answer_qi(this, iid, ppv, &[g::AEEIID_IBitmapDev])
             }
-            "Update" => Ok(g::AEE_SUCCESS),
+            "Update" => {
+                // "copies the bitmap to its associated display synchronously". The face was handed
+                // out for the device bitmap, but a bitmap no display is showing has nothing to copy
+                // to — that is the case the body falls through on. See `Runtime::dev_of`.
+                let source = self.dev_of.get(&this).copied();
+                if source == Some(self.display.device_bitmap()) {
+                    self.display.present_device_bitmap();
+                }
+                Ok(g::AEE_SUCCESS)
+            }
             "IsEnabled" => Ok(g::TRUE),
             "NotifyEnable" => {
                 let [pcb] = self.args()?;
@@ -550,7 +595,7 @@ impl Runtime {
             // and the code this host's state deserves: "`AEE_EUNSUPPORTED` if this bitmap does not
             // support preferences". Neither face has behaviour for any of the four names —
             // the device configuration is fixed when a run starts — so the string is kept in a note
-            // instead, for the reason `IDisplay::SetPrefs` gives: which names a shipped pack sends is
+            // instead, for the reason `IDisplay::SetPrefs` gives: which names a guest pack sends is
             // how any of the four would earn real behaviour.
             "SetPrefs" => {
                 let [settings, count] = self.args()?;
@@ -565,7 +610,7 @@ impl Runtime {
                 self.display.note(format!(
                     "IBitmapDev2::SetPrefs({:?}) - this host has no behaviour for w/h/c/a, and the \
                      header has a word for that: EUNSUPPORTED",
-                    String::from_utf8_lossy(&bytes)
+                    crate::encoding::stream_text(u32::from(self.device.encoding), &bytes)
                 ));
                 Ok(g::AEE_EUNSUPPORTED)
             }
@@ -576,7 +621,7 @@ impl Runtime {
     /// `IBitmapScale`'s one slot. The interface is a **service** — a scaler taking a source and a
     /// destination bitmap with their own rectangles, a clip, and a transparency operation
     /// (`AEEBITMAPSCALE_OPAQUE`/`ALPHA`/`KEYCOLOR`, the header) — and this
-    /// host publishes no object under that name: no class id for it exists anywhere in this SDK, so
+    /// host publishes no object under that name: no class id for it exists anywhere in this platform, so
     /// `CreateInstance` has nothing to hand out and the slot is reachable by id only, the position
     /// `ICharsetConv`, `IVersion` and `IBearerTechnology` are also in.
     ///
@@ -585,7 +630,13 @@ impl Runtime {
     /// `EUNSUPPORTED` is the true statement about that, and it is also the one that keeps a pack from
     /// ending its run at `unimplemented`. A pack that needed scaling would be the reason to write a
     /// real one — but inventing it now would answer a question no caller here has asked.
-    pub(crate) fn ibitmapscale(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn ibitmapscale(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -658,12 +709,12 @@ impl Runtime {
                 self.hold(buf, 1)?;
                 Ok(g::AEE_SUCCESS)
             }
-            // answers `SUCCESS` whatever it was given, including null. The shipped body
+            // answers `SUCCESS` whatever it was given, including null. The documented behaviour
             // addrefs the new destination *before* asking it for an `ITransform` and only
             // lets the old pair go afterwards, and the query's answer decides which of
             // the object's two bodies the draw slots reach (). A destination this host
             // made answers the query the way `IBitmap`'s own `QueryInterface` answers it for a pack; a
-            // bitmap a module built for itself answers nothing, which is the shipped route to the
+            // bitmap a module built for itself answers nothing, which is the reference route to the
             // simple bodies rather than an error.
             "SetDestination" => {
                 let [dst] = self.args()?;
@@ -840,7 +891,7 @@ impl Runtime {
     /// The `ITransform` taken out of a destination bitmap, which is the same face a pack gets by
     /// asking `IBitmap::QueryInterface` for `AEECLSID_TRANSFORM` — the query the delivered body runs
     /// before it decides which pair of draw bodies to install (). A bitmap this host
-    /// never made has no face to hand over, and that is the shipped route to the simple bodies rather
+    /// never made has no face to hand over, and that is the reference route to the simple bodies rather
     /// than an error.
     pub(crate) fn transform_face(&mut self, bitmap: u32) -> HResult<u32> {
         if self
@@ -993,15 +1044,17 @@ impl Runtime {
         let resolved = if let Some(face) = self.foundry_fonts.get(&this) {
             Some(face.clone())
         } else {
-            self.hle
-                .object(this)
-                .and_then(|o| {
-                    FONT_FACES
-                        .iter()
-                        .find(|(cls, _)| *cls == o.clsid)
-                        .map(|(_, face)| *face)
+            let cls = self.hle.object(this).map(|object| object.clsid);
+            cls.and_then(|cls| self.font_class_faces.get(&cls).cloned())
+                .or_else(|| {
+                    cls.and_then(|cls| {
+                        FONT_FACES
+                            .iter()
+                            .find(|(known, _)| *known == cls)
+                            .map(|(_, designator)| *designator)
+                    })
+                    .and_then(|designator| self.display.face(designator))
                 })
-                .and_then(|designator| self.display.face(designator))
         };
         let Some(font) = resolved else {
             return Err(unimplemented());
@@ -1012,12 +1065,12 @@ impl Runtime {
                 self.answer_qi(this, iid, ppv, &[g::AEEIID_IFont])
             }
             // `IFont::GetInfo(pinfo, nSize)` — the two numbers a layout needs before it can place a
-            // line. The header publishes the struct as two `int16`s, and both shipped bodies
+            // line. The header publishes the struct as two `int16`s, and both platform routines
             // compare the caller's `sizeof` for **equality**:
             // `if (sizeof(*pInfo) != nSize) return EUNSUPPORTED;` (
             // The delivered body
             // half-filled — answering SUCCESS there would hand back a record whose other fields the
-            // shipped member never wrote.
+            // reference member never wrote.
             "GetInfo" => {
                 let [pinfo, nsize] = self.args()?;
                 let info = abi::struct_info("AEEFontInfo").ok_or_else(unimplemented)?;
@@ -1025,7 +1078,7 @@ impl Runtime {
                     return Ok(g::AEE_EUNSUPPORTED);
                 }
                 if pinfo == 0 {
-                    // The shipped body has no pointer check at all — it copies into whatever address it
+                    // The documented behaviour has no pointer check at all — it copies into whatever address it
                     // was handed — so this refusal is the host's own line, not the ABI's.
                     return Ok(g::AEE_EBADPARM);
                 }
@@ -1073,7 +1126,7 @@ impl Runtime {
                     max_width as i32
                 };
                 if width < 0 {
-                    // The shipped measuring loop has no sign test — the delivered body accumulates
+                    // The reference measuring loop has no sign test — the delivered body accumulates
                     // a width and asks `if (wid > nMaxWidth)`, so a negative budget is exceeded by the
                     // first character, steps back off it, and stops: `pnFits = 0`, `pnPixels = 0`, and
                     // still `SUCCESS`. The header gives `0` the same reading ("zero means zero").
@@ -1084,9 +1137,10 @@ impl Runtime {
                     self.cpu.mem.write_u32(pn_pixels, 0)?;
                     return Ok(g::AEE_SUCCESS);
                 }
-                // No display object: the shipped body measures out of the font's own metrics
+                // No display object: the documented behaviour measures out of the font's own metrics
                 // (the delivered body never read a display), so a pack
                 // that asks a font before it has asked for the display is answered, not refused.
+                let enc = self.text_encoding();
                 let pixels = Display::measure_face(
                     &mut self.cpu.mem,
                     &font,
@@ -1094,6 +1148,7 @@ impl Runtime {
                     nchars as i32,
                     width,
                     pn_fits,
+                    enc,
                 )?;
                 self.cpu.mem.write_u32(pn_pixels, pixels)?;
                 Ok(g::AEE_SUCCESS)
@@ -1218,6 +1273,9 @@ impl Runtime {
                     let addr =
                         self.hle
                             .new_object(&mut self.cpu.mem, "IBitmapDev", iid, 8, 4, &[])?;
+                    // Which bitmap this face belongs to, so `Update` can tell the screen from a
+                    // bitmap no display is showing. See `Runtime::dev_of`.
+                    self.dev_of.insert(addr, this);
                     return self.give_object(addr, ppv);
                 }
                 if iid == g::AEEIID_BITMAPROT {
@@ -1235,10 +1293,10 @@ impl Runtime {
                 }
                 if iid == g::AEECLSID_AEEDIB {
                     // The delivered body
-                    // out"). The shipped body answers it with the address of `pPaletteMap` and takes no
+                    // out"). The documented behaviour answers it with the address of `pPaletteMap` and takes no
                     // reference — a pointer that is not the `IDIB` any caller could walk. This host
                     // hands back the bitmap itself, with the reference every other answer carries; the
-                    // shipped interior pointer is not something a pack can reach a record through.
+                    // reference interior pointer is not something a pack can reach a record through.
                     return self.return_object(this, ppv);
                 }
                 if iid != g::AEEIID_IBitmap {
@@ -1359,6 +1417,37 @@ impl Runtime {
         }
     }
 
+    /// Which raster an animated image draws now. An explicit `DrawFrame` index wins; otherwise a
+    /// started image advances on the virtual clock using `IPARM_RATE` when the caller set one, and
+    /// the file's own frame delays otherwise.
+    fn image_frame_index(&self, frame: i32, state: &ImageFrames, parm: &ImageParm) -> usize {
+        let count = state.rasters.len();
+        if count == 0 {
+            return 0;
+        }
+        if frame >= 0 {
+            return (frame as usize).min(count - 1);
+        }
+        if let Some(start) = state.started_ms {
+            let elapsed = self.clock_ms.saturating_sub(start);
+            if parm.rate > 0 {
+                return ((elapsed / parm.rate) as usize) % count;
+            }
+            let total: u32 = state.delays.iter().map(|d| u32::from(*d) * 10).sum();
+            if total > 0 {
+                let mut at = elapsed % total;
+                for (i, &delay) in state.delays.iter().enumerate() {
+                    let span = u32::from(delay) * 10;
+                    if at < span {
+                        return i;
+                    }
+                    at -= span;
+                }
+            }
+        }
+        state.current.min(count - 1)
+    }
+
     /// Copy an image onto the applet's screen, which is all `IImage::Draw` asks for.
     ///
     /// `frame` is the `nFrame` of `IImage::DrawFrame`; plain `Draw` is frame 0. The frame is picked
@@ -1366,11 +1455,32 @@ impl Runtime {
     /// not normally supporting animation" — a PNG among them — and a caller counting frames
     /// 0..`IPARM_NFRAMES` means steps of exactly that width.
     pub(crate) fn blit_image(&mut self, obj: u32, frame: i32, x: i32, y: i32) -> HResult<u32> {
-        let src = self
-            .images
-            .get(&obj)
-            .copied()
-            .ok_or(HleError::NotAnObject { addr: obj })?;
+        let animated = self.image_frames.get(&obj);
+        let is_animated = animated.is_some();
+        let mut parm = self.image_parm.get(&obj).copied().unwrap_or_default();
+        let src = if let Some(state) = animated {
+            let index = self
+                .image_frame_index(frame, state, &parm)
+                .min(state.rasters.len().saturating_sub(1));
+            let src = state.rasters[index];
+            if frame < 0 {
+                // Remember the frame the clock landed on, so a later `Stop` freezes the picture
+                // that is actually on screen rather than jumping back to the first frame.
+                if let Some(state) = self.image_frames.get_mut(&obj) {
+                    state.current = index;
+                }
+            }
+            // A decoded frame is a whole picture; the strip width the caller may have named is a
+            // different feature, so it must not slide a window inside this raster.
+            parm.cx_frame = None;
+            parm.frames = None;
+            src
+        } else {
+            self.images
+                .get(&obj)
+                .copied()
+                .ok_or(HleError::NotAnObject { addr: obj })?
+        };
         let b = self
             .display
             .bitmap(src)
@@ -1385,11 +1495,16 @@ impl Runtime {
         // `IPARM_OFFSET` name a portion of a sprite sheet, and `IPARM_ROP` names how it is laid
         // down. Both paths below carry the same three, because a pack that composited onto its own
         // display was asking for the same portion of the same image.
-        let parm = self.image_parm.get(&obj).copied().unwrap_or_default();
+        //
         // The frame slides the source window along the strip; whatever portion the caller named
-        // still applies inside it, and the clamping is the same rule with the shifted origin.
-        let stride = parm.frame_width(i32::from(b.width), i32::from(b.height));
-        let (sx, sy) = (parm.off.0 + frame.max(0) * stride, parm.off.1);
+        // still applies inside it, and the clamping is the same rule with the shifted origin. An
+        // animated picture already picked its raster, so there is no strip to slide.
+        let (sx, sy) = if is_animated {
+            (parm.off.0, parm.off.1)
+        } else {
+            let stride = parm.frame_width(i32::from(b.width), i32::from(b.height));
+            (parm.off.0 + frame.max(0) * stride, parm.off.1)
+        };
         let (cx, cy) = {
             let mut window = parm;
             window.off = (sx, sy);
@@ -1430,5 +1545,4 @@ impl Runtime {
             .bit_blt(&mut self.cpu.mem, disp, x, y, cx, cy, src, sx, sy, parm.rop)?;
         Ok(0)
     }
-
 }

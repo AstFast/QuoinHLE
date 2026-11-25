@@ -1,6 +1,6 @@
 //! The resources a run was given, looked up the way a handset looks them up.
 //!
-//! A shipped module names resources by file and id and never by the container's internal kind
+//! A guest module names resources by file and id and never by the container's internal kind
 //! ranges, so a lookup here is by id first. That leniency is deliberate and bounded: the kind a
 //! container records is what its author wrote, and a module asking `ISHELL_LoadResString` for an id
 //! its own manifest files as an image is a question about *the id*, not about our taxonomy.
@@ -17,7 +17,7 @@ use crate::resource::{self, Container, RESTYPE_STRING};
 /// sibling lookup then silently finds nothing. A bare file name means "the current directory", so
 /// the module's `.bar`/`.mif`/`.par` files are mounted exactly as they are when the caller passes
 /// an absolute path.
-pub(crate) fn dir_of(mod_path: &Path) -> PathBuf {
+pub fn dir_of(mod_path: &Path) -> PathBuf {
     match mod_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -55,7 +55,7 @@ pub struct Found {
     pub body: Vec<u8>,
     /// The property block itself, which is where the payload's own declared type lives — see
     /// [`resource::mime`]. The kind above is only the table the container filed it under, and the
-    /// corpus files MIDI and text under the image kind.
+    /// sample set files MIDI and text under the image kind.
     pub props: Vec<u8>,
     /// The resource as the container stores it, property block included. `ISHELL_LoadResData`
     /// answers with these: the app is handed the bytes and skips the block itself.
@@ -100,7 +100,7 @@ impl Store {
         }
         // The app-info manifest is named for the directory the module was expanded into and sits one
         // level *above* it — `<appid>.mif` beside the `<appid>/` that holds the `.mod` — which is how
-        // all ten builds in this corpus are laid out. It is the file the handset answers
+        // all ten builds in this sample set are laid out. It is the file the handset answers
         // `ISHELL_LoadResString(NULL, 8, …)` from, the version every AppGen applet asks for as it is
         // created, so a store that only looks beside the `.mod` cannot serve it for any pack.
         //
@@ -135,23 +135,52 @@ impl Store {
             let Some(stem) = mod_path.file_stem() else {
                 return mounted;
             };
-            for extension in ["mif", "bar"] {
+            let matches = |extension: &str| {
                 let mut name = stem.to_os_string();
                 name.push(".");
                 name.push(extension);
-                // Compared case-insensitively against what mounted, because the ancestor rule above
-                // asks the filesystem instead — and on this host that means `MUSICPLAYER.MIF` would be
-                // found there and missed here if this were an exact match. `candidates()` already
-                // compares mounted names this way. The name kept is the one that mounted, so the
-                // report quotes the file as it is spelled on disk.
                 let want = name.to_string_lossy().into_owned();
-                if let Some(found) = mounted
+                mounted
                     .iter()
                     .find(|mounted| mounted.eq_ignore_ascii_case(&want))
-                {
-                    self.own = Some(found.clone());
-                    break;
+                    .cloned()
+            };
+            let same_stem_mif = matches("mif");
+            let same_stem_bar = matches("bar");
+            // A pack expanded into its own directory can name its manifest for the *app id*
+            // (`15099.mif`) while its art keeps the module's name (`splintercell.bar`). Taking the
+            // same-stem `.bar` here used to make that art the app's own container: it has no
+            // `AEEAppInfo`, so `--start auto` probed 132 ids and declared that none belonged to the
+            // module, while the class the manifest names built an applet at once. Only promote a
+            // lone numeric manifest when it really carries the app-info record; a directory with two
+            // manifests, or one with no app-info in either, keeps the older answer.
+            let numeric_manifest = if same_stem_mif.is_none() {
+                let mifs: Vec<&String> = mounted
+                    .iter()
+                    .filter(|name| name.to_ascii_lowercase().ends_with(".mif"))
+                    .collect();
+                match mifs.as_slice() {
+                    [only] if self.has_app_info(only) => Some((*only).clone()),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+            self.own = same_stem_mif
+                .or(numeric_manifest)
+                .or(same_stem_bar);
+        }
+        // Some of the collection's apps are expanded into `<appid>/` with the manifest named for the
+        // numeric app id (`18555.mif`, `23030.mif`) rather than for the module. When no named
+        // manifest matched and exactly one `.mif` was mounted, that one is this app's: a directory
+        // carrying two app manifests is a bundle another rule has already answered for.
+        if self.own.is_none() {
+            let manifests: Vec<&String> = mounted
+                .iter()
+                .filter(|name| name.to_ascii_lowercase().ends_with(".mif"))
+                .collect();
+            if let [only] = manifests.as_slice() {
+                self.own = Some((*only).clone());
             }
         }
         mounted
@@ -239,7 +268,7 @@ impl Store {
     ///
     /// Built from what [`Store::mount_file`] accepted, so a caller listing this describes the same set
     /// a lookup can answer from — no second policy about which sibling file counts. A record's `kind`
-    /// is only the table it was filed under, and the corpus files MIDI and text under the image kind,
+    /// is only the table it was filed under, and the sample set files MIDI and text under the image kind,
     /// which is why [`Record::mime`] travels with it.
     pub fn inventory(&self) -> Vec<(String, Vec<Record>)> {
         let mut out = Vec::new();
@@ -284,6 +313,33 @@ impl Store {
         self.own.clone()
     }
 
+    /// Every string record in the app's own manifest. A few packs name their applet class as
+    /// text (`"0x0103de2b"` in a `STRING` record) rather than in the `AEEAppInfo` binary record
+    /// the classic layout uses; insa's image holds no such word at all.
+    pub fn own_strings(&self) -> Vec<Vec<u16>> {
+        let Some(own) = &self.own else {
+            return Vec::new();
+        };
+        let Some((_, bytes)) = self.files.iter().find(|(name, _)| name == own) else {
+            return Vec::new();
+        };
+        let Ok(container) = Container::parse(bytes) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for record in container.all().unwrap_or_default() {
+            if record.kind != RESTYPE_STRING {
+                continue;
+            }
+            if let Ok(mut languages) = resource::strings(record.body) {
+                if let Some(first) = languages.drain(..).next() {
+                    out.push(first);
+                }
+            }
+        }
+        out
+    }
+
     /// The resource of this kind and id, in the order [`Store::candidates`] says to try.
     pub fn find(&self, named: Option<&str>, kind: u16, id: u16) -> Option<Found> {
         for (name, bytes) in self.candidates(named, &self.files) {
@@ -326,10 +382,27 @@ impl Store {
         None
     }
 
+    /// Whether a mounted container carries the `RESTYPE_BINARY` record of id 2 an `AEEAppInfo`
+    /// lives in. The selector above uses this to tell an app's own manifest from a same-named art
+    /// container; the record is not parsed here because its fields belong to the ABI tables.
+    fn has_app_info(&self, name: &str) -> bool {
+        let Some((_, bytes)) = self.files.iter().find(|(mounted, _)| mounted == name) else {
+            return false;
+        };
+        let Ok(container) = Container::parse(bytes) else {
+            return false;
+        };
+        container
+            .find(resource::RESTYPE_BINARY, 2)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.body.len() >= 20)
+    }
+
     /// The app's own `AEEAppInfo`, which its manifest carries as a `RESTYPE_BINARY` record of id 2.
     ///
     /// This is the record a handset's shell reads to know what applet is installed at all: the class
-    /// id, the resource id its title and icon sit above, and its flags. Every manifest in this corpus
+    /// id, the resource id its title and icon sit above, and its flags. Every manifest in this sample set
     /// holds one, and for one pack — whose `.mod` is 568 bytes of loader for a compressed image it
     /// inflates into the heap — the class id exists *nowhere else*, so a host that does not read
     /// this file cannot know what the pack is.

@@ -349,7 +349,7 @@ fn query_interface_answers_five_ids_and_clears_the_slot_before_refusing() {
     }
     // Two ids that are *not*: `AEECLSID_SOCKET`, whose `me + 4` answer belongs to `AEESockPort`
     // (and is a 13 there, not a 3), and `AEEIID_ISockPort` — the number
-    // the header publishes for this very table, which the shipped body never lists.
+    // the header publishes for this very table, which the documented behaviour never lists.
     assert!(!m.accepts(CLS_SOCKET));
     assert!(!m.accepts(0x0103_9ba8));
     assert!(!m.accepts(0));
@@ -697,7 +697,7 @@ fn bytes_move_one_way_at_a_time_and_the_peer_wakes_only_when_the_ring_empties() 
     assert!(m.write_from(caller, b" there", true).fires.is_empty());
     let (done, bytes) = m.read_into(server, 20, true);
     assert_eq!((done.ret, bytes), (11, b"hello there".to_vec()));
-    // The shipped wake test is `held_after + taken == 512` — the ring has to have been **full** when
+    // The reference wake test is `held_after + taken == 512` — the ring has to have been **full** when
     // the read ran. Eleven bytes drained from an eleven-byte ring leave 11 of 512, so nobody is
     // woken: the writer still has the room it never lost. The full-ring case is the next test.
     assert!(done.fires.is_empty());
@@ -726,11 +726,11 @@ fn the_ring_holds_exactly_512_bytes_and_a_full_peer_blocks_the_writer() {
     );
     assert_eq!(m.is_writeable(caller), EWOULDBLOCK);
     assert_eq!(m.write_from(caller, b"x", true), Done::refused(EWOULDBLOCK));
-    // `Read` takes at most what it asked for, and the `0xffff` clamp is the shipped one: a request
+    // `Read` takes at most what it asked for, and the `0xffff` clamp is the reference one: a request
     // above 64 KiB is capped to 65535, which is larger than the ring, so the ring is what decides.
     let (done, bytes) = m.read_into(server, 0x1_0000, true);
     assert_eq!((done.ret, bytes.len()), (RING as i32, RING));
-    // …and this is the case the shipped condition is written for: the ring was full, so draining it
+    // …and this is the case the reference condition is written for: the ring was full, so draining it
     // is what gives the writer its room back.
     assert_eq!(
         done.fires,
@@ -860,7 +860,7 @@ fn recv_from_consumes_the_datagram_before_it_checks_the_from_address() {
     // A size word under 8: the body has already memmoved the payload into the caller's buffer and
     // freed the queue record, so the message is gone, the bytes are in the buffer, and the answer is
     // -1/515 with `pFrom` and `*pnSize` untouched. `None` here would be the host quietly eating bytes
-    // the shipped code delivers.
+    // the platform code delivers.
     assert_eq!(
         m.recv_from(b, 20, true, false, true),
         (
@@ -959,7 +959,7 @@ fn close_keeps_the_listening_bit_and_releases_what_the_queue_held() {
         .server;
     let done = m.close(listener);
     let record = m.record(listener).unwrap();
-    // bits 0 and 1 go, bit 2 stays — the shipped line is `flags = (flags >> 1) << 1 & ~2`.
+    // bits 0 and 1 go, bit 2 stays — the reference line is `flags = (flags >> 1) << 1 & ~2`.
     assert_eq!(record.flags, 4);
     assert_eq!(record.pipe, Pipe::None);
     assert_eq!(
@@ -999,7 +999,7 @@ fn the_two_armers_park_fire_or_refuse_by_the_errno_and_ignore_a_blank_callback()
     assert_eq!(m.readable(caller, 0x20, 4), Arm::Parked);
     assert_eq!(m.readable(caller, 0x30, 4), Arm::Parked);
     assert_eq!(m.record(caller).unwrap().readable, vec![0x30, 0x20]);
-    // Already readable ⇒ the shipped body resumes at once instead of parking.
+    // Already readable ⇒ the documented behaviour resumes at once instead of parking.
     let server = m
         .connect(caller, FAMILY_INET, 0xa000, LOOPBACK.to_be(), true)
         .unwrap()
@@ -1085,7 +1085,7 @@ fn release_at_zero_is_close_then_unlink_and_the_peer_hears_both_chains() {
         .connect(caller, FAMILY_INET, 0xc000, LOOPBACK.to_be(), true)
         .unwrap()
         .server;
-    // The order the shipped `Release` body keeps: `Close` runs while the record is still on the
+    // The order the reference `Release` body keeps: `Close` runs while the record is still on the
     // list, and the unlink follows. `Close`'s answer is the notification — both chains of the peer,
     // which is the body's `EventOccurred(peer, 3)`.
     let done = m.close(caller);

@@ -13,7 +13,7 @@ Set-StrictMode -Version Latest
 # face at run time — the manager's font page, `program_data_dir()/fonts`, and the operating
 # system's own paths — so a build that names nothing still draws text, and an archive that
 # carries nothing is a complete release. `-Font` and `-FontDir` are for the case where a
-# particular face should travel with the binary: they copy files from this machine into the
+# particular face should travel with the binary: they copy caller-supplied files into the
 # archive, which puts the licence question on whoever chose them. Nothing in this repository is
 # a font, so a checkout has nothing to fall back to.
 function Get-FontSelection {

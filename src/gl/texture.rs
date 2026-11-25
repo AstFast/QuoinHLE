@@ -8,6 +8,7 @@ impl Texture {
             width: 1,
             height: 1,
             rgba: vec![255, 255, 255, 255],
+            uploaded: false,
             internal: GL_RGBA,
             levels: Vec::new(),
             depth: Vec::new(),

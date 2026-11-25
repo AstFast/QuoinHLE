@@ -38,6 +38,9 @@ impl Runtime {
             Ok(rv) if *rv == g::AEE_SUCCESS => true,
             Ok(_) => reached_host,
         };
+        // Recorded before the early return: "did the module take this class" is a decision
+        // `discover_applet_class` makes, and a refusal is the answer it has to be able to see.
+        self.last_class_taken = took;
         if !took {
             return;
         }
@@ -72,7 +75,7 @@ impl Runtime {
         });
     }
 
-    /// The accepted classes the report may accuse: an id the SDK publishes an interface for, whose
+    /// The accepted classes the report may accuse: an id the platform publishes an interface for, whose
     /// object's vtable is shorter than that interface. Nothing else belongs here — see
     /// [`Runtime::accepted_unjudged_classes`], and see [`AcceptedClass::too_short`] for why the two
     /// are separable by this one test.
@@ -110,7 +113,11 @@ impl Runtime {
     /// which a null, a vtable pointer or a word that was never an object cannot do. Those keep
     /// answering `NotAnObject`, which is what they answered before, and what the crash report reads
     /// as the null it is.
-    pub(crate) fn adopt_module_object(&mut self, this: u32, iface: Option<&'static str>) -> Result<(), Error> {
+    pub(crate) fn adopt_module_object(
+        &mut self,
+        this: u32,
+        iface: Option<&'static str>,
+    ) -> Result<(), Error> {
         let Some(iface) = iface.filter(|i| is_an_abi_name(i)) else {
             return Ok(());
         };
@@ -190,7 +197,7 @@ impl Runtime {
         // the one field every shape holds *this* shell in, and `m_pIModule` has to name a module
         // this run loaded. Trying the layouts in turn instead of assuming one is what keeps a
         // working MP applet from being reported as "not an AEEApplet": its `m_pIShell` sits at 24
-        // with `m_pIModule` *before* it at 20, which is not a shift of the SDK's offsets and so was
+        // with `m_pIModule` *before* it at 20, which is not a shift of the platform's offsets and so was
         // invisible to the two-candidate test that preceded this table.
         //
         // Each candidate's `m_pIShell` word is read as the walk goes, so a refusal can report all
@@ -198,9 +205,9 @@ impl Runtime {
         // diagnosis. A match ends the walk early: the answer is known, and the offsets are only
         // meaningful up to the size of the object being tried, so reading on would quote whatever
         // the heap put next door as if it were a field.
-        let mut seen = [0u32; 3];
+        let mut seen = [0u32; 4];
         let mut claimed = 0u32;
-        let mut hit = None;
+        let mut hit: Option<(AppletLayout, u32, bool)> = None;
         for (i, layout) in AppletLayout::ALL.iter().enumerate() {
             seen[i] = self.cpu.mem.read_u32(applet + layout.shell)?;
             if seen[i] != self.shell {
@@ -208,8 +215,15 @@ impl Runtime {
             }
             let module = self.cpu.mem.read_u32(applet + layout.module)?;
             if self.owns_module(module) {
-                hit = Some((*layout, module));
+                hit = Some((*layout, module, true));
                 break;
+            }
+            // A module this host never adopted, but shaped like one, is what a self-unpacking
+            // pack answers with — see `module_shaped`. Keep walking: a later layout whose module
+            // *is* held is a better answer than this one.
+            if self.module_shaped(module) {
+                hit.get_or_insert((*layout, module, false));
+                continue;
             }
             if claimed == 0 {
                 claimed = module;
@@ -218,7 +232,7 @@ impl Runtime {
         // A module that publishes actors, extensions or service factories instead of an applet
         // answers a class with an object of a different shape. Saying "not a host object" here named
         // the wrong suspect — see `hle::Error::NotAnApplet` for the words the report now uses.
-        let Some((layout, module)) = hit else {
+        let Some((layout, module, known)) = hit else {
             return Err(Error::Hle(HleError::NotAnApplet {
                 addr: applet,
                 cls,
@@ -230,7 +244,19 @@ impl Runtime {
         // The applet's own `m_pIModule` is what "the running module" means from here: a class asked
         // for after this start is resolved against the module that built the applet, not the one the
         // run was launched with.
-        self.run_module = module;
+        //
+        // With one exception, and it is the self-unpacking pack: the `.mod` the loader mapped is
+        // only an unpacker that inflates the real image and jumps into it, so the applet names an
+        // `IModule` the guest built afterwards rather than one this host adopted. That word is a
+        // good enough record that the object *is* an applet (`module_shaped` is what reads it), but
+        // it cannot be the pointer a later class question goes through — the registry has no entry
+        // for it. The unpacker answers in its place: its own `CreateInstance` is what built this
+        // object, and on the handset the payload is not a module the shell ever knew either.
+        self.run_module = if known {
+            module
+        } else {
+            self.created_module().unwrap_or(0)
+        };
         self.applet = applet;
         self.app_cls = cls;
         // From here until `EVT_APP_START` has been answered the applet is starting, not yet the
@@ -256,8 +282,10 @@ impl Runtime {
         // Every construction below — the running module's and each library's — is an *applet* being
         // built, which `get_app_instance` has to be able to tell from an ordinary object.
         self.starting_applets += 1;
+        self.constructing_applets += 1;
         let created = self.create_applet_object(cls, ppv);
         self.starting_applets -= 1;
+        self.constructing_applets -= 1;
         let rv = created?;
         if rv != g::AEE_SUCCESS {
             return Ok(rv);
@@ -278,6 +306,12 @@ impl Runtime {
         psz_args: u32,
     ) -> Result<u32, Error> {
         self.adopt_applet(applet, cls)?;
+        // The constructor has finished; a `constructor`-scoped legacy answer stops here, before
+        // the applet's own `EVT_APP_START` loads any more images.
+        if self.oem_until_applet {
+            self.oem_native_images = false;
+            self.oem_until_applet = false;
+        }
         // The shell links a history entry for every applet it starts, at the head of the chain —
         // which is what `gBREW[238]` is, and therefore what a history object's cursor is born
         // pointing at (`AEEAppHistory_New`'s `v5[2] = gBREW[238]`). The launch string is the one this
@@ -300,11 +334,11 @@ impl Runtime {
         // `EVT_APP_START` first, because that is the event the ABI fixed and the one every classic
         // applet answers. Brew MP's *window* applications are the exception: they are started with
         // `EVT_APP_START_WINDOW` ("Start event for window application") and treat
-        // the classic event as one they were not written for. Both MP packs in the corpus say so in
+        // the classic event as one they were not written for. Both MP packs in the sample set say so in
         // their own words — `settingsapp` returns `FALSE` to it from a handler that logs nothing and
         // asks this host for nothing, and `contactapp` prints
         // `************EVT_APP_START_WINDOW************` the moment it is
-        // handed the windowed one — so the applet is the witness, and a refusal from a MP-shaped
+        // handed the windowed one — so the applet is the record, and a refusal from a MP-shaped
         // applet is retried once with the windowed event before it is taken as a refusal.
         //
         // Nothing else is retried. A classic applet's `FALSE` is a real answer from a handler that
@@ -367,7 +401,9 @@ impl Runtime {
             .string(None, (base + g::IDR_NAME_OFFSET) as u16)?;
         // `Store::string` guarantees a terminator, and a manifest that pads its name with spaces is
         // showing them in a title bar if this does not trim.
-        let text = String::from_utf16_lossy(&units);
+        // `Store::string` answers the text the container holds, already Unicode; an applet's name
+        // is shown by the host, not stored back into the guest, so no device encoding is involved.
+        let text = TextEncoding::Unicode.units_to_string(&units);
         let text = text
             .trim_matches(['\0', ' ', '\r', '\n'].as_ref())
             .to_string();
@@ -386,19 +422,57 @@ impl Runtime {
     /// The manifest is the other half, and for one pack the only half: `1073744582`'s `.mod` is 568
     /// bytes of loader for an image it inflates into the heap at run time, and its class id appears
     /// nowhere in those 568 bytes. It is in the `<appid>.mif` beside it, as the first word of the
-    /// `RESTYPE_BINARY` record of id 2 — the same record every other manifest in the corpus carries,
+    /// `RESTYPE_BINARY` record of id 2 — the same record every other manifest in the sample set carries,
     /// and whose id matches the one this scan finds by other means for all of them.
+    /// A class id the app's own manifest spells as text. insa carries `"0x0103de2b"` in a string
+    /// record of its `.bar`; the id appears nowhere in the 142040-byte image, so the word scan
+    /// cannot find it and the manifest's `AEEAppInfo` record is absent. The text is the pack's own
+    /// declaration, and starting the pack by it works.
+    fn declared_text_class(&self) -> Option<u32> {
+        for units in self.resources.own_strings() {
+            let text = TextEncoding::Unicode.units_to_string(&units);
+            let text = text.trim_matches(['\0', ' ', '\t', '\r', '\n'].as_ref());
+            let Some(hex) = text
+                .strip_prefix("0x")
+                .or_else(|| text.strip_prefix("0X"))
+            else {
+                continue;
+            };
+            if hex.len() != 8 {
+                continue;
+            }
+            let Ok(cls) = u32::from_str_radix(hex, 16) else {
+                continue;
+            };
+            let family = cls >> 16;
+            if (0x0100..=0x0107).contains(&family)
+                || family == 0x0180
+                || family == 0x0a00
+            {
+                return Some(cls);
+            }
+        }
+        None
+    }
+
     pub(crate) fn candidate_classes(&self) -> Result<Vec<u32>, Error> {
         let Some(loaded) = self.module.as_ref() else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
         let mut at = loaded.base;
+
         while at + 4 <= loaded.base + loaded.len {
             let word = self.cpu.mem.read_u32(at)?;
-            // Published BREW class ids sit between the system range and the top nibble a module
-            // would never use; anything else in the image is a pointer, a length or code.
-            if (0x0100_0000..=0x0fff_ffff).contains(&word)
+            // Published classes live in the 0x0100–0x0107 families, plus The carrier's 0x0180 private
+            // range and the 0x0a00 AppGen range. The wider 0x01xx–0x0fxx sweep the first
+            // version used collected ARM instructions — `bx lr` is 0x012fff1e, `pop {r4,pc}`
+            // is 0x08bd4010 — and probing one of those first faulted guest2's generic
+            // constructor before the image's real class (`0x0102cd2e`) was ever asked about.
+            let family = word >> 16;
+            if ((0x0100..=0x0107).contains(&family)
+                || family == 0x0180
+                || family == 0x0a00)
                 && !self.host_answers_itself(word)
                 && !out.contains(&word)
             {
@@ -411,11 +485,46 @@ impl Runtime {
         out.retain(|w| *w != APPGEN_CLSID);
         out.insert(0, APPGEN_CLSID);
         // The manifest's declaration goes before even that: it is the id the pack was *installed*
-        // under, not a guess from a word that happens to be shaped like one.
-        if let Some(cls) = self.applet_field("cls") {
+        // under, not a guess from a word that happens to be shaped like one. A pack that names
+        // its class only as text still counts as declaring it.
+        if let Some(cls) = self
+            .applet_field("cls")
+            .or_else(|| self.declared_text_class())
+        {
             out.retain(|w| *w != cls);
             out.insert(0, cls);
         }
+        Ok(out)
+    }
+
+    /// Every other word in `0x0100..=0x01ff` that could be a private class id.
+    ///
+    /// The narrow sweep stops at `0x0107` because the wider range collects ARM instructions
+    /// (`bx lr` is `0x012fff1e`). A private family — au's `0x01a0` and `0x015x` — lives above that
+    /// line, and a module whose only class sits there answers `AEE_EFAILED` to every narrow id.
+    /// This pass hands the remainder over, ordered so that ids whose low half looks like an index
+    /// (`…0001`, `…0002`) come before words whose low half is code, which is the cheapest way to
+    /// ask the real candidates first. The caller tolerates faults here; it does not read them as
+    /// ownership.
+    pub(crate) fn wide_candidate_classes(&self, narrow: &[u32]) -> Result<Vec<u32>, Error> {
+        let Some(loaded) = self.module.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut at = loaded.base;
+        while at + 4 <= loaded.base + loaded.len {
+            let word = self.cpu.mem.read_u32(at)?;
+            let family = word >> 16;
+            if (0x0100..=0x01ff).contains(&family)
+                && !narrow.contains(&word)
+                && !self.host_answers_itself(word)
+                && !out.contains(&word)
+            {
+                out.push(word);
+            }
+            at += 4;
+        }
+        out.sort_by_key(|w| w & 0xffff > 0x00ff);
         Ok(out)
     }
 
@@ -424,23 +533,87 @@ impl Runtime {
     /// Asking is the only way to know. A classic module publishes no class list, and
     /// `IModule::CreateInstance` answers a class it does not own by handing it straight back to
     /// `IShell::CreateInstance` — which this runtime recognises as a decline, and which records
-    /// nothing. So an id counts as owned when the module produced an object for it, *or* when the
-    /// probe got as far as asking the shell for a service or a resource: declining a class never
-    /// reaches that. The second test is what keeps an applet whose constructor needs a handset
-    /// service we have not written from being reported as "not this module's class".
+    /// nothing. So an id counts as owned when the module produced an object for it, *or* when its
+    /// answer came from the module's own code rather than from that hand-back. The second half is
+    /// [`Runtime::last_class_taken`], and it is the one test that separates a class whose constructor
+    /// then failed on a service this host has not written from a class that was never its own.
+    ///
+    /// The test this used to run — whether the probe added to the missing-resource or missing-class
+    /// ledgers — could not make that separation. A refusal is refused by the shell too, and the shell
+    /// records the id in `missing_classes`, so *every* stranger looked like a class the module had
+    /// taken. A sample whose manifest names a class the module does not answer for made that visible:
+    /// with its `.mif` readable, `helloworld` offered `0x01009ff0` first and discovery stopped there.
     ///
     /// Nothing is adopted and no event is sent here: an owned id whose constructor then faults has
     /// still answered the ownership question, and that answer is the useful half.
     pub fn discover_applet_class(&mut self) -> Result<AutoStart, Error> {
-        let candidates = self.candidate_classes()?;
+        // Stage one: the families a published class id actually lives in. Everything the sample set
+        // declares sits here, and this is the sweep the guest2 fix narrowed the search to.
+        let narrow = self.candidate_classes()?;
+        let found = self.discover_in(&narrow, true, 0)?;
+        if found.cls != 0 || found.note.is_some() {
+            return Ok(found);
+        }
+        // Stage two: every narrow id was turned down. A private class can still sit outside those
+        // families — au's `0x01a0`/`0x015x` ids do, and the wide sweep is what found them before the
+        // narrowing. Sweep the rest of `0x0100..=0x01ff` once, tolerating faults: a word-shaped
+        // instruction there (`bx lr` is `0x012fff1e`) faults the generic constructor, and that says
+        // nothing about the class. Only reachable when nothing in the image's own families claimed
+        // the applet, so the guest2 false positive — a probe that stops on an instruction *before*
+        // the real class is asked — cannot happen here.
+        let wide = self.wide_candidate_classes(&narrow)?;
+        if wide.is_empty() {
+            return Ok(found);
+        }
+        let again = self.discover_in(&wide, false, narrow.len())?;
+        if again.cls != 0 || again.note.is_some() {
+            return Ok(again);
+        }
+        Ok(AutoStart {
+            tried: narrow.len() + wide.len(),
+            ..found
+        })
+    }
+
+    /// One pass over `candidates`. `strict` is the narrow sweep: a fault there means the module got
+    /// past its own comparison, so the class is owned and the reason is reported. A non-strict pass
+    /// treats a fault as "not a class" and keeps going, because its candidate list also contains
+    /// instruction words.
+    fn discover_in(
+        &mut self,
+        candidates: &[u32],
+        strict: bool,
+        base: usize,
+    ) -> Result<AutoStart, Error> {
         let recorded = self.accepted_classes.len();
         for (n, cls) in candidates.iter().enumerate() {
             let ppv = self.cpu.mem.alloc_zeroed(4)?;
             let classes = self.missing_classes.len();
             let resources = self.missing_resources.len();
-            let outcome = self.create_via_module(*cls, ppv);
-            let asked =
+            self.last_class_taken = false;
+            // The probe is the other door an applet is built through, and it is a start in every way
+            // that matters to a timer: the module's constructor runs here, and it may arm one.
+            self.constructing_applets += 1;
+            let mut outcome = self.create_via_module(*cls, ppv);
+            self.constructing_applets -= 1;
+            // `APPGEN_CLSID` is offered before anything the image holds, because a module that
+            // compares nothing builds its applet for it. A module that *does* compare may still be
+            // handed it first and fault inside the generic constructor — guest2 reads a null the
+            // real class would have filled. That fault is not an answer about any class in the
+            // image, so the probe keeps going instead of ending on the synthetic default. The same
+            // holds for every 0x0a00 word the image scan finds: that range is also ARM's `beq`
+            // encoding, so a false candidate there can fault the generic path just as the default
+            // does.
+            let appgen = (*cls >> 16) == 0x0a00;
+            // Two facts, and the class is owned only when both hold: the probe asked for something
+            // this host owes, **and** the module's own code ran to ask it. The ledger alone cannot
+            // answer the second — a class the module refuses is refused by the shell too, and that
+            // refusal is recorded — while `last_class_taken` alone is too wide for this decision (it
+            // is also true of a constructor that failed without asking for anything, which the test
+            // below pins as "not chosen").
+            let owed =
                 self.missing_classes.len() > classes || self.missing_resources.len() > resources;
+            let asked = owed && self.last_class_taken;
             let applet = match outcome {
                 Ok(rv) if rv == g::AEE_SUCCESS => self.cpu.mem.read_u32(ppv)?,
                 Ok(_) => 0,
@@ -448,22 +621,34 @@ impl Runtime {
                 // `create_via_module` returns the refusal. Only a module that got past its own
                 // comparison reaches code this host cannot serve, so *any* fault here means the class
                 // was owned — with the reason kept, because owned-and-unstartable is still answered.
+                // The synthetic default is the exception: a fault there says the module is not the
+                // generic applet, not that it owns the name.
                 Err(e) => {
+                    if appgen || !strict {
+                        self.crash = None;
+                        self.last_fault = None;
+                        continue;
+                    }
                     return Ok(AutoStart {
                         cls: *cls,
-                        tried: n + 1,
+                        tried: base + n + 1,
                         applet: 0,
                         note: Some(e.to_string()),
                     })
                 }
             };
             // A probe that returned a failure value is the ambiguous case: that is both a decline and
-            // an applet whose constructor failed because the shell would not give it a service. The
-            // ledgers tell those apart, because declining a class asks the shell for nothing.
+            // an applet whose constructor failed because the shell would not give it a service. Both
+            // halves of `asked` are needed to tell them apart — see where it is computed.
             if applet != 0 || asked {
+                // The module took the default and built nothing: keep looking for a class it can
+                // actually construct. A real class from the image is still reported as owned.
+                if appgen && applet == 0 {
+                    continue;
+                }
                 return Ok(AutoStart {
                     cls: *cls,
-                    tried: n + 1,
+                    tried: base + n + 1,
                     applet,
                     note: None,
                 });
@@ -471,7 +656,7 @@ impl Runtime {
         }
         Ok(AutoStart {
             cls: 0,
-            tried: candidates.len(),
+            tried: base + candidates.len(),
             applet: 0,
             note: self.took_without_an_object(recorded),
         })
@@ -609,7 +794,7 @@ impl Runtime {
             return Ok(());
         }
         // The resource controller's wake is not a callback the app wrote either: it is this host's stand
-        // for the `AEECallback` the shipped record embeds, whose notify is the runtime's own
+        // for the `AEECallback` the reference record embeds, whose notify is the runtime's own
         // `IResourceCtl_ObjNotify`. Reading the pair happens inside that hook, not here.
         if self.res_ctl.wake != 0 && pcb == self.res_ctl.wake {
             return self.resource_obj_notify();
@@ -730,7 +915,7 @@ impl Runtime {
     /// Three events rather than two because the shell puts an `EVT_KEY` between the press and the
     /// release when the device supports key repeat, and an applet written against the older
     /// contract switches on `EVT_KEY` alone — send only the pair and such an applet never sees the
-    /// key at all, which is exactly how a shipped game looked dead to input here.
+    /// key at all, which is exactly how a guest game looked dead to input here.
     pub fn press_key(&mut self, code: u32) -> Result<u32, Error> {
         self.dispatch_event(g::EVT_KEY_PRESS, code, 0)?;
         self.dispatch_event(g::EVT_KEY, code, 0)?;
@@ -785,7 +970,7 @@ impl Runtime {
         if self.cpu.mem.read_u32(allow)? == 0 {
             // The header's `dwParam` is a `boolean *`: FALSE means the applet declined to close and
             // is still running. The `int` return tells the caller, but a pack that ignores it (as the
-            // corpus's exit paths do) would otherwise leave a failed exit entirely silent. Keep the
+            // sample set's exit paths do) would otherwise leave a failed exit entirely silent. Keep the
             // fact in the report and put it on stderr, where a headless run can see it.
             let said = "CloseApplet: the applet refused EVT_APP_STOP, so it is still running";
             self.display.note(said);
@@ -1117,6 +1302,24 @@ impl Runtime {
                 || self.libraries.iter().any(|lib| lib.module == module))
     }
 
+    /// Whether `module` is shaped like an `IModule` built by this run: a vtable pointer, a
+    /// reference count, and *this* shell at offset 8.
+    ///
+    /// A self-unpacking pack needs this. Its mapped `.mod` inflates the real image into the guest
+    /// heap and jumps into it, and the payload builds its own `IModule` — same three words as every
+    /// module this host synthesizes, but a pointer the registry never saw, because nothing in the
+    /// loader adopted it. The applet the payload then builds names that module, and refusing the
+    /// applet over it would trade a working start for a bookkeeping detail.
+    ///
+    /// What this deliberately does *not* say is "any pointer will do": the shell word is the fixed
+    /// address of this run's `IShell`, so an object that carries it at an `IModule`'s offset is
+    /// either a module or an object built to masquerade as one — and the alternative reading, that
+    /// it is an actor or a factory whose neighbouring word happens to be the shell, is what the
+    /// three-layout walk already ruled out before this is asked.
+    fn module_shaped(&self, module: u32) -> bool {
+        module != 0 && self.cpu.mem.read_u32(module + 8).ok() == Some(self.shell)
+    }
+
     /// Read the image at `path`, load it into this machine, and start the applet the module declares
     /// for itself.
     ///
@@ -1156,6 +1359,7 @@ impl Runtime {
         self.handlers = loose.handlers;
         self.static_ptr = loose.static_ptr;
         self.images = loose.images;
+        self.image_frames = loose.image_frames;
         self.image_display = loose.image_display;
         self.file_maps = loose.file_maps;
         self.files = loose.files;
@@ -1187,5 +1391,4 @@ impl Runtime {
         self.dispatcher.owners = loose.dispatch.owners;
         self.res_ctl = loose.res_ctl;
     }
-
 }

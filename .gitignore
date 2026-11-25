@@ -30,7 +30,7 @@
 # Release archives from `build.ps1 -Package`: output, not source.
 /dist/
 
-# The maintainer's ABI tooling, and the SDK trees plus the extracted spec it reads. The tables it
+# The maintainer's ABI tooling, and the Interface trees plus the extracted spec it reads. The tables it
 # produces are committed; none of the inputs are, and must not be.
 # The directories do not exist in a checkout; these rules are here for the day somebody copies one in.
 /tools/

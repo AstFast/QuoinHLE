@@ -19,11 +19,11 @@ impl Runtime {
     /// fields and **twelve** bytes, `+8` for `roImage` — and this table copies it. But both bodies that
     /// move a record of this type move **eight** bytes, and the way `Menu_GetStyleOffsets` reads them
     /// (`+0` into `IDisplay::DrawFrame`, then halfwords at `+2` and `+4`) puts its three used members at
-    /// a pitch the header's types cannot produce. So the shipped runtime's `AEEItemStyle` is a different
+    /// a pitch the header's types cannot produce. So the reference runtime's `AEEItemStyle` is a different
     /// shape than the header's, and what is known per byte is only its *role* — which is why the records
     /// are reproduced as bytes rather than filled through the header's field names.
     ///
-    /// What the values are is witnessed: they come from the three `AEEDeviceInfo` fields the device reads
+    /// What the values are is recorded: they come from the three `AEEDeviceInfo` fields the device reads
     /// (`cxScreen`, `cyScreen`, `nColorDepth`), which is why this answers from the host's own screen
     /// rather than a theme. Bytes `+1` and `+7` are zero because the device clears the record before
     /// choosing four of its bytes; a caller that logs the record sees the same thing on both.
@@ -57,7 +57,13 @@ impl Runtime {
 
     /// The `IDialog` slots: the seven the delivered body's vtable names beyond `AddRef`/`Release`, which
     /// the object machinery answers for every host class.
-    pub(crate) fn idialog(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn idialog(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let mut dialog = self
             .dialogs
             .get(&this)
@@ -71,7 +77,7 @@ impl Runtime {
             // `ADialog_GetControl` walks the list and answers with the control it holds. It does not
             // `AddRef` it: the dialog holds the only reference, which is why releasing the dialog
             // releases the controls, and why a pack that keeps this pointer past `ISHELL::EndDialog`
-            // is holding what the shipped object has already freed.
+            // is holding what the reference object has already freed.
             "GetControl" => {
                 let [want] = self.args()?;
                 Ok(dialog.control(want as u16).unwrap_or(0))
@@ -81,7 +87,7 @@ impl Runtime {
                 dialog.pfn = pfn;
                 dialog.user = user;
                 self.dialogs.insert(this, dialog);
-                // The slot is `void`; the shipped body leaves the object in `r0`, and a caller that
+                // The slot is `void`; the documented behaviour leaves the object in `r0`, and a caller that
                 // reads `r0` from a void call is reading whatever the body happened to return.
                 Ok(this)
             }
@@ -107,7 +113,7 @@ impl Runtime {
         }
     }
 
-    /// The class an object of this host was made from. The shipped controls keep the same fact in
+    /// The class an object of this host was made from. The reference controls keep the same fact in
     /// their own first word — `TimeCtl.m_cls`, tested by the `IsAlarmClock` / `IsCountDown` /
     /// `IsStopWatch` macros at the delivered body — and it is the class and not the interface that
     /// decides several of their answers, because three classes share the one `ITimeCtl` vtable.
@@ -115,10 +121,59 @@ impl Runtime {
         self.hle.object(addr).map_or(0, |o| o.clsid)
     }
 
+    /// Paint one `IHtmlViewer`: the `Redraw` door's own body, shared with the deferred repaint below
+    /// so the two cannot drift apart.
+    fn html_redraw(&mut self, this: u32, disp: u32) -> HResult<u32> {
+        // `HVP_TRANSPARENT`: the reference `Redraw` opens with
+        //
+        //     if (properties & 0x10) { record.code = 10; notify(...); }
+        //
+        // so the request to erase what is *under* the page goes out before the page paints, and the
+        // painter then draws no paper of its own. Sent from this door rather than from
+        // `Widgets::redraw` because the callback is guest code and only the runtime can run it; the
+        // property is read here for the same reason the fill is read there — a pack may set it
+        // between frames.
+        if self.widgets.properties(this)? & g::HVP_TRANSPARENT != 0 {
+            self.html_notify(this, g::HVN_ERASEBKGND, 0)?;
+        }
+        // `case 9` of the reference layout loop loads `<body background>` through the shell, not
+        // through the network. It has to be settled before the redraw walks the picture cache. The
+        // transparent branch above does not skip it: the load happens at layout time, and only the
+        // *painting* of it is replaced.
+        self.html_load_background(this)?;
+        let now = self.clock_ms;
+        let html = self.widgets.html(this)?;
+        let epoch = *html.marquee_epoch.get_or_insert(now);
+        html.marquee_elapsed = now.saturating_sub(epoch);
+        self.widgets
+            .redraw(&mut self.cpu.mem, &mut self.display, disp, this)
+    }
+
+    /// Paint every page that changed since the last frame, just before that frame is presented.
+    ///
+    /// `IHtmlViewer::Redraw` is the interface's own statement that the pack need not ask: "The
+    /// application does not normally have to call this function to ensure that the screen has been
+    /// updated after changes have been made to the content or options of the viewer. The viewer
+    /// takes care of ... ensuring that changes are properly reflected on the screen." A handset
+    /// pays that debt in its screen-invalidate pass; this host has none. Painting inside `SetData`
+    /// instead would be too early: the dialog-shaped packs set the page first and *then* draw their
+    /// frame around it, which is the order that leaves a notification window with an empty body if
+    /// the page is painted before the frame.
+    pub(crate) fn paint_html_views(&mut self, disp: u32) -> HResult<()> {
+        for ctl in self.widgets.html_views_to_paint() {
+            // The debt is settled before the paint rather than after it: `html_redraw` can run
+            // guest code (the `HVN_ERASEBKGND` report, a `<body background>` load), and a callback
+            // that reaches `IDisplay::Update` again must not find the same page still owed a paint.
+            self.widgets.html_painted(ctl);
+            self.html_redraw(ctl, disp)?;
+        }
+        Ok(())
+    }
+
     /// What `ADialog_Redraw` does with the controls it owns: give each one the active state the
     /// dialog's own focus says it should have, render it, and end with one `IDisplay_Update(1)`.
-    /// The shipped member draws the frame and the copyright line around them first, out of system
-    /// colours this host has no witness for; the contents are the half that carries the app's own
+    /// The reference member draws the frame and the copyright line around them first, out of system
+    /// colours this host has no record for; the contents are the half that carries the app's own
     /// pixels, so that is the half that lands here.
     pub(crate) fn dialog_redraw(&mut self, obj: u32) -> Result<(), Error> {
         let Some(dialog) = self.dialogs.get(&obj).cloned() else {
@@ -140,7 +195,7 @@ impl Runtime {
     /// news goes to the owner applet. With neither, the answer is FALSE — which is also the answer
     /// that makes `ISHELL::CreateDialog` fail when there is no applet running to accept its dialog.
     ///
-    /// The shipped version enters the owner's *app context* around the call, so a dialog owned by a
+    /// The reference version enters the owner's *app context* around the call, so a dialog owned by a
     /// suspended applet runs its handler with that applet as the current one. This host routes the
     /// news to whichever applet is running now, which is the same applet whenever a dialog is driven
     /// by the code that made it.
@@ -175,7 +230,7 @@ impl Runtime {
             if last != want {
                 // `if ( v5 != 0 ) SetFocus(old, FALSE)`: the gate is the old **id**, while the
                 // rollback three lines down is gated on the old *node*. So a control that held focus
-                // under id 0 keeps its active state after the dialog has moved on, and the shipped
+                // under id 0 keeps its active state after the dialog has moved on, and the reference
                 // member leaves it lit — nothing here gets to tidy that up.
                 if last != 0 {
                     if let Some(old) = prev {
@@ -196,7 +251,13 @@ impl Runtime {
 
     /// `IControl::HandleEvent` for a control this host made: the three codes a dialog fills a control
     /// with share the door, and everything else goes down the key path.
-    pub(crate) fn widget_handle_event(&mut self, ctl: u32, evt: u32, code: u32, dwp: u32) -> HResult<bool> {
+    pub(crate) fn widget_handle_event(
+        &mut self,
+        ctl: u32,
+        evt: u32,
+        code: u32,
+        dwp: u32,
+    ) -> HResult<bool> {
         if matches!(
             evt,
             g::EVT_CTL_ADD_ITEM | g::EVT_CTL_SET_TITLE | g::EVT_CTL_SET_TEXT
@@ -254,7 +315,7 @@ impl Runtime {
     }
 
     /// `ICONTROL_GetRect` for a control, read back as a rectangle rather than written for a caller.
-    /// The shipped hit test keeps one `AEERect` on its own stack and reuses it per row; this host has
+    /// The reference hit test keeps one `AEERect` on its own stack and reuses it per row; this host has
     /// no stack to borrow, so a guest module's control is asked through its vtable with a block this
     /// host allocated for the length of the question.
     pub(crate) fn control_rect(&mut self, ctl: u32) -> Result<Rect, Error> {
@@ -286,8 +347,14 @@ impl Runtime {
 
     /// The `DLG_HANDLE_ALL_EVENTS` step both branches end on. The record is read afresh, because a
     /// control that took the event may have moved the dialog's properties or its handler in the time
-    /// since — the shipped body re-reads `m_dwProps` and `m_pfnEvent` at that point too.
-    pub(crate) fn dialog_all_events(&mut self, obj: u32, evt: u32, wp: u32, dwp: u32) -> Result<bool, Error> {
+    /// since — the documented behaviour re-reads `m_dwProps` and `m_pfnEvent` at that point too.
+    pub(crate) fn dialog_all_events(
+        &mut self,
+        obj: u32,
+        evt: u32,
+        wp: u32,
+        dwp: u32,
+    ) -> Result<bool, Error> {
         let Some(dialog) = self.dialogs.get(&obj).cloned() else {
             return Ok(false);
         };
@@ -297,7 +364,7 @@ impl Runtime {
         Ok(self.call_guest(dialog.pfn, &[dialog.user, evt, wp, dwp])? != 0)
     }
 
-    /// `ADialog_HandleEvent`, in the shipped order and with the shipped gates.
+    /// `ADialog_HandleEvent`, in the reference order and with the reference gates.
     ///
     /// The prompt branch is not here: `m_bPrompt` is raised only by `ADialog_Prompt`, and the three
     /// returns it owns (`EVT_COMMAND`, the close key, the copyright key) all end in
@@ -334,7 +401,7 @@ impl Runtime {
             if evt == g::EVT_CTL_TAB {
                 // Forward is the focus node's `pNext`, wrapping to the head. Backward walks from the
                 // head for the node *before* the focus one, and when focus was already the head the
-                // shipped's second loop walks to the **last** node — so a dialog with one control
+                // reference's second loop walks to the **last** node — so a dialog with one control
                 // keeps that control, and TAB never leaves the list empty-handed.
                 let at = dialog
                     .focus
@@ -405,13 +472,13 @@ impl Runtime {
             }
         }
         if handler == 0 {
-            // The overlap rule is the loop's, not its comment's: the shipped walk does **not** stop at
+            // The overlap rule is the loop's, not its comment's: the reference walk does **not** stop at
             // the first control whose rectangle holds the point — it keeps going, re-focusing and
             // re-answering `pHandler` for every later one that also holds it, so the last hit wins,
             // even though the delivered body says "This gives the first control ID precedence".
             // The delivered body
             for node in dialog.controls.iter() {
-                // The focus control already had its turn above, and the shipped skips the focus *node*
+                // The focus control already had its turn above, and the reference skips the focus *node*
                 // by pointer, which is what re-reading `m_pFocus` per step reproduces.
                 let current = self.dialogs.get(&obj).and_then(|d| d.focus);
                 if current == Some(node.id) {
@@ -446,7 +513,7 @@ impl Runtime {
     /// `IShell::CreateInstance` for one control of a dialog record: the classes this host serves get
     /// their faces and their per-class records exactly as the shell's own door hands them out, and
     /// anything else is asked of the applet's module, which is where the shell sends a class it does
-    /// not know. `None` is the shipped "this control could not be made", and the caller leaves it out
+    /// not know. `None` is the reference "this control could not be made", and the caller leaves it out
     /// of the dialog rather than failing the whole thing.
     pub(crate) fn dialog_control(&mut self, cls: u32) -> Result<Option<u32>, Error> {
         if let Some((iface, _)) = HOST_SERVICES.iter().find(|(_, c)| *c == cls) {
@@ -482,7 +549,7 @@ impl Runtime {
         if slot == 0 {
             return Ok(None);
         }
-        // The shipped shell clears the caller's slot before it asks, and the answer the pack must be
+        // The reference shell clears the caller's slot before it asks, and the answer the pack must be
         // able to test is a null pointer rather than whatever its memory held.
         self.cpu.mem.write_u32(slot, 0)?;
         let code = self.create_via_module(cls, slot)?;
@@ -498,7 +565,7 @@ impl Runtime {
         Ok(Some(addr))
     }
 
-    /// The loader's `abort:`: release the half-built dialog the way the shipped loader does, which
+    /// The loader's `abort:`: release the half-built dialog the way the reference loader does, which
     /// takes its controls, its place on the applet's dialog chain and its own memory with it.
     pub(crate) fn abandon_dialog(&mut self, obj: u32) -> Result<(), Error> {
         let release =
@@ -527,11 +594,11 @@ impl Runtime {
     /// a frame — but the record is made, stacked where `ADialog_New` puts one, reported by
     /// `IShell::GetActiveDialog` while it is up, and closed through [`Runtime::finish_dialog`], which is
     /// the door that owns the end-of-dialog event. That is what a pack which waits for
-    /// `EVT_COPYRIGHT_END` before it builds its own screen needs, and one shipped pack does exactly
+    /// `EVT_COPYRIGHT_END` before it builds its own screen needs, and one guest pack does exactly
     /// that: without it the applet sat idle for the whole run, having drawn nothing.
     ///
     /// Two members of the record are worth naming because they look alike and are not. `ready` is
-    /// raised here: the shipped `ADialog_ShowCopyright` raises it along with the modal and copyright
+    /// raised here: the reference `ADialog_ShowCopyright` raises it along with the modal and copyright
     /// bits in one store to `m_dwProps`, and `ADialog_Release` reports only to a ready dialog.
     /// `prompt` stays down, because in this host that flag means "a `Prompt` already sent its command
     /// from `ADialog_Dismiss`" and a notice never sends one — raising it here would silence the one
@@ -569,7 +636,7 @@ impl Runtime {
     /// Close the copyright notice, which is what both of its endings do: the timer, and the key that
     /// `ADialog_HandleEvent` lets dismiss it (`evt == EVT_KEY && (m_dwProps & AEE_DIALOG_…copyright)`).
     ///
-    /// Either way the shipped body is `ADialog_Dismiss(pme, m_wDefCommand)` with `m_wDefCommand` zero,
+    /// Either way the documented behaviour is `ADialog_Dismiss(pme, m_wDefCommand)` with `m_wDefCommand` zero,
     /// so the close carries no `EVT_COMMAND` and the release carries the `EVT_COPYRIGHT_END`. The
     /// release is reached through `IDialog::Release`, not by dropping the record here: that path is
     /// where the chain re-link, the controls (there are none) and the end event already live, and a
@@ -588,7 +655,7 @@ impl Runtime {
     /// dialog's own `Release` and the loader's abort path reaches the same way: unstack the dialog,
     /// tell the owner it is over, release every control it made, and repaint whatever is now on top.
     ///
-    /// The shipped body also cancels the dialog's timers through `ISHELL_CancelTimer(NULL, po)`. This
+    /// The documented behaviour also cancels the dialog's timers through `ISHELL_CancelTimer(NULL, po)`. This
     /// door does not arm any yet — `ADialog_Timeout` is what sets one, and that is not this path — so
     /// there is nothing to take back, and the timer list is keyed by applet rather than by dialog.
     pub(crate) fn finish_dialog(&mut self, obj: u32, dialog: Dialog) -> Result<(), Error> {
@@ -596,7 +663,7 @@ impl Runtime {
             self.active_dialog = dialog.next;
         } else {
             // Otherwise walk the chain for the dialog this one hangs off, and let it point past the
-            // one going away — the shipped loop does exactly that walk before it re-links.
+            // one going away — the reference loop does exactly that walk before it re-links.
             let mut at = self.active_dialog;
             while at != 0 {
                 let Some(rec) = self.dialogs.get(&at).cloned() else {
@@ -645,7 +712,7 @@ impl Runtime {
     }
 
     /// `ICONTROL_HandleEvent` for the three codes a dialog uses to fill a control, which is also what
-    /// a pack can send a control itself. the delivered body states the rule the shipped controls
+    /// a pack can send a control itself. the delivered body states the rule the reference controls
     /// all follow: "Text ID is wParam, resource file is dwParam if coming from resource, otherwise
     /// wID is 0, and pText is actual text to set" — a non-zero `w` is an id to load out of the file
     /// `dw` names, and a zero `w` means `dw` already points at the text.
@@ -664,7 +731,7 @@ impl Runtime {
         // `res_named` is how the shell's own resource slots read a file argument: it takes the pointer
         // and answers the container mounted beside this module, so a control told `dwParam =
         // pszResFile` reaches the same text the dialog itself was read from. A zero `w` is the other
-        // reading the shipped controls share — `dw` *is* the text — and that one is served from here
+        // reading the reference controls share — `dw` *is* the text — and that one is served from here
         // because only a guest pointer can carry it.
         if w == 0 {
             let text = dw;
@@ -680,7 +747,13 @@ impl Runtime {
     /// The same door with the resource file already named, for host code that holds the name rather
     /// than a guest pointer to it — which is what `AEEDialog_Load` has in hand when it sends
     /// `EVT_CTL_SET_TITLE` with `pszResFile` as its fourth argument.
-    pub(crate) fn ctl_fill_at(&mut self, ctl: u32, evt: u32, w: u32, file: Option<&str>) -> HResult<bool> {
+    pub(crate) fn ctl_fill_at(
+        &mut self,
+        ctl: u32,
+        evt: u32,
+        w: u32,
+        file: Option<&str>,
+    ) -> HResult<bool> {
         if evt == g::EVT_CTL_ADD_ITEM || w == 0 {
             // An item arrives as a block, and a caller with no id to look up has no reason to come
             // this way: the dialog's fill step knows which of the two it holds.
@@ -688,7 +761,7 @@ impl Runtime {
         }
         let text = match self.res_string(file, w as u16)? {
             0 => {
-                // The shipped control tries an image next and, failing that, answers FALSE. A text id
+                // The reference control tries an image next and, failing that, answers FALSE. A text id
                 // that names neither is the control's problem to report, not this door's to invent an
                 // empty label for.
                 return Ok(false);
@@ -702,7 +775,7 @@ impl Runtime {
     }
 
     /// The dialog record a pack passes as `DialogInfo *`, walked the way `ADialog_Load` walks it: a
-    /// 20-byte head, then `nControls` items of `24 + 12 * nItems` bytes. That stride is the shipped
+    /// 20-byte head, then `nControls` items of `24 + 12 * nItems` bytes. That stride is the reference
     /// pointer arithmetic, not a guess — `sizeof(DialogItem) + sizeof(DListItem) * (nItems - 1)`, and
     /// one `DListItem` *less* when the count is zero, which is what makes a control with no items 24
     /// bytes and not 36.
@@ -774,7 +847,11 @@ impl Runtime {
     /// records of twelve bytes. The bytes are the ones `ISHELL::LoadResData` hands a pack for the same
     /// kind and id, so a dialog read through this door and one a module read for itself come from one
     /// answer, whatever the container's own property block turns out to be.
-    pub(crate) fn dialog_spec_res(&mut self, file: &str, id: u16) -> Result<Option<DialogSpec>, Error> {
+    pub(crate) fn dialog_spec_res(
+        &mut self,
+        file: &str,
+        id: u16,
+    ) -> Result<Option<DialogSpec>, Error> {
         let head = |field: &str| {
             abi::offset_of("DialogInfoHead", field).expect("DialogInfoHead is in the tables")
         };
@@ -824,7 +901,7 @@ impl Runtime {
                 .map(|f| f.stored)
             else {
                 // `if(!pdih) continue;` — a control id the container does not have costs that control
-                // and nothing else, in this loader exactly as in the shipped one.
+                // and nothing else, in this loader exactly as in the reference one.
                 continue;
             };
             let mut ctl = CtlSpec {
@@ -908,7 +985,7 @@ impl Runtime {
                 // `(evt, wParam, dwParam)`; on a control's key the code is in `wParam`. The three
                 // codes a dialog uses to fill a control are answered on the same door, because a pack
                 // sends them to a control it made itself: `EVT_CTL_SET_TITLE`, `EVT_CTL_SET_TEXT` and
-                // `EVT_CTL_ADD_ITEM`, which is what the shipped controls' own event doors take.
+                // `EVT_CTL_ADD_ITEM`, which is what the reference controls' own event doors take.
                 let [evt, code, dwp] = self.args()?;
                 Ok(u32::from(self.widget_handle_event(this, evt, code, dwp)?))
             }
@@ -916,7 +993,7 @@ impl Runtime {
                 if class == "IAClockCtl" {
                     return self.aclock_redraw(this);
                 }
-                // `HVP_TRANSPARENT`: the shipped `Redraw` opens with
+                // `HVP_TRANSPARENT`: the reference `Redraw` opens with
                 //
                 //     if (properties & 0x10) { record.code = 10; notify(...); }
                 //
@@ -926,18 +1003,7 @@ impl Runtime {
                 // can run it; the property is read here for the same reason the fill is read there
                 // — a pack may set it between frames.
                 if class == "IHtmlViewer" {
-                    if self.widgets.properties(this)? & g::HVP_TRANSPARENT != 0 {
-                        self.html_notify(this, g::HVN_ERASEBKGND, 0)?;
-                    }
-                    // `case 9` of the shipped layout loop loads `<body background>` through the
-                    // shell, not through the network. It has to be settled before the redraw walks
-                    // the picture cache. The transparent branch above does not skip it: the load
-                    // happens at layout time, and only the *painting* of it is replaced.
-                    self.html_load_background(this)?;
-                    let now = self.clock_ms;
-                    let html = self.widgets.html(this)?;
-                    let epoch = *html.marquee_epoch.get_or_insert(now);
-                    html.marquee_elapsed = now.saturating_sub(epoch);
+                    return self.html_redraw(this, disp);
                 }
                 Ok(self
                     .widgets
@@ -948,6 +1014,13 @@ impl Runtime {
                 // `AClock_SetActive` is empty.
                 if class == "IAClockCtl" {
                     return Ok(0);
+                }
+                // "This call usually results in the underlying control redrawing its contents": for
+                // a viewer the contents are a page, and the paint itself waits for the frame edge
+                // like every other one this host owes the class. Deactivating owes nothing — a
+                // reset drops the page and the caller draws the emptied control itself.
+                if class == "IHtmlViewer" && on != 0 {
+                    self.widgets.html_mark_dirty(this)?;
                 }
                 // A menu and a static repaint from inside this call (`IMenuCtl_SetActive` →
                 // `IMenuCtl_Redraw` → `Menu_Draw`; `AStatic_SetActive` → `AStatic_Redraw`), and the
@@ -1001,6 +1074,8 @@ impl Runtime {
                 // rather than on the next frame, which must not move the page by itself.
                 if class == "IHtmlViewer" {
                     self.html_fit(this)?;
+                    // The page moved or was resized: what is on the screen is now somewhere else.
+                    self.widgets.html_mark_dirty(this)?;
                 }
                 Ok(0)
             }
@@ -1026,12 +1101,12 @@ impl Runtime {
                     let mut clock = self.clocks.get(this).ok_or_else(|| gap())?;
                     clock.props = props;
                     self.clocks.put(this, clock);
-                    // One word in the shipped object (`m_dwProps`); the generic record keeps a copy
+                    // One word in the reference object (`m_dwProps`); the generic record keeps a copy
                     // for the readers that only know about controls.
                     self.widgets.set_properties(this, props)?;
                     return Ok(0);
                 }
-                // The shipped viewer re-runs its whole `SetRect` when the scrollbar bit flips —
+                // The reference viewer re-runs its whole `SetRect` when the scrollbar bit flips —
                 // that bit decides how wide the page is laid out, so the change is a layout
                 // change, not a paint hint.
                 let old_props = self.widgets.properties(this)?;
@@ -1049,7 +1124,7 @@ impl Runtime {
                 self.widgets.properties(this)
             }
             "Reset" => {
-                // The shipped `IHtmlViewer_Reset` is its own body, not the generic one:
+                // The reference `IHtmlViewer_Reset` is its own body, not the generic one:
                 // `Dox_Reset` frees the document, `Dox_SetUrl(dox, 0)` clears the base URL the
                 // next relative `href` would resolve against, the scroll timer is cancelled and
                 // the pen state is zeroed. The header adds that
@@ -1320,7 +1395,7 @@ impl Runtime {
                 Ok(0)
             }
             "GetStyle" | "SetStyle" => {
-                // The control's two style records, in the eight-byte shape the shipped body moves —
+                // The control's two style records, in the eight-byte shape the documented behaviour moves —
                 // the pair `MenuCtl_New` seeded from `IShell::GetItemStyle` and the caller has since
                 // been able to overwrite, half at a time. Each pointer is handled on its own in
                 // [`crate::widget`], which is what both bodies do.
@@ -1395,7 +1470,7 @@ impl Runtime {
                 Ok(0)
             }
             // `ITimeCtl::SetTime(dwMSecs, bIncUpdate)` — the delivered body. The second word decides
-            // only the shipped member's drawn-string cache and whether its tail `TimeCtl_Redraw`
+            // only the reference member's drawn-string cache and whether its tail `TimeCtl_Redraw`
             // repaints in place, so it is not a state this host keeps; the first is bounded by the
             // class: only the clock refuses anything past one day, and all three refuse a negative.
             "SetTime" => {
@@ -1431,7 +1506,7 @@ impl Runtime {
                 self.widgets.set_edit_field(this, field)?;
                 Ok(0)
             }
-            // `IImageCtl::SetImage(pi)`: the shipped body releases what it held and takes a reference
+            // `IImageCtl::SetImage(pi)`: the documented behaviour releases what it held and takes a reference
             // on the new picture, so an image a pack handed to a control
             // and then dropped its own reference to stays alive. `pi == 0` is a normal call.
             "SetImage" => {
@@ -1492,5 +1567,4 @@ impl Runtime {
             _ => Err(gap()),
         }
     }
-
 }

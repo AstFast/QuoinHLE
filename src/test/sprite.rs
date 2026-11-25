@@ -18,7 +18,7 @@ fn cmd(x: i32, y: i32, size: u8, index: u8, layer: u8, composite: u8) -> Cmd {
 
 #[test]
 fn sprites_are_walked_once_per_layer_and_a_bad_size_only_stains_the_result() {
-    // The shipped `for` is outside the `while`, so drawing order is by layer and then by
+    // The reference `for` is outside the `while`, so drawing order is by layer and then by
     // list order — a sprite on layer 1 that comes first in the list is still drawn *after* a layer 0
     // one that comes second. A size outside the four sets the result and keeps walking,
     // which is the difference between a refusal and a partly drawn screen with `EBADPARM` on top.
@@ -113,7 +113,7 @@ fn bit_15_names_the_caller_s_table_and_without_one_stains_the_answer() {
 
 #[test]
 fn a_hidden_layer_matches_no_pass() {
-    // `unLayer` is 0-3, and the header names 0xFF as "not drawn": the shipped pass loop never
+    // `unLayer` is 0-3, and the header names 0xFF as "not drawn": the reference pass loop never
     // reaches 0xFF, so the command is walked and dropped.
     let (blits, bad) = plan_sprites(
         &[cmd(0, 0, 0, 0, g::SPRITE_LAYER_HIDDEN as u8, 0)],

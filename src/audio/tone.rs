@@ -66,7 +66,7 @@ pub fn frequencies(id: u32) -> Option<(u16, u16)> {
         }
         // Call progress in the form the networks this host is likely to meet use. The header names
         // the tones but not their pitches, and these four are the same in every handset that ever
-        // shipped on those networks.
+        // reference on those networks.
         0x3f => (440, 480), // ringback
         0x40 => (480, 620), // busy
         0x43 => (480, 620), // reorder
@@ -79,7 +79,7 @@ pub fn frequencies(id: u32) -> Option<(u16, u16)> {
 ///
 /// `0` in the record is *not* a tune of −64: it is a player that has never been tuned, because
 /// [`crate::runtime::Player::default`] leaves the field alone. The centre is `0x40`, which the
-/// shipped body writes for a step of zero.
+/// documented behaviour writes for a step of zero.
 pub fn tune_step(tune: u32) -> i32 {
     if tune == 0 {
         0

@@ -1,8 +1,8 @@
 //! The handset's app resource containers, and the pictures inside them.
 //!
-//! A shipped app's art and text live in a `.bar` file — and, as it turns out, in a `.mif` font
+//! A guest app's art and text live in a `.bar` file — and, as it turns out, in a `.mif` font
 //! too: both are the same container, found here by matching its signature across a third-party
-//! corpus. The layout below was read off every one of them and holds on all of them, with the two
+//! sample set. The layout below was derived from every one of them and holds on all of them, with the two
 //! exceptions [`Container::parse`] says it tolerates:
 //!
 //! ```text
@@ -13,7 +13,7 @@
 //!            covering first_id..= first_id+extra_ids at consecutive table slots
 //!       table: resource count + 1 *absolute* u32 file offsets; resource j is
 //!            [table[j], table[j+1]) and the table's last entry is the end of the data, which
-//!            a handful of shipped files leave a few bytes short of the real file size
+//!            a handful of pack files leave a few bytes short of the real file size
 //! ```
 //!
 //! Each resource starts with a property block — a u16 for its total length including those two
@@ -121,7 +121,7 @@ pub const JPEG_GRAY: &[u8] = &[
 ];
 #[cfg(test)]
 #[rustfmt::skip]  // a byte table, not code: twelve per line is how the fixture is read
-/// The three-component partner of [`JPEG_GRAY`]: the arm the shipped `JPEGDecoder_Write` takes when
+/// The three-component partner of [`JPEG_GRAY`]: the arm the reference `JPEGDecoder_Write` takes when
 /// `c_jpeg_get_bytes_per_pixel` answers 3, which is the 24-bpp DIB.
 pub const JPEG_RGB: &[u8] = &[
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
@@ -232,7 +232,7 @@ impl<'a> Container<'a> {
         // file. What it points at is a sentinel, and see below for why its value is not compared.
         let _sentinel = c.at(c.offsets + 4 * c.count)?;
         let data = u32_at(bytes, 0x18)?;
-        // The layout facts that held on all 62 containers in this corpus: the map and the offset
+        // The layout facts that held on all 62 containers in this sample set: the map and the offset
         // table fit, the table stops before the data section, and the first resource starts exactly
         // where the header says the data does. Checked here so a wrong guess about the format is
         // caught at parse time rather than as a garbled picture later.
@@ -253,14 +253,14 @@ impl<'a> Container<'a> {
         }
         // What is *not* required is that the file ends where the table's last entry or the header's
         // `data_bytes` says. Those two fields disagree with the file length on five of those 62
-        // shipped containers — one art container claims 3 309 bytes more data than there are bytes —
+        // sample containers — one art container claims 3 309 bytes more data than there are bytes —
         // and every span the reader walks is bounds-checked against the file anyway. So a stale
         // length costs nothing to tolerate, while refusing on it hides *every* resource in the
         // container behind one bad word: a font table asked for by name comes back NULL, and the app
         // faults tens of thousands of instructions later.
         //
         // The terminal table entry is read as part of that same lesson, not as a separate one. It is a
-        // sentinel — no byte is ever served *from* it — and on the wider corpus the writers close a
+        // sentinel — no byte is ever served *from* it — and on the wider sample set the writers close a
         // table with it past the end of the file as a matter of course: of the 2 343 `.mif`/`.bar`
         // files across both corpora, **943 were rejected by this check alone** (the rest of that
         // survey: 1 278 clean, 112 without the `0x11` first byte, 4 too short for a header, 6 whose
@@ -268,7 +268,7 @@ impl<'a> Container<'a> {
         // times, and those same files all satisfy `first == data`, which is the check that says this
         // really is this format rather than a lucky byte run.
         //
-        // **None of the game corpus's 62 containers is among the 943**, and none of its 35 modules
+        // **None of the sample set's 62 containers is among the 943**, and none of its 35 modules
         // changes which manifest it calls its own (measured: 35/35 still resolve through the ancestor
         // rule) — so tolerating this cannot change how any pack already read answers.
         //
@@ -363,7 +363,7 @@ impl<'a> Container<'a> {
             Error::Malformed(format!("resource {kind}/{id} lies outside the file"))
         })?;
         if kind != RESTYPE_STRING && kind != RESTYPE_IMAGE {
-            // A binary resource is its payload from the first byte — the corpus shows the property
+            // A binary resource is its payload from the first byte — the sample set shows the property
             // block belongs to the two kinds the shell hands back as objects and as text.
             return Ok(Resource {
                 kind,
@@ -377,7 +377,7 @@ impl<'a> Container<'a> {
         if head < 2 || head > raw.len() {
             // A property block cannot be longer than the resource holding it, so a length that
             // fails that test is not a corrupt block but the absence of one: the payload starts at
-            // the first byte. Two shapes in the corpus arrive here - a UTF-16 BOM, whose `fe ff`
+            // the first byte. Two shapes in the sample set arrive here - a UTF-16 BOM, whose `fe ff`
             // reads as 0xfeff, and text whose first character is a printable byte. The readers
             // downstream still refuse what they cannot parse, so this widens what is *offered*
             // without widening what is claimed.
@@ -412,7 +412,7 @@ pub struct Bitmap {
     /// 8-bit only: 256 BGR triples.
     pub palette: Option<Vec<u8>>,
     /// Per-pixel transparency the *file itself* named. Kept beside the pixels instead of blended into
-    /// them, because the pack is entitled to read the colours it shipped: rewriting a see-through
+    /// them, because the pack is entitled to read the colours it reference: rewriting a see-through
     /// pixel into some mask colour would fabricate a byte the app never stored, and a picture is
     /// blitted far more often than it is read.
     pub alpha: Alpha,
@@ -468,7 +468,7 @@ impl Bitmap {
 
     /// The colour of one pixel, resolved through the palette when there is one.
     ///
-    /// Out of range is answered, not panicked: a shipped container can declare a frame bigger than
+    /// Out of range is answered, not panicked: a reference container can declare a frame bigger than
     /// the bytes it supplies, and a caller that walks `0..height × 0..width` to build an icon would
     /// otherwise take the host down over a picture that is merely short.
     pub fn rgb(&self, x: usize, y: usize) -> (u8, u8, u8) {
@@ -480,7 +480,7 @@ impl Bitmap {
                 }
                 let index = usize::from(self.pixels[i]);
                 // A file may declare fewer table entries than its own depth can address — `biClrUsed`
-                // of 9 on an 8-bpp picture is a shape that occurs in the shipped corpus — so a pixel
+                // of 9 on an 8-bpp picture is a shape that occurs in the sample set — so a pixel
                 // can name a colour the pack never supplied. Black is the answer that does not take
                 // the host down with it, which an indexed read past the end of the table would.
                 if index * 3 + 2 >= p.len() {
@@ -560,9 +560,98 @@ pub fn file_size(head: &[u8]) -> Option<usize> {
         .filter(|n| *n <= MAX_IMAGE_BYTES)
 }
 
-/// Read a Windows BMP, the format every image resource in the corpus turned out to be.
+/// Read a Windows BMP, the format every image resource in the sample set turned out to be.
 ///
 /// Bottom-up rows are flipped here so a caller never has to know; the row padding is dropped.
+/// `"BCI\0"`, the four bytes every Brew Compressed Image starts with.
+const BCI_MAGIC: [u8; 4] = *b"BCI\0";
+
+/// A Brew Compressed Image: a 32-byte header, a palette with per-entry alpha, and a deflated plane
+/// of one index byte per pixel.
+///
+/// The header is what the platform's own `dumpbci` reads, field for field: `file_size` at 4, the offset
+/// of the deflated plane at 8, the picture's **width at 14 and height at 16**. The palette runs from
+/// 32 to that offset in four-byte entries — blue, green, red, alpha — and outgrows 256 entries in
+/// reference art (one sample carries 271), while an index byte can only reach 255, so the tail is
+/// simply never named.
+///
+/// At the deflated offset sit twelve bytes this host does not need (the same picture's dimensions
+/// again, and two words that are 1 in every sample), then the deflate stream that inflates to
+/// exactly `width * height` index bytes. Both sizes are taken from the *smaller* of the header's
+/// word and the buffer, because a resource is cut from its container and a stale length must not
+/// become a read past the end.
+pub fn bci(bytes: &[u8]) -> R<Bitmap> {
+    if bytes.len() < 32 || !bytes.starts_with(&BCI_MAGIC[..]) {
+        return Err(Error::Malformed("an image resource is not a BCI".into()));
+    }
+    let word = |at: usize| -> R<usize> { Ok(usize::from(u16_at(bytes, at)?)) };
+    let declared = word(4)?;
+    let plane = word(8)?;
+    let width = word(14)?;
+    let height = word(16)?;
+    let stop = declared.min(bytes.len());
+    if width == 0 || height == 0 {
+        return Err(Error::Malformed(format!(
+            "a BCI names a {width}x{height} picture"
+        )));
+    }
+    if plane < 32 || plane + 12 > stop {
+        return Err(Error::Malformed(format!(
+            "a BCI names its plane at {plane:#x}, outside a {stop:#x}-byte picture"
+        )));
+    }
+    // Four bytes per entry, blue first: `Bitmap::palette` is BGR triples, and the fourth is the
+    // entry's own alpha, which is what makes a BCI see-through per colour rather than per pixel.
+    let entries = (plane - 32) / 4;
+    let mut palette = Vec::with_capacity(entries.min(256) * 3);
+    let mut alphas = Vec::with_capacity(entries);
+    for entry in 0..entries {
+        let at = 32 + entry * 4;
+        if entry < 256 {
+            palette.extend_from_slice(&bytes[at..at + 3]);
+        }
+        alphas.push(bytes[at + 3]);
+    }
+    let plane_bytes = &bytes[plane + 12..stop];
+    let mut rows = Vec::with_capacity(width * height);
+    // Bounded like every other decoder here: a deflate stream that expands without end is a broken
+    // file, not a picture this host should chase to the end of memory.
+    const CAP: u64 = 64 << 20;
+    use std::io::Read as _;
+    let mut reader = flate2::read::ZlibDecoder::new(plane_bytes).take(CAP);
+    reader
+        .read_to_end(&mut rows)
+        .map_err(|e| Error::Malformed(format!("a BCI's plane does not inflate: {e}")))?;
+    // A row is padded to four bytes — 53 pixels a row arrive as 56 — which two samples of different
+    // widths pin down: `dog.bci` is 104 wide and its plane is exactly `104 * 70`, while `skin.bci`
+    // at 25 wide inflates to `28 * 146` and `Modtones.bar`'s 53-wide sprite to `56 * 8`. The pad is
+    // dropped here rather than carried, because `Bitmap` walks `width` bytes a row.
+    let stride = (width + 3) & !3;
+    if rows.len() != stride * height {
+        return Err(Error::Malformed(format!(
+            "a BCI's plane inflates to {} byte(s), not the {stride}x{height} its rows occupy",
+            rows.len()
+        )));
+    }
+    let mut indices = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let at = row * stride;
+        indices.extend_from_slice(&rows[at..at + width]);
+    }
+    let alpha = if alphas.iter().all(|&a| a == u8::MAX) {
+        Alpha::Opaque
+    } else {
+        Alpha::Index(alphas)
+    };
+    Ok(Bitmap {
+        width,
+        height,
+        pixels: indices,
+        palette: Some(palette),
+        alpha,
+    })
+}
+
 pub fn bmp(bytes: &[u8]) -> R<Bitmap> {
     if bytes.len() < 26 || &bytes[0..2] != b"BM" {
         return Err(Error::Malformed("an image resource is not a BMP".into()));
@@ -764,7 +853,7 @@ pub fn png(bytes: &[u8]) -> R<Bitmap> {
     // A bit depth under eight arrives *packed*: `output_buffer_size` is `ceil(width * depth / 8)`
     // bytes per row and the decoder's transformations default to `IDENTITY`, so the buffer holds
     // several indices in one byte while every reader above this one - `Bitmap::rgb` and
-    // `Bitmap::alpha_of` - walks one byte per pixel. Over the corpus, 15 of 921 PNG records are
+    // `Bitmap::alpha_of` - walks one byte per pixel. Over the sample set, 15 of PNG records are
     // indexed at depth 1, 2 or 4, and 13 of those carry `tRNS`, so the stride is
     // not cosmetic here; left packed it would name the wrong pixels transparent.
     let depth = info.bit_depth as u8;
@@ -800,7 +889,7 @@ pub fn png(bytes: &[u8]) -> R<Bitmap> {
             // for a picture shallower than 16 bits (`stream.rs`, `parse_trns`, `Rgb` arm). A genuine
             // 16-bit file keeps the six-byte form and this reader does not narrow *keys* - only samples
             // (`STRIP_16`) - so such a picture stays opaque. libpng compares 16-bit keys at 16-bit
-            // precision; guessing which half to keep instead of doing that is a rule no witness here
+            // precision; guessing which half to keep instead of doing that is a rule no record here
             // states, and the wrong guess paints a pixel transparent a file never named.
             let alpha = match reader.info().trns.as_deref() {
                 Some(k) if k.len() == 3 => Alpha::Pixel(
@@ -899,7 +988,7 @@ pub fn png(bytes: &[u8]) -> R<Bitmap> {
             let table = reader.info().palette.clone().unwrap_or_default();
             // `tRNS` for an indexed picture is one alpha byte for each of the first few palette
             // entries; entries it does not reach are opaque. This is the shape 746 records in the
-            // corpus use - 443 of them one pack's tiles - and without it their see-through background
+            // sample set use - 443 of them one pack's tiles - and without it their see-through background
             // paints as its stored white.
             let alpha = match reader.info().trns.as_ref().map(|t| t.to_vec()) {
                 Some(a) if !a.is_empty() => Alpha::Index(a),
@@ -949,10 +1038,10 @@ pub fn jpeg(bytes: &[u8]) -> R<Bitmap> {
         .map_err(|e| Error::Malformed(format!("JPEG data: {e}")))?;
     match info.pixel_format {
         PixelFormat::L8 => {
-            // The shipped DIB is 8 bpp and holds the luminance itself. The grey ramp beside it is this
+            // The reference DIB is 8 bpp and holds the luminance itself. The grey ramp beside it is this
             // host's choice, and it is said as one: `Bitmap::rgb` resolves an index through the palette,
             // so an indexed picture with no table would answer black for every pixel. Nothing in the
-            // delivered members says what the shipped `CreateDIB` left in that block.
+            // delivered members says what the reference `CreateDIB` left in that block.
             Ok(Bitmap {
                 width,
                 height,
@@ -969,7 +1058,7 @@ pub fn jpeg(bytes: &[u8]) -> R<Bitmap> {
             alpha: Alpha::Opaque,
         }),
         PixelFormat::CMYK32 => {
-            // Three bytes out of every four, the way the shipped loop does it — the fourth component is
+            // Three bytes out of every four, the way the reference loop does it — the fourth component is
             // dropped rather than composited, so a CMYK stream comes back as its first three channels.
             let mut rgb = Vec::with_capacity(width * height * 3);
             for pixel in buf.chunks_exact(4) {
@@ -1003,15 +1092,22 @@ pub const MIME_JPG: &str = "image/jpg";
 /// GIF. No delivered member decodes it — see [`gif`], which says what that means for the answer this
 /// host gives at `IShell::DetectType`.
 pub const MIME_GIF: &str = "image/gif";
+/// BREW's own compressed picture: "Brew Compressed Image" (the image declarations), created by the platform's BCI
+/// authoring tool and reference by packs as `image/bci` resources. An indexed picture whose palette
+/// carries per-entry alpha, with the index plane deflated.
+pub const MIME_BCI: &str = "image/bci";
+/// The carrier's `.sis`/`.saf` picture: a split DEFLATE stream with a fixed master palette. See
+/// [`crate::sis`] for what the container stores and [`sis`] for the decode.
+pub const MIME_SIS: &str = "image/sis";
 
 /// A file-name suffix that is a shorter spelling of a MIME in [`DECODABLE`], rather than a format of its
 /// own. It is one pair because [`sniff`] can only ever answer [`MIME_JPEG`]: no payload says whether its
 /// author meant to write `jpeg` or `jpg`, and a name a caller cannot load back is the drift [`DECODABLE`]
-/// exists to prevent.
-const SUFFIX_ALIASES: [(&str, &str); 1] = [("jpg", MIME_JPEG)];
+/// exists to prevent. `.saf` is the other spelling of [`MIME_SIS`]; `.sis` is already its subtype.
+const SUFFIX_ALIASES: [(&str, &str); 2] = [("jpg", MIME_JPEG), ("saf", MIME_SIS)];
 
 /// Every MIME [`image`] will then agree to decode, and so every MIME [`sniff`] may name.
-const DECODABLE: [&str; 4] = [MIME_PNG, MIME_BMP, MIME_JPEG, MIME_GIF];
+const DECODABLE: [&str; 6] = [MIME_PNG, MIME_BMP, MIME_JPEG, MIME_GIF, MIME_BCI, MIME_SIS];
 
 /// The eight bytes every PNG stream opens with.
 ///
@@ -1030,6 +1126,10 @@ pub const JPEG_MAGIC: &[u8] = b"\xFF\xD8\xFF";
 /// have to know which one it is looking at, and a stream that says `GIF8` is a stream [`gif`] can try.
 pub const GIF_MAGIC: &[u8] = b"GIF8";
 
+/// The two four-byte signatures The carrier's `.sis` container answers to.
+pub const SAF_MAGIC: &[u8] = b"SAF\0";
+pub const SIS_MAGIC: &[u8] = b"SIS\0";
+
 pub fn gif(bytes: &[u8]) -> R<Bitmap> {
     use gif::{ColorOutput, DecodeOptions};
     if !bytes.starts_with(GIF_MAGIC) {
@@ -1042,28 +1142,73 @@ pub fn gif(bytes: &[u8]) -> R<Bitmap> {
     let mut decoder = options
         .read_info(std::io::Cursor::new(bytes))
         .map_err(|e| Error::Malformed(format!("GIF header: {e}")))?;
+    let (screen_width, screen_height) =
+        (usize::from(decoder.width()), usize::from(decoder.height()));
+    if screen_width == 0 || screen_height == 0 {
+        return Err(Error::Malformed(format!(
+            "GIF canvas {screen_width}x{screen_height} names no picture"
+        )));
+    }
+    let background = decoder.bg_color();
     let frame = decoder
         .read_next_frame()
         .map_err(|e| Error::Malformed(format!("GIF data: {e}")))?
         .ok_or_else(|| Error::Malformed("a GIF with no frame in it".into()))?;
-    let (width, height) = (usize::from(frame.width), usize::from(frame.height));
-    if width == 0 || height == 0 {
+    let (frame_width, frame_height) = (usize::from(frame.width), usize::from(frame.height));
+    if frame_width == 0 || frame_height == 0 {
         return Err(Error::Malformed(format!(
-            "GIF frame {width}x{height} names no picture"
+            "GIF frame {frame_width}x{frame_height} names no picture"
         )));
     }
-    let pixels = frame.buffer.to_vec();
+    let (left, top) = (usize::from(frame.left), usize::from(frame.top));
     // Taken here rather than where it is used: the frame borrows the decoder mutably, and the
     // effective colour table is a question for the decoder afterwards.
     let transparent = frame.transparent;
-    // The de-interlaced frame, exactly as wide as its own header says: a short buffer is a stream that
-    // lied about its size, and padding it here would invent rows the file does not have.
-    if pixels.len() != width * height {
+    let source = frame.buffer.to_vec();
+    if source.len() != frame_width * frame_height {
         return Err(Error::Malformed(format!(
-            "GIF frame {width}x{height} delivered {} byte(s)",
-            pixels.len()
+            "GIF frame {frame_width}x{frame_height} delivered {} byte(s)",
+            source.len()
         )));
     }
+    // A frame that covers the canvas is the whole picture and keeps its indices. A sub-rectangle is
+    // placed at its own corner on a canvas filled with the background or transparent pen; calling it
+    // a picture of its own width would crop everything the file says surrounds it.
+    let full =
+        left == 0 && top == 0 && frame_width == screen_width && frame_height == screen_height;
+    let (width, height) = if full {
+        (frame_width, frame_height)
+    } else {
+        (screen_width, screen_height)
+    };
+    if width
+        .checked_mul(height)
+        .is_some_and(|n| n > MAX_IMAGE_BYTES)
+    {
+        return Err(Error::Unsupported(format!(
+            "a GIF canvas of {} pixel(s), over the {MAX_IMAGE_BYTES}-byte limit",
+            width.saturating_mul(height)
+        )));
+    }
+    let pixels = if full {
+        source
+    } else {
+        let fill = transparent.map(usize::from).or(background).unwrap_or(0) as u8;
+        let mut canvas = vec![fill; width * height];
+        for y in 0..frame_height {
+            for x in 0..frame_width {
+                let index = source[y * frame_width + x];
+                if Some(index) == transparent {
+                    continue;
+                }
+                let (cx, cy) = (left + x, top + y);
+                if cx < width && cy < height {
+                    canvas[cy * width + cx] = index;
+                }
+            }
+        }
+        canvas
+    };
     let rgb = decoder
         .palette()
         .map_err(|e| Error::Malformed(format!("GIF colour table: {e}")))?
@@ -1112,10 +1257,231 @@ pub fn gif(bytes: &[u8]) -> R<Bitmap> {
     })
 }
 
+/// The carrier's `.sis`/`.saf` picture. The container and split-DEFLATE work live in [`crate::sis`]; this
+/// name is what the dispatch and the tests share with the other decoders.
+pub fn sis(bytes: &[u8]) -> R<Bitmap> {
+    crate::sis::decode(bytes)
+}
+
+/// A picture that names more than one frame, with each frame already laid onto the logical canvas.
+#[derive(Debug, Clone)]
+pub struct Animation {
+    pub frames: Vec<Bitmap>,
+    /// Each frame's delay in centiseconds, the unit GIF stores.
+    pub delays: Vec<u16>,
+}
+
+const MAX_ANIMATION_BYTES: usize = 64 * 1024 * 1024;
+/// A bound on frame *count* as well as bytes: one-pixel frames have almost no pixel budget and
+/// would otherwise turn a small file into millions of `Bitmap` headers.
+const MAX_ANIMATION_FRAMES: usize = 1024;
+
+/// GIF frames composed onto the logical screen.
+///
+/// A GIF frame is a rectangle, not a whole picture: later frames commonly update a small area and
+/// rely on the previous frame staying put. The eight-bit path in [`gif`] takes the first frame as a
+/// static image; this path keeps the canvas, applies transparency and the four disposal methods, and
+/// returns every frame as a full-size picture so a caller can animate it.
+pub fn gif_frames(bytes: &[u8]) -> R<Animation> {
+    use gif::{ColorOutput, DecodeOptions, DisposalMethod};
+
+    if !bytes.starts_with(GIF_MAGIC) {
+        return Err(Error::Malformed("a GIF stream that does not say so".into()));
+    }
+    let mut options = DecodeOptions::new();
+    options.set_color_output(ColorOutput::Indexed);
+    let mut decoder = options
+        .read_info(std::io::Cursor::new(bytes))
+        .map_err(|e| Error::Malformed(format!("GIF header: {e}")))?;
+    let (width, height) = (usize::from(decoder.width()), usize::from(decoder.height()));
+    if width == 0 || height == 0 {
+        return Err(Error::Malformed(format!(
+            "GIF canvas {width}x{height} names no picture"
+        )));
+    }
+    let canvas_bytes = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| Error::Malformed("GIF canvas dimensions overflow".into()))?;
+    if canvas_bytes > MAX_IMAGE_BYTES {
+        return Err(Error::Unsupported(format!(
+            "a GIF canvas of {canvas_bytes} byte(s), over the {MAX_IMAGE_BYTES}-byte limit"
+        )));
+    }
+
+    // Copied before the frame loop: the decoder is borrowed mutably by `read_next_frame`.
+    let global = decoder
+        .global_palette()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
+    let background = decoder
+        .bg_color()
+        .and_then(|i| global.get(i * 3..i * 3 + 3))
+        .map(|p| [p[0], p[1], p[2]])
+        .unwrap_or([0, 0, 0]);
+
+    let mut canvas = vec![0u8; canvas_bytes];
+    let mut alpha = vec![0u8; width * height];
+    let mut frames = Vec::new();
+    let mut delays = Vec::new();
+    let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
+
+    while let Some(frame) = decoder
+        .read_next_frame()
+        .map_err(|e| Error::Malformed(format!("GIF data: {e}")))?
+    {
+        let (fw, fh) = (usize::from(frame.width), usize::from(frame.height));
+        let (left, top) = (usize::from(frame.left), usize::from(frame.top));
+        if fw == 0 || fh == 0 {
+            return Err(Error::Malformed("a GIF frame names no picture".into()));
+        }
+        let dispose = frame.dispose;
+        let transparent = frame.transparent.map(usize::from);
+        let delay = frame.delay;
+        let palette = frame.palette.as_deref().unwrap_or(&global);
+        let source = frame.buffer.as_ref();
+        if source.len() != fw * fh {
+            return Err(Error::Malformed(format!(
+                "GIF frame {fw}x{fh} delivered {} byte(s)",
+                source.len()
+            )));
+        }
+        if frames.len() >= MAX_ANIMATION_FRAMES {
+            return Err(Error::Unsupported(format!(
+                "a GIF animation with more than {MAX_ANIMATION_FRAMES} frames"
+            )));
+        }
+
+        if dispose == DisposalMethod::Previous {
+            previous = Some((canvas.clone(), alpha.clone()));
+        }
+        for y in 0..fh {
+            for x in 0..fw {
+                let index = usize::from(source[y * fw + x]);
+                if Some(index) == transparent {
+                    continue;
+                }
+                let (r, g, b) = palette
+                    .get(index * 3..index * 3 + 3)
+                    .map(|p| (p[0], p[1], p[2]))
+                    .unwrap_or((0, 0, 0));
+                let (cx, cy) = (left + x, top + y);
+                if cx < width && cy < height {
+                    let at = cy * width + cx;
+                    canvas[at * 3] = r;
+                    canvas[at * 3 + 1] = g;
+                    canvas[at * 3 + 2] = b;
+                    alpha[at] = u8::MAX;
+                }
+            }
+        }
+
+        if (frames.len() + 1).saturating_mul(width * height * 4) > MAX_ANIMATION_BYTES {
+            return Err(Error::Unsupported(format!(
+                "a GIF animation over the {MAX_ANIMATION_BYTES}-byte limit"
+            )));
+        }
+        frames.push(Bitmap {
+            width,
+            height,
+            pixels: canvas.clone(),
+            palette: None,
+            alpha: Alpha::Pixel(alpha.clone()),
+        });
+        delays.push(delay);
+
+        // The spec's background is a colour; with a transparent pen in play, leaving the rect
+        // see-through is what keeps the frame behind it visible. `Previous` with no saved canvas
+        // (the first frame) means the same background.
+        let clear_rect = |canvas: &mut [u8], alpha: &mut [u8]| {
+            let clear = if transparent.is_some() { 0 } else { u8::MAX };
+            for y in 0..fh {
+                for x in 0..fw {
+                    let (cx, cy) = (left + x, top + y);
+                    if cx < width && cy < height {
+                        let at = cy * width + cx;
+                        canvas[at * 3..at * 3 + 3].copy_from_slice(&background);
+                        alpha[at] = clear;
+                    }
+                }
+            }
+        };
+
+        match dispose {
+            DisposalMethod::Background => clear_rect(&mut canvas, &mut alpha),
+            DisposalMethod::Previous => {
+                if let Some((saved, saved_alpha)) = previous.take() {
+                    canvas = saved;
+                    alpha = saved_alpha;
+                } else {
+                    clear_rect(&mut canvas, &mut alpha);
+                }
+            }
+            DisposalMethod::Any | DisposalMethod::Keep => {}
+        }
+    }
+
+    if frames.is_empty() {
+        return Err(Error::Malformed("a GIF with no frame in it".into()));
+    }
+    Ok(Animation { frames, delays })
+}
+
+/// SIS frames. Each type-4 frame is already a complete indexed picture; the metadata block's
+/// type-10 duration is used for every frame, falling back to 10 cs when it is absent.
+pub fn sis_frames(bytes: &[u8]) -> R<Animation> {
+    let frames = crate::sis::decode_frames(bytes)?;
+    let delay = crate::sis::frame_delay_cs(bytes).unwrap_or(10);
+    let delays = vec![delay; frames.len()];
+    Ok(Animation { frames, delays })
+}
+
+/// Count GIF frames without LZW-decoding them. `None` means the header could not be read; the
+/// caller then lets the ordinary static decoder report the error.
+fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    options.skip_frame_decoding(true);
+    let mut decoder = options.read_info(std::io::Cursor::new(bytes)).ok()?;
+    let mut count = 0;
+    while decoder.next_frame_info().ok()?.is_some() {
+        count += 1;
+        if count > 1 {
+            break;
+        }
+    }
+    Some(count)
+}
+
+/// A GIF animation only when it really has more than one frame. A still GIF stays on the indexed
+/// [`gif`] path, so `IImage_SetStream` does not decode its pixels once here and once again there.
+fn gif_animation(bytes: &[u8]) -> Option<R<Animation>> {
+    match gif_frame_count(bytes) {
+        Some(0) | Some(1) => None,
+        Some(_) => Some(gif_frames(bytes)),
+        // Let the ordinary static decoder report a header this scan could not read.
+        None => None,
+    }
+}
+
+/// The animation a stream holds, when its format names frames rather than one picture.
+pub fn animation(props: &[u8], bytes: &[u8]) -> Option<R<Animation>> {
+    match mime(props) {
+        Some(name) if name == MIME_GIF => gif_animation(bytes),
+        Some(name) if name == MIME_SIS => Some(sis_frames(bytes)),
+        Some(_) => None,
+        None if bytes.starts_with(GIF_MAGIC) => gif_animation(bytes),
+        None if bytes.starts_with(SAF_MAGIC) || bytes.starts_with(SIS_MAGIC) => {
+            Some(sis_frames(bytes))
+        }
+        None => None,
+    }
+}
+
 /// The picture a resource holds, whichever of the formats this host can read it arrived in.
 ///
 /// The property block names the format and is the thing to trust, not the payload's first bytes:
-/// the corpus files MIDI and text under the image kind, so a magic-number test alone would call a
+/// the sample set files MIDI and text under the image kind, so a magic-number test alone would call a
 /// `.mid` a picture. A resource that names no format falls back to its own contents, because the
 /// `.par` reader synthesizes a kind from the payload and has no property block to offer.
 ///
@@ -1131,6 +1497,8 @@ pub fn image(props: &[u8], bytes: &[u8]) -> R<Bitmap> {
         Some(name) if name == MIME_BMP => bmp(bytes),
         Some(name) if name == MIME_JPEG || name == MIME_JPG => jpeg(bytes),
         Some(name) if name == MIME_GIF => gif(bytes),
+        Some(name) if name == MIME_BCI => bci(bytes),
+        Some(name) if name == MIME_SIS => sis(bytes),
         // No declared type: the payload has to name itself.
         None => {
             if bytes.starts_with(PNG_MAGIC) {
@@ -1139,6 +1507,10 @@ pub fn image(props: &[u8], bytes: &[u8]) -> R<Bitmap> {
                 jpeg(bytes)
             } else if bytes.starts_with(GIF_MAGIC) {
                 gif(bytes)
+            } else if bytes.starts_with(&BCI_MAGIC[..]) {
+                bci(bytes)
+            } else if bytes.starts_with(SAF_MAGIC) || bytes.starts_with(SIS_MAGIC) {
+                sis(bytes)
             } else {
                 bmp(bytes)
             }
@@ -1166,7 +1538,7 @@ pub fn image(props: &[u8], bytes: &[u8]) -> R<Bitmap> {
 /// decodes it — until [`gif`] added one on this side, which is why the sentence still matters: what makes
 /// `image/gif` nameable now is that [`image`] will agree to decode it, not that the extracted members
 /// would. Read [`gif`] before treating a GIF that draws here as a verdict either way about a real handset:
-/// its symbol census is an account of this set, and the same search over a shipped ROM image answers 0 for
+/// its symbol census is an account of this set, and the same search over a reference ROM image answers 0 for
 /// formats that phone serves.
 ///
 /// What it costs is a decode: a caller that sniffs a picture and then loads it pays for the
@@ -1182,6 +1554,12 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(GIF_MAGIC) && gif(bytes).is_ok() {
         return Some(MIME_GIF);
     }
+    if bytes.starts_with(&BCI_MAGIC[..]) && bci(bytes).is_ok() {
+        return Some(MIME_BCI);
+    }
+    if (bytes.starts_with(SAF_MAGIC) || bytes.starts_with(SIS_MAGIC)) && sis(bytes).is_ok() {
+        return Some(MIME_SIS);
+    }
     // `bmp` says no inside its first four checks, so a payload that is neither is not paying for a
     // second decode.
     bmp(bytes).is_ok().then_some(MIME_BMP)
@@ -1193,7 +1571,7 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
 /// free to invent a vocabulary: it is the subtype of a MIME in [`DECODABLE`], so the two answers
 /// this can give are the two [`image`] has an arm for. `audio/mid` and the private `image/z*` names
 /// answer `None`, which is the difference between "this is not a picture" and "we have no decoder"
-/// — the corpus files MIDI under the image resource kind, and a sniffer that guessed from the
+/// — the sample set files MIDI under the image resource kind, and a sniffer that guessed from the
 /// extension there would have called a song a picture. `audio/mid` is refused *here* and named by
 /// [`crate::audio::sniff_name`], which is where the authority behind that name lives;
 /// `IShell::DetectType` asks the two in turn.
@@ -1227,7 +1605,7 @@ pub fn sniff_name(name: &str) -> Option<&'static str> {
 
 /// What a payload is, according to its own property block.
 ///
-/// The resource's *kind* only says which table the handset filed it under, and the corpus files
+/// The resource's *kind* only says which table the handset filed it under, and the sample set files
 /// plenty of things under the wrong one: music filed as `RESTYPE_IMAGE` holding `audio/mid`, and a
 /// "Loading." caption filed as `RESTYPE_IMAGE` holding `text/plain`. So the difference between "this
 /// reader is missing a decoder" and "this was never a picture" is here, not in the kind number.
@@ -1238,17 +1616,18 @@ pub fn mime(props: &[u8]) -> Option<&str> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Shift-JIS bytes as the `AECHAR` code units a face is looked up by.
+/// Shift-JIS bytes as Unicode code units.
 ///
-/// The same decoding serves a `FD FE`-marked resource string and a narrow string the guest
-/// passes to `STREXPAND`: both are byte streams in the device's `AEE_ENC_S_JIS` encoding, and
-/// widening one byte at a time is what turns `83 65` ("テ") into two Latin-1 code units.
+/// Two callers share it: a `FD FE`-marked resource string (whose text the store keeps as Unicode)
+/// and `IUnicodeSjis`, whose whole contract is UCS-2 <-> Shift-JIS. This is **not** the device's
+/// `AECHAR` form: a handset unit carries the two bytes in guest-memory order, which is what
+/// [`crate::encoding::TextEncoding`] converts at the boundary.
 pub fn decode_shift_jis(bytes: &[u8]) -> Vec<u16> {
     let (text, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
     text.encode_utf16().collect()
 }
 
-/// The inverse: `AECHAR` units to the Shift-JIS bytes a `char *` buffer holds.
+/// The inverse: Unicode code units to the Shift-JIS bytes a `char *` buffer holds.
 pub fn encode_shift_jis(units: &[u16]) -> Vec<u8> {
     let text: String = units
         .iter()
@@ -1261,19 +1640,19 @@ pub fn encode_shift_jis(units: &[u16]) -> Vec<u8> {
 ///
 /// Two shapes reach here. The documented one is one count byte, then that many strings separated by
 /// `^` and closed by `~`; the first is the language the container was built for — English on every
-/// file in the corpus, Spanish on the localized one — and the handset picks by index. The other is a
+/// file in the sample set, Spanish on the localized one — and the handset picks by index. The other is a
 /// `.mif`'s own metadata — vendor, version, app name — which is **one plain string with no count in
 /// front of it**: `Popcap`, whose first byte is `0x50`. Reading that as "80 languages" is what this
 /// function used to do to a file that had exactly one string to give.
 ///
 /// The terminator tells the two apart, because a counted resource always ends with `~` and none of
-/// the plain ones in the corpus contains one at all — which is a better test than whether the first
+/// the plain ones in the sample set contains one at all — which is a better test than whether the first
 /// byte looks like a small number, since half the alphabet does.
 pub fn strings(body: &[u8]) -> R<Vec<Vec<u16>>> {
     if body.is_empty() {
         return Err(Error::Malformed("an empty string resource".into()));
     }
-    // KDDI's containers put `FD FE` in front of every Japanese string: `0xFD` is
+    // Carrier containers put `FD FE` in front of every Japanese string: `0xFD` is
     // `AEE_ENC_S_JIS` and the bytes behind the pair are Shift-JIS, not UTF-16. Widening those
     // bytes one per byte turns `83 65` ("テ") into two Latin-1 code units, which is exactly the
     // mojibake a menu shows when its text is read as Latin. The two bytes are a marker, not
@@ -1281,7 +1660,7 @@ pub fn strings(body: &[u8]) -> R<Vec<Vec<u16>>> {
     if let Some(rest) = body.strip_prefix(&[0xfd, 0xfe][..]) {
         return Ok(vec![decode_shift_jis(rest)]);
     }
-    // The big-endian spelling of the UTF-16 mark. No corpus file carries it yet; the little-endian
+    // The big-endian spelling of the UTF-16 mark. No sample set file carries it yet; the little-endian
     // one below is what the packing tools write, and this keeps the pair from disagreeing.
     if let Some(rest) = body.strip_prefix(&[0xfe, 0xff][..]) {
         return Ok(vec![rest
@@ -1293,7 +1672,7 @@ pub fn strings(body: &[u8]) -> R<Vec<Vec<u16>>> {
     // `RESTYPE_STRING` records of `chess_comb.bar` begin with it, while the three plain strings in
     // the manifest beside it do not. It is the container's "a string starts here" tag and not a
     // character — a menu that printed it drew a box in front of every label, which is exactly what
-    // the first chess run did. Nothing in the corpus stores `U+0003` as text, so the tag is dropped
+    // the first chess run did. Nothing in the sample set stores `U+0003` as text, so the tag is dropped
     // rather than turned into a cell.
     let body = body.strip_prefix(&[0x03][..]).unwrap_or(body);
     let wide = |text: &[u8]| text.iter().map(|b| u16::from(*b)).collect::<Vec<u16>>();
@@ -1346,7 +1725,7 @@ pub fn strings(body: &[u8]) -> R<Vec<Vec<u16>>> {
     Ok(out.into_iter().take(count).map(|s| wide(&s)).collect())
 }
 
-/// A container written the way the shipped files are, for tests that need one without a corpus: eight
+/// A container written the way the pack files are, for tests that need one without a sample set: eight
 /// header words, one map entry per record (each covering a single id), an offset table with one more
 /// entry than there are records, and every payload behind its own `len u16 + NUL-separated block`.
 ///

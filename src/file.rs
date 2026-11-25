@@ -7,11 +7,11 @@
 //! included, with the prefix handling done here, and the only bytes on the host disk it can ever see
 //! are the ones that were in the pack's own directory when the run started.
 //!
-//! Two kinds of entry, and the difference is not cosmetic. A *shipped* file is the pack's own,
+//! Two kinds of entry, and the difference is not cosmetic. A *reference* file is the pack's own,
 //! present before the app ran; a *written* file is one the run made or took over. Both live in
 //! memory, and that is the point: a headless run that silently edited the user's tree would be worse
 //! than one that loses the save, so the only bytes from the host disk an app ever sees are the ones
-//! it started with, and an app that writes to a shipped file gets a written copy of it.
+//! it started with, and an app that writes to a pack file gets a written copy of it.
 //!
 //! *Where* those written bytes go at the end of a run is the caller's decision, and there are two of
 //! them. By default they go nowhere: the volume is memory, the save is lost with the run, and the
@@ -65,13 +65,13 @@ fn split_basename(name: &str) -> (String, &str) {
     }
 }
 
-/// The gate `CFile_GetInfo` puts on its out-parameter: `AEE_CheckPtr(0, a2, 76, 1)` — the disassembly
+/// The gate `CFile_GetInfo` puts on its out-parameter: `AEE_CheckPtr(0, a2, 76, 1)` — the inspection
 /// loads it as `movs r2, #0x4c`. 76 is `sizeof`: the three words at `+0/+4/+8` plus
 /// `szName[AEE_MAX_FILE_NAME]`.
 pub const INFO_SIZE: u32 = 12 + g::AEE_MAX_FILE_NAME;
 
 /// How much a run may write. An app in a loop with no free-space check would otherwise grow the
-/// host process until the operating system stops it; 16 MiB is far past anything the shipped packs
+/// host process until the operating system stops it; 16 MiB is far past anything the guest packs
 /// hold and far below what would hurt.
 pub const VOLUME_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -108,7 +108,7 @@ pub const AEE_EBADFILENAME: u32 = g::AEEFS_ERROR + 0x03;
 
 /// How many directories below the `.mod` [`Volume::mount_beside`] will go.
 ///
-/// The deepest thing a pack in this corpus ships is `res/ui/`, so this is not a limit a real run
+/// The deepest thing a pack in this sample set ships is `res/ui/`, so this is not a limit a real run
 /// reaches; it is what stops a directory someone pointed a run at from being walked for as long as
 /// it happens to nest.
 ///
@@ -122,7 +122,7 @@ pub const MOUNT_DEPTH: u8 = 4;
 enum Entry {
     /// Bytes the app made this run.
     Written(Vec<u8>),
-    /// A file the pack shipped, copied in at mount time so the host file is never held open and
+    /// A file the pack provides, copied in at mount time so the host file is never held open and
     /// cannot change under the run's feet.
     Shipped(Vec<u8>),
     Dir,
@@ -176,12 +176,15 @@ pub struct Info {
 /// The app-private volume, plus the single enumeration cursor `EnumInit`/`EnumNext` share.
 #[derive(Default)]
 pub struct Volume {
+    /// Whether a lookup folds ASCII case, as a FAT-backed handset does. The default is the BREW
+    /// header's case-sensitive namespace; a device profile whose packs rely on folding turns it on.
+    case_insensitive: bool,
     /// Sorted, so `EnumNext` has an order worth asserting on. A handset's directory order is
     /// unspecified; a run's should not be.
     entries: BTreeMap<String, Entry>,
     /// What `EnumInit` picked — each entry's key and its **leaf** — and how far `EnumNext` has got
     /// through them. The name a caller is handed is the leaf with [`Volume::enum_dir`] put back in
-    /// front, which is what the shipped enumeration does at report time rather than at list time.
+    /// front, which is what the reference enumeration does at report time rather than at list time.
     listing: Vec<(String, String)>,
     at: usize,
     /// The directory string the running enumeration was started with, with only its leading separators
@@ -201,6 +204,12 @@ pub struct Volume {
     /// [`Volume::persist_to`], and that directory is then the only place besides the pack's own files
     /// this volume ever touches.
     home: Option<std::path::PathBuf>,
+    /// The canonical form of [`Volume::home`], fixed when the save directory was opened.
+    ///
+    /// A normalized guest name cannot climb out lexically, but a link already inside the save
+    /// directory can carry a write or a delete to wherever it points. Every host path is resolved
+    /// and tested against this root before it is touched, so the link decides nothing by itself.
+    home_real: Option<std::path::PathBuf>,
     /// `IFILEMGR_SetDescription`: name → description, as `AECHAR` units.
     ///
     /// The header says `pszDescription` is a wide-string description whose capacity comes in from
@@ -330,6 +339,126 @@ fn strip_prefix_any<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Where a host path may be touched: its parent, resolved, must still be inside the save root.
+///
+/// `Ok(None)` means the parent is not there, which for a deletion is the same answer as the target
+/// already being gone; a write resolves this through [`ensure_parent_inside`] instead.
+fn parent_inside(root: &Path, path: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(real) if real.starts_with(root) => Ok(Some(real)),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path resolves outside the save directory",
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create the parent of a write's target, after proving that the nearest part of it which exists
+/// still resolves inside the save root. Creating first and checking afterwards would let a link in
+/// the middle of the path receive the new directories.
+fn ensure_parent_inside(root: &Path, path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut probe = parent;
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(real) => {
+                if !real.starts_with(root) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path resolves outside the save directory",
+                    ));
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(next) = probe.parent() else {
+                    return Err(e);
+                };
+                probe = next;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::create_dir_all(parent)?;
+    let real = std::fs::canonicalize(parent)?;
+    if !real.starts_with(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path resolves outside the save directory",
+        ));
+    }
+    Ok(())
+}
+
+/// A link Windows reports as a directory (a junction) rather than as a symbolic link.
+///
+/// `remove_dir_all` on one of these follows it. The save directory's links are removed as links.
+#[cfg(windows)]
+fn is_reparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || is_reparse(meta)
+}
+
+/// Remove a directory and everything below it without ever following a link.
+///
+/// `std::fs::remove_dir_all` is left alone because a link inside the tree decides for itself
+/// whether it is a directory on some platforms; a save directory the guest asked to delete must
+/// not become a way to delete whatever such a link points at.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    let mut dirs = Vec::new();
+    let mut todo = vec![path.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        dirs.push(dir.clone());
+        for entry in std::fs::read_dir(&dir)? {
+            let child = entry?.path();
+            let meta = std::fs::symlink_metadata(&child)?;
+            if is_link(&meta) {
+                std::fs::remove_file(&child).or_else(|_| std::fs::remove_dir(&child))?;
+            } else if meta.is_dir() {
+                todo.push(child);
+            } else {
+                std::fs::remove_file(&child)?;
+            }
+        }
+    }
+    for dir in dirs.into_iter().rev() {
+        std::fs::remove_dir(&dir)?;
+    }
+    Ok(())
+}
+
+/// What a failed host file-system call means to the guest, in the header's own EFS family.
+///
+/// The family has one member for "no room" and none for the rest; a permission, lock or device
+/// error is reported as an operation the file system would not perform.
+fn host_failure(err: &std::io::Error) -> u32 {
+    #[cfg(windows)]
+    let full = matches!(err.raw_os_error(), Some(39 | 112));
+    #[cfg(not(windows))]
+    let full = err.raw_os_error() == Some(28);
+    if full {
+        AEEFS_EFSFULL
+    } else {
+        AEEFS_EINVALIDOPERATION
+    }
+}
+
 impl Volume {
     /// Copy every file the pack ships into the volume, which is where a handset keeps the app's own
     /// directory.
@@ -345,9 +474,14 @@ impl Volume {
     pub fn mount_beside(&mut self, mod_path: &Path) -> Vec<String> {
         let mut mounted = Vec::new();
         let dir = crate::store::dir_of(mod_path);
+        // Every entry is resolved before it is used, and one that resolves outside the pack's own
+        // directory is skipped: a link beside a `.mod` must not mount the rest of the host.
+        let Ok(root) = std::fs::canonicalize(&dir) else {
+            return mounted;
+        };
         // A work list rather than recursion, because the depth is what is bounded and a directory
         // tree is not naturally a stack of frames the host has to pay for.
-        let mut todo = vec![(dir, String::new(), 0u8)];
+        let mut todo = vec![(root.clone(), String::new(), 0u8)];
         // What the pack holds is copied into memory so the host files are never held open, so the
         // volume's own ceiling bounds the copy as well: a directory someone pointed a run at is
         // allowed to be enormous, and mounting all of it would end the run before it started.
@@ -366,29 +500,38 @@ impl Volume {
                 } else {
                     format!("{prefix}{name}")
                 };
-                // `is_dir` and `is_file` rather than the dirent's own type, so a link to a pack file
-                // still mounts, which is what reading the path decided before sub-directories existed.
-                if child.is_dir() {
+                let Ok(real) = std::fs::canonicalize(&child) else {
+                    continue;
+                };
+                if !real.starts_with(&root) {
+                    eprintln!(
+                        "quoin: pack directory: skipping {} because it resolves outside {}",
+                        child.display(),
+                        root.display()
+                    );
+                    continue;
+                }
+                if real.is_dir() {
                     if depth >= MOUNT_DEPTH {
                         continue;
                     }
                     self.entries.insert(key.clone(), Entry::Dir);
                     mounted.push(key.clone());
-                    todo.push((child, format!("{key}/"), depth + 1));
+                    todo.push((real, format!("{key}/"), depth + 1));
                     continue;
                 }
-                if !child.is_file() {
+                if !real.is_file() {
                     continue;
                 }
                 // Asked before read, because the thing being kept out is a file large enough to
                 // matter, and reading it to find that out is the cost.
-                let Ok(meta) = child.metadata() else {
+                let Ok(meta) = std::fs::metadata(&real) else {
                     continue;
                 };
                 if meta.len() > room as u64 {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&child) else {
+                let Ok(bytes) = std::fs::read(&real) else {
                     continue;
                 };
                 room -= bytes.len().min(room);
@@ -405,17 +548,57 @@ impl Volume {
     ///
     /// The directory is created if it is not there, and every file already in it becomes a *written*
     /// entry: these are the app's own files from last time, so they are writable, and a name the pack
-    /// also ships resolves to the save rather than to the shipped copy. That last part is what makes a
+    /// also ships resolves to the save rather than to the reference copy. That last part is what makes a
     /// game remember — a pack asks `Test`/`GetInfo` about its save before it decides to start a new
     /// game, and a volume that answers "not there" for a file an earlier run wrote sends it down the
     /// new-game path every time it is started.
     ///
     /// The returned names are what was loaded, for the caller to report.
+    /// Point the volume's writes at the directory the module came from, the way a handset keeps a
+    /// module's files and its saves in one place.
+    ///
+    /// Unlike [`Volume::persist_to`], nothing is loaded: [`Volume::mount_beside`] already put the
+    /// pack files into the volume, and they stay read-only until the app opens one for writing.
+    /// What it then writes is mirrored back into that directory.
+    pub fn write_back_to(&mut self, dir: &Path) -> bool {
+        self.home = Some(dir.to_path_buf());
+        match std::fs::canonicalize(dir) {
+            Ok(root) => {
+                self.home_real = Some(root);
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "quoin: pack directory {} could not be resolved: {e}",
+                    dir.display()
+                );
+                self.home_real = None;
+                false
+            }
+        }
+    }
+
     pub fn persist_to(&mut self, dir: &Path) -> Vec<String> {
         self.home = Some(dir.to_path_buf());
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!(
+                "quoin: save directory {} could not be created: {e}",
+                dir.display()
+            );
+            self.home_real = None;
+            return Vec::new();
+        }
+        let Ok(root) = std::fs::canonicalize(dir) else {
+            eprintln!(
+                "quoin: save directory {} could not be resolved",
+                dir.display()
+            );
+            self.home_real = None;
+            return Vec::new();
+        };
+        self.home_real = Some(root.clone());
         let mut loaded = Vec::new();
-        let mut todo = vec![(dir.to_path_buf(), String::new(), 0u8)];
+        let mut todo = vec![(root.clone(), String::new(), 0u8)];
         let mut room = VOLUME_LIMIT;
         while let Some((path, prefix, depth)) = todo.pop() {
             let Ok(read) = std::fs::read_dir(&path) else {
@@ -427,22 +610,39 @@ impl Volume {
                     continue;
                 };
                 let key = format!("{prefix}{name}");
-                if child.is_dir() {
+                // A link that leads out of the save directory is left alone rather than loaded:
+                // what it points at is not the guest's file, and a write through it would edit
+                // something the guest never owned.
+                let Ok(real) = std::fs::canonicalize(&child) else {
+                    continue;
+                };
+                if !real.starts_with(&root) {
+                    eprintln!(
+                        "quoin: save directory: skipping {} because it resolves outside {}",
+                        child.display(),
+                        root.display()
+                    );
+                    continue;
+                }
+                if real.is_dir() {
                     if depth >= MOUNT_DEPTH {
                         continue;
                     }
                     self.entries.insert(key.clone(), Entry::Dir);
                     loaded.push(key.clone());
-                    todo.push((child, format!("{key}/"), depth + 1));
+                    todo.push((real, format!("{key}/"), depth + 1));
                     continue;
                 }
-                let Ok(meta) = child.metadata() else {
+                if !real.is_file() {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(&real) else {
                     continue;
                 };
                 if meta.len() > room as u64 {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&child) else {
+                let Ok(bytes) = std::fs::read(&real) else {
                     continue;
                 };
                 room -= bytes.len().min(room);
@@ -460,29 +660,93 @@ impl Volume {
     /// the moment the app wrote it is still on disk if the process is killed a second later, which is
     /// the same promise a handset's flash makes. A volume the caller gave no home does nothing here,
     /// which is every ordinary run.
-    fn mirror(&self, key: &str) {
+    fn mirror(&self, key: &str) -> std::io::Result<()> {
         let Some(home) = &self.home else {
-            return;
+            return Ok(());
         };
         if key.is_empty() {
-            return;
+            return Ok(());
         }
-        let path = home.join(key);
+        let Some(root) = &self.home_real else {
+            let why = std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("save directory {} is not usable", home.display()),
+            );
+            eprintln!("quoin: save: {why}");
+            return Err(why);
+        };
+        let path = root.join(key);
         match self.entries.get(key) {
             Some(Entry::Written(bytes)) => {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = ensure_parent_inside(root, &path).and_then(|()| {
+                    if std::fs::symlink_metadata(&path).is_ok_and(|m| is_link(&m)) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "refusing to write through a link in the save directory",
+                        ))
+                    } else {
+                        std::fs::write(&path, bytes)
+                    }
+                }) {
+                    eprintln!("quoin: save: could not write {}: {e}", path.display());
+                    return Err(e);
                 }
-                let _ = std::fs::write(&path, bytes);
+                Ok(())
             }
             // The bytes are the pack's, and a run does not put the pack's own files anywhere.
-            Some(Entry::Shipped(_)) => {}
+            Some(Entry::Shipped(_)) => Ok(()),
             Some(Entry::Dir) => {
-                let _ = std::fs::create_dir_all(&path);
+                if let Err(e) = ensure_parent_inside(root, &path).and_then(|()| {
+                    if std::fs::symlink_metadata(&path).is_ok_and(|m| is_link(&m)) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "refusing to create a directory over a link in the save directory",
+                        ))
+                    } else {
+                        std::fs::create_dir_all(&path)
+                    }
+                }) {
+                    eprintln!("quoin: could not create {}: {e}", path.display());
+                    return Err(e);
+                }
+                Ok(())
             }
             None => {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_dir_all(&path);
+                if parent_inside(root, &path)
+                    .map_err(|e| {
+                        eprintln!("quoin: could not remove {}: {e}", path.display());
+                        e
+                    })?
+                    .is_none()
+                {
+                    return Ok(());
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    // The caller asked for the name not to be there, and it is not.
+                    return Ok(());
+                };
+                if is_link(&meta) {
+                    return std::fs::remove_file(&path)
+                        .or_else(|_| std::fs::remove_dir(&path))
+                        .map_err(|e| {
+                            eprintln!("quoin: could not remove {}: {e}", path.display());
+                            e
+                        });
+                }
+                if meta.is_dir() {
+                    eprintln!(
+                        "quoin: save: deleting {} recursively because the guest removed the directory",
+                        path.display()
+                    );
+                    return remove_tree(&path).map_err(|e| {
+                        eprintln!("quoin: could not remove {}: {e}", path.display());
+                        e
+                    });
+                }
+                std::fs::remove_file(&path).map_err(|e| {
+                    eprintln!("quoin: could not remove {}: {e}", path.display());
+                    e
+                })
             }
         }
     }
@@ -520,7 +784,7 @@ impl Volume {
     /// is the only thing `GetLastError` is good for.
     fn resolve(&mut self, name: &str) -> Option<String> {
         match normalize(name) {
-            Resolved::Here(n) => Some(n),
+            Resolved::Here(n) => Some(self.canonical(n)),
             Resolved::OtherVolume => {
                 self.last_error = g::AEE_ESCHEMENOTSUPPORTED;
                 None
@@ -530,6 +794,25 @@ impl Volume {
                 None
             }
         }
+    }
+
+    /// The key an existing entry is filed under, folding ASCII case when the device says its
+    /// filesystem does. A name that is not there keeps the spelling the caller asked for, so a
+    /// create-mode open still leaves a key with that case.
+    fn canonical(&self, name: String) -> String {
+        if !self.case_insensitive || name.is_empty() || self.entries.contains_key(&name) {
+            return name;
+        }
+        self.entries
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(&name))
+            .cloned()
+            .unwrap_or(name)
+    }
+
+    /// Turn on the ASCII-case folding a FAT-backed handset performs.
+    pub fn set_case_insensitive(&mut self, fold: bool) {
+        self.case_insensitive = fold;
     }
 
     fn refused(&mut self) -> u32 {
@@ -621,7 +904,7 @@ impl Volume {
             self.last_error = g::AEE_EBADPARM;
             return Err(g::AEE_EBADPARM);
         }
-        // A shipped file the app wants to edit becomes a written copy of itself. The bytes on the
+        // A pack file the app wants to edit becomes a written copy of itself. The bytes on the
         // host disk are already out of reach — `mount_beside` copied them in at the start — so this
         // changes the run and nothing that comes after it, which is the same bargain the module makes
         // for a save file the app invents: kept faithfully while it runs, lost when it does. Refusing
@@ -658,7 +941,7 @@ impl Volume {
         })
     }
 
-    /// The bytes `IFile::Map` may hand out: a read-only view of a file the pack **shipped**.
+    /// The bytes `IFile::Map` may hand out: a read-only view of a file the pack **reference**.
     ///
     /// `None` is the header's own failure answer, and it covers each of its conditions
     ///: only a const file can be mapped, so a file the app wrote this run is
@@ -695,7 +978,10 @@ impl Volume {
             return Ok(0);
         }
         if bytes.is_empty() {
-            self.mirror(&open.name);
+            if let Err(e) = self.mirror(&open.name) {
+                self.last_error = host_failure(&e);
+                return Err(g::AEE_EFAILED);
+            }
             return Ok(0);
         }
         if !open.writable {
@@ -726,6 +1012,18 @@ impl Volume {
             return Ok(0);
         }
         let end = start + bytes.len() as i64;
+        let old_len = match self.entries.get(&open.name) {
+            Some(Entry::Written(data)) => data.len(),
+            _ => 0,
+        };
+        // The part of the old file this write replaces, so a host failure can put it back rather
+        // than leave the guest's memory and the save directory disagreeing about what is on disk.
+        let replaced = match self.entries.get(&open.name) {
+            Some(Entry::Written(data)) if (start as usize) < old_len => {
+                data[start as usize..(end as usize).min(old_len)].to_vec()
+            }
+            _ => Vec::new(),
+        };
         // The mutable borrow ends with this block: what follows reads the entry back out of the volume
         // to mirror it, and a save that has been written but not yet put on the host's disk is a save
         // the next run looks for and does not find.
@@ -740,7 +1038,17 @@ impl Volume {
             }
             data[start as usize..end as usize].copy_from_slice(bytes);
         }
-        self.mirror(&open.name);
+        if let Err(e) = self.mirror(&open.name) {
+            if let Some(Entry::Written(data)) = self.entries.get_mut(&open.name) {
+                data.truncate(old_len);
+                if !replaced.is_empty() {
+                    data[start as usize..start as usize + replaced.len()]
+                        .copy_from_slice(&replaced);
+                }
+            }
+            self.last_error = host_failure(&e);
+            return Err(g::AEE_EFAILED);
+        }
         open.pos = end as u32;
         Ok(bytes.len() as u32)
     }
@@ -812,7 +1120,7 @@ impl Volume {
         g::AEE_SUCCESS
     }
 
-    /// `IFile::Truncate`. Answers the shipped `bool`, where **TRUE means failure**, and leaves the
+    /// `IFile::Truncate`. Answers the reference `bool`, where **TRUE means failure**, and leaves the
     /// file-system result in [`Volume::last_error`] instead of returning it — that is what
     /// `CFile_Truncate` does: it calls the system and then writes `*(a1[3] + 12) = v8`, the cell
     /// `CFileMgr_GetLastError` reads, so a *successful* truncate leaves **0** there rather than the
@@ -823,7 +1131,7 @@ impl Volume {
     /// - the cached-write branch, `if ( a1[32] != 0 ) { *(a1[3] + 12) = 266; return true; }`. That
     ///   word is the record's read-only view of the file (`FindConstFile` installs it at `+128`), and
     ///   266 = `0x100 + 0x0A` = `AEEFS_ERROR + 0x0A` = [`AEEFS_EINVALIDOPERATION`]. This host's
-    ///   counterpart is a handle over an [`Entry::Shipped`] name — the pack's own bytes, mounted read-only —
+    ///   counterpart is a handle over an [`Entry::Reference`] name — the pack's own bytes, mounted read-only —
     ///   so the branch **is** reachable and is taken first, exactly as the body takes it before any
     ///   cache or quota work. What this store does not have is a cache still holding a *previous*
     ///   write, which is the other thing that word can mean on a handset.
@@ -849,17 +1157,32 @@ impl Volume {
         if !open.writable {
             return g::AEE_EREADONLY;
         }
-        {
+        let (old_len, tail) = {
             let Some(Entry::Written(data)) = self.entries.get_mut(&open.name) else {
                 return g::AEE_EREADONLY;
             };
+            let old_len = data.len();
+            let tail = if (len as usize) < old_len {
+                data[len as usize..].to_vec()
+            } else {
+                Vec::new()
+            };
             data.truncate(len as usize);
+            (old_len, tail)
+        };
+        if let Err(e) = self.mirror(&open.name) {
+            if let Some(Entry::Written(data)) = self.entries.get_mut(&open.name) {
+                data.truncate(old_len);
+                if !tail.is_empty() {
+                    data[len as usize..].copy_from_slice(&tail);
+                }
+            }
+            return host_failure(&e);
         }
-        self.mirror(&open.name);
         g::AEE_SUCCESS
     }
 
-    /// `IFILEMGR_Remove`. A shipped file cannot be removed, because that would be a run editing the
+    /// `IFILEMGR_Remove`. A pack file cannot be removed, because that would be a run editing the
     /// pack rather than its own data.
     pub fn remove(&mut self, name: &str) -> u32 {
         let Some(n) = self.resolve(name) else {
@@ -876,8 +1199,13 @@ impl Volume {
         }
         match self.entries.get(&n) {
             Some(Entry::Written(_)) => {
-                self.entries.remove(&n);
-                self.mirror(&n);
+                let Some(entry) = self.entries.remove(&n) else {
+                    return self.fail(AEEFS_EFILENOEXISTS);
+                };
+                if let Err(e) = self.mirror(&n) {
+                    self.entries.insert(n, entry);
+                    return self.fail(host_failure(&e));
+                }
                 g::AEE_SUCCESS
             }
             Some(Entry::Shipped(_)) => self.fail(g::AEE_EREADONLY),
@@ -897,7 +1225,10 @@ impl Volume {
             return g::AEE_SUCCESS;
         }
         self.entries.insert(n.clone(), Entry::Dir);
-        self.mirror(&n);
+        if let Err(e) = self.mirror(&n) {
+            self.entries.remove(&n);
+            return self.fail(host_failure(&e));
+        }
         g::AEE_SUCCESS
     }
 
@@ -913,8 +1244,13 @@ impl Volume {
         if self.entries.keys().any(|k| k.starts_with(&prefix)) {
             return self.fail(g::AEE_EALREADY);
         }
-        self.entries.remove(&n);
-        self.mirror(&n);
+        let Some(entry) = self.entries.remove(&n) else {
+            return self.fail(AEEFS_EDIRNOEXISTS);
+        };
+        if let Err(e) = self.mirror(&n) {
+            self.entries.insert(n, entry);
+            return self.fail(host_failure(&e));
+        }
         g::AEE_SUCCESS
     }
 
@@ -933,15 +1269,29 @@ impl Volume {
         let Some(moved) = moved else {
             return self.fail(g::AEE_EBADPARM);
         };
-        // Landing on a shipped file would overwrite the pack through a side door that `OpenFile`
+        // Landing on a pack file would overwrite the pack through a side door that `OpenFile`
         // and `Remove` both refuse, so the target gets the same check.
         if matches!(self.entries.get(&b), Some(Entry::Shipped(_))) {
             return self.fail(g::AEE_EREADONLY);
         }
-        self.entries.insert(b.clone(), moved);
-        self.entries.remove(&a);
-        self.mirror(&b);
-        self.mirror(&a);
+        let old_b = self.entries.insert(b.clone(), moved);
+        let old_a = self.entries.remove(&a);
+        let result = self.mirror(&b).and_then(|()| self.mirror(&a));
+        if let Err(e) = result {
+            // Put the name space back before reporting: a host rename that only half happened must
+            // not leave the volume pointing at a file the disk does not have.
+            self.entries.remove(&b);
+            self.entries.remove(&a);
+            if let Some(entry) = old_a {
+                self.entries.insert(a.clone(), entry);
+            }
+            if let Some(entry) = old_b {
+                self.entries.insert(b.clone(), entry);
+            }
+            let _ = self.mirror(&b);
+            let _ = self.mirror(&a);
+            return self.fail(host_failure(&e));
+        }
         g::AEE_SUCCESS
     }
 
@@ -1024,7 +1374,7 @@ impl Volume {
     ///
     /// The bits are `AEEFP_*` (the header: `READ`=1, `WRITE`=2, `CREATE`=4,
     /// `DELETE`=8). The answer is not what this host feels like doing but what the volume *is*:
-    /// what the pack shipped is a read-only copy taken at mount time (`Entry::Shipped`), and only
+    /// what the pack provides a read-only copy taken at mount time (`Entry::Reference`), and only
     /// what the app wrote this run is `Entry::Written`. A name outside `AEEFS_HOME_DIR` does not
     /// belong to this volume at all, and that is a different answer from "not permitted" — the two
     /// stay separate here for the same reason `Resolved` keeps them apart.
@@ -1115,7 +1465,7 @@ impl Volume {
     ///
     /// ⚠ The header does not say whether `Use` is what makes a file count in
     /// `AEEFileUseInfo::wFilesUsed` — it defines that field only as "Number of Files currenty used by
-    /// this Module". This host has no second witness for that, so `GetFileUseInfo`
+    /// this Module". This host has no second record for that, so `GetFileUseInfo`
     /// keeps answering with what the volume holds, and `Use` is used for the `Remove` guard alone.
     pub fn use_file(&mut self, name: &str, on: bool) -> u32 {
         let Some(n) = self.resolve(name) else {
@@ -1146,15 +1496,30 @@ impl Volume {
         let Some(n) = self.resolve(name) else {
             return self.refused();
         };
-        match self.entries.get_mut(&n) {
+        let (old_len, tail) = match self.entries.get_mut(&n) {
             Some(Entry::Written(data)) => {
+                let old_len = data.len();
+                let tail = if (len as usize) < old_len {
+                    data[len as usize..].to_vec()
+                } else {
+                    Vec::new()
+                };
                 data.truncate(len as usize);
+                (old_len, tail)
             }
             Some(Entry::Shipped(_)) => return self.fail(g::AEE_EREADONLY),
             Some(Entry::Dir) => return self.fail(g::AEE_EBADPARM),
             None => return self.fail(AEEFS_EFILENOEXISTS),
+        };
+        if let Err(e) = self.mirror(&n) {
+            if let Some(Entry::Written(data)) = self.entries.get_mut(&n) {
+                data.truncate(old_len);
+                if !tail.is_empty() {
+                    data[len as usize..].copy_from_slice(&tail);
+                }
+            }
+            return self.fail(host_failure(&e));
         }
-        self.mirror(&n);
         g::AEE_SUCCESS
     }
 
@@ -1171,7 +1536,7 @@ impl Volume {
             // A directory is readable and writable; `Stat` on the root answers the same, which is
             // why `resolve("")` giving an empty name is not special-cased out.
             Entry::Dir => g::FS_S_IFDIR | g::FS_R_OK | g::FS_W_OK,
-            // What the pack shipped is read-only here for the same reason `Entry::attrib` says
+            // What the pack provides read-only here for the same reason `Entry::attrib` says
             // `AEE_FA_CONST`: it is the card, and the app's writes go elsewhere.
             Entry::Shipped(_) => g::FS_S_IFREG | g::FS_S_IFRDONLY | g::FS_R_OK,
             Entry::Written(_) => g::FS_S_IFREG | g::FS_R_OK | g::FS_W_OK,
@@ -1206,7 +1571,7 @@ impl Volume {
     ///
     /// This is the shape a front end needs when its save slot is one buffer rather than a directory: a
     /// libretro core hands its front end `retro_get_memory_data` and the front end writes those bytes
-    /// out as a `.srm`. Only *written* entries are in it — a shipped file is the pack's own and comes
+    /// out as a `.srm`. Only *written* entries are in it — a pack file is the pack's own and comes
     /// back from the pack — and directories are not, because an empty directory is not worth a name in
     /// a format that has to stay parseable.
     ///

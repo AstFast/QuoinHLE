@@ -1,13 +1,13 @@
 // Moved out of `src/manager.rs` so that file is implementation only; the `#[path]` attribute on its
 // `mod tests;` declaration is what keeps this a child of that module, and `use super::*` is how it
 // reaches the private items. Rows are built by hand here: listing is not starting, so nothing in this
-// file reads a pack, needs a corpus, or can boot one.
+// file reads a pack, needs a sample set, or can boot one.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::*;
-use crate::library::{Candidate, Entry, Icon, Pick, Row, Witness};
+use crate::library::{Candidate, Entry, Icon, Pick, Row, Claim};
 
 /// A pack as the list would hold it: everything the list can see, and nothing that needs a file.
 fn pack(title: &str, build: &str) -> Row {
@@ -101,7 +101,7 @@ fn a_filter_lists_only_what_the_bytes_can_actually_show() {
     claimed.sizes = vec![Candidate {
         width: 240,
         height: 320,
-        witness: Witness::Folder,
+        claim: Claim::Folder,
         evidence: "from the directory: 240x320".to_string(),
     }];
     let plain = pack("plain", "240x320");
@@ -217,6 +217,7 @@ fn manager(rows: Vec<Row>) -> Manager {
         lang: UiLang::Zh,
         saves: Vec::new(),
         save_dir: None,
+        saves_device: false,
         saves_for: None,
         playing: None,
         loading: None,
@@ -308,7 +309,7 @@ fn the_pane_paints_the_selected_packs_report_and_nothing_boots() {
 
 #[test]
 fn the_picker_names_the_size_a_launch_would_use() {
-    // Two witnesses that disagree, so the label proves which one a boot would take. The row is built by
+    // Two records that disagree, so the label proves which one a boot would take. The row is built by
     // hand: listing is not starting, and nothing here reads a pack.
     let mut row = pack("picker", "picker-240x320");
     row.detail = vec!["  screen inference: **canvas candidate 320x240**".to_string()];
@@ -316,13 +317,13 @@ fn the_picker_names_the_size_a_launch_would_use() {
         Candidate {
             width: 240,
             height: 320,
-            witness: Witness::Folder,
+            claim: Claim::Folder,
             evidence: "from the directory: picker-240x320".to_string(),
         },
         Candidate {
             width: 320,
             height: 240,
-            witness: Witness::Art,
+            claim: Claim::Art,
             evidence:
                 "width from a 320-pixel-wide bar; 2 picture(s) at that width, the tallest gives 240"
                     .to_string(),
@@ -496,7 +497,7 @@ fn a_list_icon_is_always_at_a_whole_multiple_of_its_own_pixels() {
         Vec2::splat(26.0),
         "one step, because two would not fit"
     );
-    // 16 is what every build in the corpus carries, and it lands exactly on the box. An icon larger than
+    // 16 is what every build in the sample set carries, and it lands exactly on the box. An icon larger than
     // the box has no whole multiple below one, so it keeps its own pixels and the cell gives way to it
     // rather than the picture being shrunk through a filter.
     assert_eq!(icon_size(16, 16), Vec2::splat(ICON_BOX));

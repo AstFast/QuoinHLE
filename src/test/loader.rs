@@ -53,7 +53,7 @@ fn the_loader_stuffs_the_helper_pointer_below_the_entry() {
 
 #[test]
 fn the_second_argument_is_the_helper_table() {
-    // The SDK spells it `void *ph`, and a pack that inflates and runs its own module reads the
+    // The platform spells it `void *ph`, and a pack that inflates and runs its own module reads the
     // helper table out of it: it calls `[ph + 0x68]` — which is `AEEHelperFuncs::malloc` — and
     // copies `[base - 4]` into the new image's `entry - 4`. That
     // block used to be zeroes, and `bx 0` is where the pack stopped.
@@ -85,7 +85,7 @@ fn a_real_entry_point_returns_and_we_read_the_out_parameter() {
     assert_eq!(created_module(&cpu, &loaded).unwrap(), 0);
 }
 
-/// A flat SDK sample carries no header, so nothing is taken from it.
+/// A flat Sample build carries no header, so nothing is taken from it.
 #[test]
 fn a_flat_image_keeps_every_byte_it_ships() {
     let (mut cpu, mut hle, shell) = runtime();
@@ -115,7 +115,7 @@ fn the_writable_area_is_reported_and_cleared_only_after_the_module_is_done_with_
     ] {
         image[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
-    // The reference area, in the shape a shipped module lays it out: initialised tables the
+    // The reference area, in the shape a guest module lays it out: initialised tables the
     // module keeps reading, then the fixup stream it consumes once. A store binary keeps its
     // zlib code-length tables in exactly that first part, which is why clearing from `refdata`
     // gave its inflate an all-zero table and cost the app its whole start-up.

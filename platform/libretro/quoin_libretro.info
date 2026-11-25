@@ -6,7 +6,7 @@ corename = "QuoinHLE"
 supported_extensions = "breq|mod"
 license = "GPL-2.0-or-later"
 permissions = ""
-display_version = "0.0.1-alpha"
+display_version = "0.0.1-beta"
 
 # Hardware Information
 manufacturer = "Qualcomm"

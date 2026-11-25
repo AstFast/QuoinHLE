@@ -1,6 +1,6 @@
 //! A small HTML reader and painter for `IHtmlViewer`.
 //!
-//! The shipped viewer supports a subset — hyperlinks, simple forms, inline images, left/center/right
+//! The reference viewer supports a subset — hyperlinks, simple forms, inline images, left/center/right
 //! alignment, bold and large text, and text colour — and says outright
 //! that it "is not intended to support for arbitrary content". This module reads exactly that
 //! subset into a flat document: tags in document order for the three DOM slots, and text runs with
@@ -17,15 +17,16 @@
 //! with a value in them, not words in a row. They are runs too (a row can hold a label and two
 //! checkboxes), and [`render`] draws the box before the value. The last mark it draws is the cursor:
 //! whatever element the viewer's focus names is inverted, because a page the user can act on has to
-//! show where they are — the shipped viewer's own cursor is the same inversion.
+//! show where they are — the reference viewer's own cursor is the same inversion.
 
 use std::collections::HashMap;
 
 use crate::abi::generated as g;
 use crate::device::make_rgb;
 use crate::display::{Display, Rect};
+use crate::encoding::TextEncoding;
 use crate::font::{Face, Faces};
-use crate::hle::{Error as HleError, HResult};
+use crate::hle::HResult;
 use crate::mem::Mem;
 
 /// The state an `IHtmlViewer` keeps.
@@ -41,6 +42,17 @@ pub struct Html {
     pub user: u32,
     pub view_state: String,
     pub busy: bool,
+    /// The page no longer matches what is on the screen.
+    ///
+    /// The repaint is the viewer's own debt, not the pack's: `IHtmlViewer::Redraw` says "The
+    /// application does not normally have to call this function to ensure that the screen has been
+    /// updated after changes have been made to the content or options of the viewer. The viewer
+    /// takes care of ... ensuring that changes are properly reflected on the screen." A handset
+    /// collects that debt in its screen-invalidate pass; this host has no such pass, so the debt is
+    /// paid in `IDisplay::Update`, immediately before the frame is presented — which is also the
+    /// only point late enough to survive a pack that draws its own frame *after* the page was set,
+    /// as the dialog-shaped packs do.
+    pub dirty: bool,
     /// `HVOPT_SZ_URL` as text: the address the document was loaded from. It is what a relative
     /// `href` is resolved against before `HVN_JUMP` hands it to the pack, and it is kept as an
     /// owned string because the caller's `char *` need only live for the `SetOption` call.
@@ -138,7 +150,7 @@ pub struct Element {
     pub text: String,
     /// Whether the element encloses nothing at all — `<p></p>` rather than `<p>x</p>`.
     ///
-    /// The shipped layout reads this off the node stream (`node[node_length] == 2`, the close tag
+    /// The reference layout reads this off the node stream (`node[node_length] == 2`, the close tag
     /// being the next node) and skips both the frame push and the margin for such an element, so an
     /// empty paragraph is invisible: no gap, no line, nothing. The close tag of an empty element has
     /// no frame of its own to read a margin out of either, which is what keeps a page full of
@@ -252,7 +264,7 @@ pub struct Marquee {
     pub amount: i32,
     /// Attribute 41 (`scrolldelay`), 36 by default: milliseconds between steps.
     pub delay: u32,
-    /// Attribute 7 (`bgcolor`), or `None` for the shipped default of 10 = `CLR_SYS_WIN`.
+    /// Attribute 7 (`bgcolor`), or `None` for the reference default of 10 = `CLR_SYS_WIN`.
     pub bg: Option<u32>,
 }
 
@@ -589,7 +601,7 @@ impl Document {
         // bytes still go into the element's own text, so `GetElemText` on a `title` answers the
         // title — the opaque stretch decides what is *painted*, not what is read.
         let mut opaque: Option<String> = None;
-        // The shipped loop's `v41`: how many frames are open. It is a counter, not `open.len` —
+        // The reference loop's `v41`: how many frames are open. It is a counter, not `open.len` —
         // objects, void tags and empty elements never reach its `++`. Past `FRAME_LIMIT` this
         // number keeps rising (and falling again), but no frame is written or popped; see the two
         // `capped` gates below and [`Document::frame_len`].
@@ -726,7 +738,7 @@ impl Document {
             // the alignment for what it encloses, not for the blank row it opens.
             let style = doc.style(&open);
             let index = doc.elements.len();
-            // Whether this element encloses nothing, which is a byte the shipped layout reads: the
+            // Whether this element encloses nothing, which is a byte the reference layout reads: the
             // node stream is `[open, id][…contents…][close, id]`, so an element whose contents are
             // empty is one whose next node is the close tag.
             let empty = bytes[i..].starts_with(b"</");
@@ -870,7 +882,14 @@ impl Document {
                     large: false,
                     ..*style
                 };
-                self.push_space(&plain, enclosing, false, Line::Always, style.pre, Some(Mark::Rule));
+                self.push_space(
+                    &plain,
+                    enclosing,
+                    false,
+                    Line::Always,
+                    style.pre,
+                    Some(Mark::Rule),
+                );
                 *flow = false;
             }
             name if is_block(name) => {
@@ -942,8 +961,14 @@ impl Document {
                     rows: 0,
                 };
                 let mark = take_bullet(bullet);
-                self.runs
-                    .push(run(String::new(), *flow, Some(field), Some(index), None, mark));
+                self.runs.push(run(
+                    String::new(),
+                    *flow,
+                    Some(field),
+                    Some(index),
+                    None,
+                    mark,
+                ));
                 *flow = true;
             }
             // A textarea's initial value is its own text, so the box starts empty and is filled in
@@ -956,8 +981,14 @@ impl Document {
                     rows: length_in(attrs, "rows"),
                 };
                 let mark = take_bullet(bullet);
-                self.runs
-                    .push(run(String::new(), *flow, Some(field), Some(index), None, mark));
+                self.runs.push(run(
+                    String::new(),
+                    *flow,
+                    Some(field),
+                    Some(index),
+                    None,
+                    mark,
+                ));
                 *flow = true;
             }
             "body" => {
@@ -1004,7 +1035,7 @@ impl Document {
         let mut first = true;
         for line in lines_of(&text) {
             // A preformatted line is kept as written: `<pre>` is the one element whose spaces mean
-            // something, and its newlines are the row breaks. The normaliser in the shipped engine
+            // something, and its newlines are the row breaks. The normaliser in the reference engine
             // makes exactly this split — a branch that copies bytes verbatim while the `0x80` bit is
             // inherited, and one that collapses runs of white space when it is not.
             let line: std::borrow::Cow<'_, str> = if style.pre {
@@ -1335,7 +1366,7 @@ impl Document {
     /// A document with no enclosing form answers the whole document, which is what
     /// `HVN_SUBMIT` falls back to as well.
     /// Every `<form>`'s element stretch, in document order — the ranges [`form_pairs`] reads and
-    /// the ones the shipped `DoxFormIter` walks when it writes a view state.
+    /// the ones the reference `DoxFormIter` walks when it writes a view state.
     pub fn form_stretches(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         let mut at = 0;
@@ -1395,6 +1426,34 @@ impl Document {
     /// a document that arrived without a declared type is the common case and reading it as HTML is
     /// what a viewer with no type to go on does.
     pub fn parse_as(bytes: &[u8], media_type: &str) -> Document {
+        Self::parse_as_in(bytes, media_type, None)
+    }
+
+    /// Parse the bytes the way `HVOPT_SZ_TYPE` says they are, in the device's own encoding.
+    ///
+    /// `IHtmlViewer::SetData`: "The character encoding of the source stream is assumed to be an
+    /// 8-bit encoding compatible with the native encoding of the device (ISOLATIN 1, Shift-JIS, or
+    /// KSC5601)." `encoding` is that encoding — [`encoding_of`] turns the `AEE_ENC_*` the device
+    /// publishes into it — and `None` is a caller with no device to ask, which keeps the bytes as
+    /// UTF-8 the way every such caller has always had them.
+    ///
+    /// The decode happens once, here, rather than inside the reader: the reader walks bytes and
+    /// turns each stretch into text with `from_utf8_lossy`, so handing it bytes that are already the
+    /// device's text in UTF-8 is the whole of the change and leaves no per-token decision that
+    /// could drift from the one made for the next token.
+    pub fn parse_as_in(
+        bytes: &[u8],
+        media_type: &str,
+        encoding: Option<&'static encoding_rs::Encoding>,
+    ) -> Document {
+        let decoded;
+        let bytes = match encoding {
+            Some(encoding) => {
+                decoded = encoding.decode(bytes).0;
+                decoded.as_bytes()
+            }
+            None => bytes,
+        };
         if is_plain_text(media_type) {
             Document::plain(bytes)
         } else {
@@ -1837,7 +1896,7 @@ pub enum ViewRestore {
     Anchor(String),
     Restore {
         scroll: i32,
-        /// The focus item's position; -1 is the shipped "leave the focus alone".
+        /// The focus item's position; -1 is the reference "leave the focus alone".
         focus: i32,
         /// Every `name=value` word after the first `?`, decoded. A second `?` starts another
         /// form's stretch on the handset; this host restores the words of all of them by name.
@@ -1845,7 +1904,7 @@ pub enum ViewRestore {
     },
 }
 
-/// Read back one string [`view_state`] wrote — or, in the shipped reader's other half, an
+/// Read back one string [`view_state`] wrote — or, in the reference reader's other half, an
 /// `#anchor`. Words this host cannot make sense of are dropped rather than guessed at:
 /// `SetViewState` returns `void`, so there is no caller to tell.
 pub fn parse_view_state(state: &str) -> ViewRestore {
@@ -1956,7 +2015,7 @@ const TAG_PRE: u8 = 0x80;
 
 const FRAME_LIMIT: usize = 29;
 
-/// Whether an element pushes a frame. The gate around the open-tag arm of the shipped loop is
+/// Whether an element pushes a frame. The gate around the open-tag arm of the reference loop is
 /// `(layout & 3) == 0 && node[node_length] != 2`: either low bit (`?xml`/`script`/`style`/`title`
 /// for `0x01`, the five objects for `0x02`) takes the tag out of the frame path, and so does an
 /// element whose next node is its own close tag.
@@ -1966,77 +2025,361 @@ fn pushes_frame(name: &str, empty: bool) -> bool {
 
 /// The seventy-one records, in table order.
 static TAGS: [Tag; 71] = [
-    Tag { name: "?xml", style: 0x00, layout: 0x01 },
-    Tag { name: "a", style: 0x00, layout: 0x00 },
-    Tag { name: "address", style: 0x00, layout: 0x04 },
-    Tag { name: "applet", style: 0x00, layout: 0x00 },
-    Tag { name: "area", style: 0x00, layout: 0x00 },
-    Tag { name: "b", style: 0x01, layout: 0x00 },
-    Tag { name: "base", style: 0x00, layout: 0x00 },
-    Tag { name: "big", style: 0x02, layout: 0x00 },
-    Tag { name: "blockquote", style: 0x00, layout: 0x1c },
-    Tag { name: "body", style: 0x00, layout: 0x00 },
-    Tag { name: "br", style: 0x00, layout: 0x0c },
-    Tag { name: "caption", style: 0x00, layout: 0x00 },
-    Tag { name: "center", style: 0x10, layout: 0x04 },
-    Tag { name: "cite", style: 0x00, layout: 0x00 },
-    Tag { name: "code", style: 0x00, layout: 0x00 },
-    Tag { name: "dd", style: 0x00, layout: 0x14 },
-    Tag { name: "dfn", style: 0x00, layout: 0x00 },
-    Tag { name: "dir", style: 0x00, layout: 0x1c },
-    Tag { name: "div", style: 0x00, layout: 0x24 },
-    Tag { name: "dl", style: 0x00, layout: 0x0c },
-    Tag { name: "dt", style: 0x00, layout: 0x04 },
-    Tag { name: "em", style: 0x00, layout: 0x00 },
-    Tag { name: "font", style: 0x00, layout: 0x00 },
-    Tag { name: "form", style: 0x00, layout: 0x0c },
-    Tag { name: "h1", style: 0x03, layout: 0x2c },
-    Tag { name: "h2", style: 0x03, layout: 0x2c },
-    Tag { name: "h3", style: 0x03, layout: 0x2c },
-    Tag { name: "h4", style: 0x01, layout: 0x2c },
-    Tag { name: "h5", style: 0x01, layout: 0x2c },
-    Tag { name: "h6", style: 0x01, layout: 0x2c },
-    Tag { name: "head", style: 0x00, layout: 0x00 },
-    Tag { name: "hr", style: 0x00, layout: 0x4c },
-    Tag { name: "html", style: 0x00, layout: 0x00 },
-    Tag { name: "i", style: 0x00, layout: 0x00 },
-    Tag { name: "img", style: 0x00, layout: 0x02 },
-    Tag { name: "input", style: 0x00, layout: 0x02 },
-    Tag { name: "isindex", style: 0x00, layout: 0x00 },
-    Tag { name: "kbd", style: 0x00, layout: 0x00 },
-    Tag { name: "label", style: 0x00, layout: 0x00 },
-    Tag { name: "li", style: 0x00, layout: 0x44 },
-    Tag { name: "link", style: 0x00, layout: 0x00 },
-    Tag { name: "map", style: 0x00, layout: 0x00 },
-    Tag { name: "marquee", style: 0x00, layout: 0x02 },
-    Tag { name: "menu", style: 0x00, layout: 0x1c },
-    Tag { name: "meta", style: 0x00, layout: 0x00 },
-    Tag { name: "ol", style: 0x00, layout: 0x1c },
-    Tag { name: "option", style: 0x00, layout: 0x00 },
-    Tag { name: "p", style: 0x00, layout: 0x2c },
-    Tag { name: "param", style: 0x00, layout: 0x00 },
-    Tag { name: "pre", style: 0x00, layout: 0x8c },
-    Tag { name: "samp", style: 0x00, layout: 0x00 },
-    Tag { name: "script", style: 0x00, layout: 0x01 },
-    Tag { name: "select", style: 0x00, layout: 0x02 },
-    Tag { name: "small", style: 0x00, layout: 0x00 },
-    Tag { name: "strike", style: 0x00, layout: 0x00 },
-    Tag { name: "strong", style: 0x01, layout: 0x00 },
-    Tag { name: "style", style: 0x00, layout: 0x01 },
-    Tag { name: "sub", style: 0x00, layout: 0x00 },
-    Tag { name: "sup", style: 0x00, layout: 0x00 },
-    Tag { name: "table", style: 0x00, layout: 0x04 },
-    Tag { name: "td", style: 0x00, layout: 0x00 },
-    Tag { name: "textarea", style: 0x00, layout: 0x82 },
-    Tag { name: "textflow", style: 0x00, layout: 0x00 },
-    Tag { name: "th", style: 0x00, layout: 0x00 },
-    Tag { name: "title", style: 0x00, layout: 0x01 },
-    Tag { name: "tr", style: 0x00, layout: 0x00 },
-    Tag { name: "tt", style: 0x00, layout: 0x00 },
-    Tag { name: "u", style: 0x04, layout: 0x00 },
-    Tag { name: "ul", style: 0x00, layout: 0x1c },
-    Tag { name: "var", style: 0x00, layout: 0x00 },
-    Tag { name: "xmp", style: 0x00, layout: 0x80 },
+    Tag {
+        name: "?xml",
+        style: 0x00,
+        layout: 0x01,
+    },
+    Tag {
+        name: "a",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "address",
+        style: 0x00,
+        layout: 0x04,
+    },
+    Tag {
+        name: "applet",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "area",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "b",
+        style: 0x01,
+        layout: 0x00,
+    },
+    Tag {
+        name: "base",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "big",
+        style: 0x02,
+        layout: 0x00,
+    },
+    Tag {
+        name: "blockquote",
+        style: 0x00,
+        layout: 0x1c,
+    },
+    Tag {
+        name: "body",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "br",
+        style: 0x00,
+        layout: 0x0c,
+    },
+    Tag {
+        name: "caption",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "center",
+        style: 0x10,
+        layout: 0x04,
+    },
+    Tag {
+        name: "cite",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "code",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "dd",
+        style: 0x00,
+        layout: 0x14,
+    },
+    Tag {
+        name: "dfn",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "dir",
+        style: 0x00,
+        layout: 0x1c,
+    },
+    Tag {
+        name: "div",
+        style: 0x00,
+        layout: 0x24,
+    },
+    Tag {
+        name: "dl",
+        style: 0x00,
+        layout: 0x0c,
+    },
+    Tag {
+        name: "dt",
+        style: 0x00,
+        layout: 0x04,
+    },
+    Tag {
+        name: "em",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "font",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "form",
+        style: 0x00,
+        layout: 0x0c,
+    },
+    Tag {
+        name: "h1",
+        style: 0x03,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "h2",
+        style: 0x03,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "h3",
+        style: 0x03,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "h4",
+        style: 0x01,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "h5",
+        style: 0x01,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "h6",
+        style: 0x01,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "head",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "hr",
+        style: 0x00,
+        layout: 0x4c,
+    },
+    Tag {
+        name: "html",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "i",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "img",
+        style: 0x00,
+        layout: 0x02,
+    },
+    Tag {
+        name: "input",
+        style: 0x00,
+        layout: 0x02,
+    },
+    Tag {
+        name: "isindex",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "kbd",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "label",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "li",
+        style: 0x00,
+        layout: 0x44,
+    },
+    Tag {
+        name: "link",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "map",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "marquee",
+        style: 0x00,
+        layout: 0x02,
+    },
+    Tag {
+        name: "menu",
+        style: 0x00,
+        layout: 0x1c,
+    },
+    Tag {
+        name: "meta",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "ol",
+        style: 0x00,
+        layout: 0x1c,
+    },
+    Tag {
+        name: "option",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "p",
+        style: 0x00,
+        layout: 0x2c,
+    },
+    Tag {
+        name: "param",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "pre",
+        style: 0x00,
+        layout: 0x8c,
+    },
+    Tag {
+        name: "samp",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "script",
+        style: 0x00,
+        layout: 0x01,
+    },
+    Tag {
+        name: "select",
+        style: 0x00,
+        layout: 0x02,
+    },
+    Tag {
+        name: "small",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "strike",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "strong",
+        style: 0x01,
+        layout: 0x00,
+    },
+    Tag {
+        name: "style",
+        style: 0x00,
+        layout: 0x01,
+    },
+    Tag {
+        name: "sub",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "sup",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "table",
+        style: 0x00,
+        layout: 0x04,
+    },
+    Tag {
+        name: "td",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "textarea",
+        style: 0x00,
+        layout: 0x82,
+    },
+    Tag {
+        name: "textflow",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "th",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "title",
+        style: 0x00,
+        layout: 0x01,
+    },
+    Tag {
+        name: "tr",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "tt",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "u",
+        style: 0x04,
+        layout: 0x00,
+    },
+    Tag {
+        name: "ul",
+        style: 0x00,
+        layout: 0x1c,
+    },
+    Tag {
+        name: "var",
+        style: 0x00,
+        layout: 0x00,
+    },
+    Tag {
+        name: "xmp",
+        style: 0x00,
+        layout: 0x80,
+    },
 ];
 
 fn tag_of(name: &str) -> Option<&'static Tag> {
@@ -2210,6 +2553,24 @@ fn find_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     }
     (0..=haystack.len() - needle.len())
         .find(|&at| haystack[at..at + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// The codec for an `AEE_ENC_*` device encoding, or `None` for one no document can arrive in.
+///
+/// These are the values `AEEDeviceInfo::wEncoding` publishes, and the set is exactly what the
+/// viewer's own header allows a page to be in: "ISOLATIN 1, Shift-JIS, or KSC5601", plus UTF-8 and
+/// EUC-CN, which the same published names. `AEE_ENC_GSM_7_BIT_DEFAULT` and `AEE_ENC_UNICODE` name a wire
+/// format rather than an 8-bit page encoding, so they answer `None`: inventing a decode the device
+/// never promised is the one answer this host must not give.
+///
+/// `AEE_ENC_ISOLATIN1` maps to windows-1252 because that is what the label `iso-8859-1` means to
+/// every decoder that has implemented it since HTML 4 — the two disagree only in 0x80..0x9F, where
+/// a handset showing "Latin-1" shows the windows-1252 characters. `AEE_ENC_OCTET` is one byte, one
+/// character and nothing above it, which is the same table.
+///
+/// Three names share `0xFE` (`KSC5601`, `EUC_KR`, `UNICODE2`); they are one codec, so one arm.
+pub(crate) fn encoding_of(aee: u32) -> Option<&'static encoding_rs::Encoding> {
+    TextEncoding::stream_codec(aee)
 }
 
 /// Whether `media_type` names plain text, parameters ignored: `text/plain; charset=utf-8` does.
@@ -2436,17 +2797,15 @@ fn rows_of(field: &Field) -> i16 {
 /// the display has installed under that designator, and a layout that answered the question itself
 /// would fold the line where the *built-in* grid ends rather than where the drawn face does.
 fn width_of(face: Option<&Face>, text: &str) -> i16 {
-    let chars: Vec<u16> = text
-        .encode_utf16()
-        .map(|unit| {
-            if unit == 0x00a0 {
-                u16::from(b' ')
-            } else {
-                unit
-            }
-        })
-        .collect();
-    let width = face.map_or(chars.len() as u32 * 8, |f| f.measure_chars(&chars));
+    let shown: std::borrow::Cow<'_, str> = if text.contains('\u{a0}') {
+        std::borrow::Cow::Owned(text.replace('\u{a0}', " "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let width = match face {
+        Some(face) => face.measure_text(&shown, TextEncoding::Unicode),
+        None => shown.encode_utf16().count() as u32 * 8,
+    };
     i16::try_from(width).unwrap_or(i16::MAX)
 }
 
@@ -2458,7 +2817,7 @@ fn cell_of(face: Option<&Face>) -> i16 {
 
 /// The height one line of `font` takes: the face's own cell plus the leading every row of words
 /// gets. This is the number a `<br>`, an `<hr>` or a blank line in `<pre>` moves the cursor by, and
-/// it is exactly the height a row of one word in that face would have had — the shipped engine reads
+/// it is exactly the height a row of one word in that face would have had — the reference engine reads
 /// it out of the same four-word per-face table the layout uses (`a1[4 * (frame & 3) + 195]`).
 fn line_height(faces: Faces<'_>, font: u32) -> i16 {
     cell_of(faces.face(font).as_ref()).saturating_add(ROW_LEADING)
@@ -2550,7 +2909,9 @@ fn box_of(face: Option<&Face>, text: &str, field: &Field) -> (i16, i16) {
     let cell = cell_of(face);
     // A column is as wide as the face's zero, because that is what the value inside the box is
     // drawn with — the same face the box is measured against.
-    let advance = face.map_or(6, |f| f.advance_of(b'0' as u16).max(1) as i16);
+    let advance = face.map_or(6, |f| {
+        f.advance_of_char('0', TextEncoding::Unicode).max(1) as i16
+    });
     match field.kind {
         // A box and a gap, so the label that follows it does not touch the frame.
         FieldKind::Checkbox | FieldKind::Radio => {
@@ -2925,7 +3286,7 @@ fn fold(faces: Faces<'_>, row: &[Run], pieces: &[Piece], dx: i16, pre: bool) -> 
                     rest = rest[take..].trim_start_matches([' ', '\t']);
                 }
                 // Nowhere to cut and nothing else on the line: the word keeps its width and
-                // overflows, which is what the shipped engine does with an item that fits nowhere.
+                // overflows, which is what the reference engine does with an item that fits nowhere.
                 // Only the word overflows — the rest of the text still starts a line of its own.
                 None if line.is_empty() => {
                     let end = rest.find(' ').unwrap_or(rest.len());
@@ -2985,7 +3346,7 @@ pub fn layout(
     // height still counts, so the rows below them land where they would unscrolled.
     let mut y = rect.y.saturating_sub(scroll.max(0));
     let mut out = Vec::new();
-    // The `<hr>` rules in `out`, by index. Each is placed where the shipped redraw would put it
+    // The `<hr>` rules in `out`, by index. Each is placed where the reference redraw would put it
     // only once the line *after* it has been laid out — see the pass at the bottom of this function.
     let mut rules: Vec<usize> = Vec::new();
     let mut at = 0;
@@ -3078,7 +3439,7 @@ pub fn layout(
         let row_dx = dx.saturating_sub(left).saturating_sub(right);
         let x0 = rect.x.saturating_add(left);
         // The leading is the gap between lines of *words*, which is why it is added to every row
-        // that has one. A row of pictures alone has none: the shipped engine adds nothing to a
+        // that has one. A row of pictures alone has none: the reference engine adds nothing to a
         // line it lays out, and the picture's own height already says where the next row starts.
         let row_leading = if row.iter().any(|run| run.image.is_none()) {
             leading
@@ -3125,9 +3486,7 @@ pub fn layout(
             for segment in line {
                 if !started && row[0].mark == Some(Mark::Bullet) {
                     started = true;
-                    let top = y
-                        .saturating_add(height / 2)
-                        .saturating_sub(1);
+                    let top = y.saturating_add(height / 2).saturating_sub(1);
                     out.push(Placed {
                         x: x.saturating_sub(5),
                         y: top,
@@ -3240,7 +3599,7 @@ pub struct View<'a> {
     /// What the user has changed. `None` is a page nobody has touched — and the state every caller
     /// that only wants geometry can pass.
     pub values: Option<&'a Values>,
-    /// `HVP_TRANSPARENT`: the page has no paper of its own. The shipped `Redraw` asks for the
+    /// `HVP_TRANSPARENT`: the page has no paper of its own. The reference `Redraw` asks for the
     /// background to be erased instead of filling it — see [`render`].
     pub transparent: bool,
     pub elapsed_ms: u32,
@@ -3301,7 +3660,7 @@ pub fn render(
     }
     for line in lines {
         let focused = line.elem.is_some() && line.elem == view.focus;
-        // A mark is not a row of the page: it is the rectangle the shipped tag walk fills while it
+        // A mark is not a row of the page: it is the rectangle the reference tag walk fills while it
         // is walking, so it is stroked here and counts as nothing.
         if line.mark.is_some() {
             paint_mark(&line, mem, display, disp, scratch)?;
@@ -3334,25 +3693,7 @@ pub fn render(
     Ok(painted)
 }
 
-/// Write `text` as the `AECHAR` string `IDisplay::DrawText` reads — UTF-16 code units, null
-/// terminated — and answer the address. The caller frees it after the draw, because the display
-/// names its text by address and copies what it needs within the call.
-///
-/// The whole page goes through here: a span, a control's value and an `<img>`'s `alt` are the same
-/// kind of string to the display, and all three used to be written as UTF-8.
-fn text_in(mem: &mut Mem, text: &str) -> HResult<u32> {
-    let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
-    for unit in text.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    let at = mem.alloc(bytes.len() as u32, 2).map_err(HleError::Mem)?;
-    mem.write_bytes(at, &bytes).map_err(HleError::Mem)?;
-    Ok(at)
-}
-
-/// One line of words: the bytes go to guest memory for the length of `draw_text`, which names its
-/// text by address, and the block is freed immediately after.
+/// One line of words: the host's own text, drawn without a trip through guest memory.
 fn paint_text(
     line: &Placed,
     focused: bool,
@@ -3369,12 +3710,8 @@ fn paint_text(
     } else {
         std::borrow::Cow::Borrowed(&line.text)
     };
-    // `IDisplay::DrawText` names its string as `const AECHAR *`, and `AECHAR` is a 16-bit code unit,
-    //so the span is written as UTF-16 and read back with `read_u16str`. Writing it
-    // as UTF-8 — which is what this did — made the display take every other byte as the high half of
-    // a wide character: `AB` arrived as U+4241, one character the face has no glyph for, and the
-    // page painted the missing-character box for every word instead of the word.
-    let at = text_in(mem, &shown)?;
+    // The page is host text: it was decoded from the device's byte stream when it was parsed, and
+    // the face it draws with is keyed by code point. It is never turned back into `AECHAR` units.
     Rect::new(line.x, line.top, line.w.max(0), line.h.max(0)).write(mem, scratch)?;
     if line.color != 0 {
         display.set_color(disp, g::CLR_USER_TEXT, line.color)?;
@@ -3388,18 +3725,16 @@ fn paint_text(
             flags |= g::IDF_TEXT_UNDERLINE;
         }
     }
-    display.draw_text(
+    display.draw_text_unicode(
         mem,
         disp,
         line.font,
-        at,
-        -1,
+        &shown,
         line.x as i32,
         line.top as i32,
         scratch,
         flags,
     )?;
-    mem.free(at);
     Ok(1)
 }
 
@@ -3480,19 +3815,16 @@ fn paint_field(
                 break;
             }
             if !text.is_empty() {
-                let at = text_in(mem, text)?;
-                display.draw_text(
+                display.draw_text_unicode(
                     mem,
                     disp,
                     line.font,
-                    at,
-                    -1,
+                    text,
                     inner.x as i32,
                     y as i32,
                     scratch,
                     g::IDF_ALIGN_TOP,
                 )?;
-                mem.free(at);
             }
             y = y.saturating_add(cell);
         }
@@ -3607,7 +3939,7 @@ fn marquee_pose(mq: &Marquee, box_w: i16, text_w: i16, elapsed_ms: u32) -> Marqu
         steps %= period.max(1);
     }
     // A bounded marquee stops after a handful of passes, so replaying its steps is cheap. The cap
-    // is a guard for a pathological `box` width, not a shipped behaviour.
+    // is a guard for a pathological `box` width, not a reference behaviour.
     for _ in 0..steps.min(4096) {
         if !running(cycles) {
             break;
@@ -3680,22 +4012,19 @@ fn paint_marquee(
     if line.color != 0 {
         display.set_color(disp, g::CLR_USER_TEXT, line.color)?;
     }
-    let at = text_in(mem, &line.text)?;
     // The rectangle is both the fill's shape and the text's clip. Writing it again is harmless:
     // `draw_rect` did not change it, and it keeps the two calls independent of each other.
     rect.write(mem, scratch)?;
-    display.draw_text(
+    display.draw_text_unicode(
         mem,
         disp,
         line.font,
-        at,
-        -1,
+        &line.text,
         x,
         i32::from(line.y) + i32::from(box_.pad),
         scratch,
         g::IDF_TEXT_TRANSPARENT,
     )?;
-    mem.free(at);
     Ok(1)
 }
 
@@ -3784,22 +4113,19 @@ fn paint_image(
     if image.alt.is_empty() {
         return Ok(0);
     }
-    let at = text_in(mem, &image.alt)?;
     // The `alt` is the span, not the line: drawn across the column it would paint over whatever
     // shares the row with it.
     Rect::new(line.x, line.top, line.w.max(0), line.h.max(0)).write(mem, scratch)?;
-    display.draw_text(
+    display.draw_text_unicode(
         mem,
         disp,
         line.font,
-        at,
-        -1,
+        &image.alt,
         line.x as i32,
         line.top as i32,
         scratch,
         g::IDF_ALIGN_TOP,
     )?;
-    mem.free(at);
     Ok(1)
 }
 

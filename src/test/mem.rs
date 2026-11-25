@@ -92,6 +92,37 @@ fn alloc_grows_and_zeroes() {
 }
 
 #[test]
+fn a_declared_newline_slack_stops_at_the_requested_length() {
+    let mut mem = Mem::new();
+    mem.set_heap(0x8000_0000, 0x8000_4000);
+    let plain = mem.alloc(0x8ad, 8).unwrap();
+    assert_eq!(
+        mem.read_u8(plain + 0x8ad).unwrap(),
+        0,
+        "without a declaration the spare bytes are the arena's"
+    );
+
+    mem.set_slack_newline(true);
+    let declared = mem.alloc(0x8ad, 8).unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            mem.read_u8(declared + 0x8ad + i).unwrap(),
+            0x0a,
+            "the three bytes between 0x8ad and the next node read as a newline"
+        );
+    }
+    assert_eq!(
+        mem.read_u8(declared + 0x8ad - 1).unwrap(),
+        0,
+        "only the spare bytes are painted; the payload keeps what the allocator gave it"
+    );
+    assert!(
+        mem.heap_audit().is_ok(),
+        "the next node header is untouched"
+    );
+}
+
+#[test]
 fn a_request_for_nothing_still_names_a_page_it_can_be_read_from() {
     // `map(base, 0)` used to compute an end page one *below* the start and slice `start..=end`,
     // which is not an empty range but a panic. A degenerate size reaches it from anywhere a guest
@@ -161,7 +192,7 @@ fn a_freed_block_is_reused_as_soon_as_the_search_reaches_it() {
     // The delivery is not a bump allocator with a quarantine: `free` marks the node and links it, and
     // the very next request starts its search at the lowest free node. A pack that frees a buffer and
     // keeps the pointer therefore sees that address again — and a host that holds the space back is
-    // running a different allocator, which is what took a shipped pack down.
+    // running a different allocator, which is what took a guest pack down.
     let mut mem = Mem::new();
     mem.set_heap(0x8000_0000, 0x8100_0000);
     let first = mem.alloc(0x40, 8).unwrap();
@@ -188,7 +219,7 @@ fn a_freed_block_is_reused_as_soon_as_the_search_reaches_it() {
 
 #[test]
 fn a_small_request_lands_at_the_head_of_the_lowest_freed_block() {
-    // The shape that took a shipped pack down — and it is the *delivery's* shape, not a bug in it.
+    // The shape that took a guest pack down — and it is the *delivery's* shape, not a bug in it.
     // Lowest-address first fit hands a small object the head of a large freed buffer, so a stale
     // pointer to that buffer now names a live object. This host used to refuse that on purpose; the
     // rule was ours, and running it meant answering addresses no handset would have.
@@ -965,7 +996,7 @@ fn mapping_new_pages_advances_the_layout_generation_but_not_the_window_one() {
 /// The heap and the stack each live in their own contiguous run, so windows are counted in **runs**,
 /// not in 1 MiB units.
 ///
-/// This test witnessed two things, and the order matters:
+/// This test recorded two things, and the order matters:
 /// 1. When every super page was allocated on its own, a 5 MiB heap folded into five runs, exhausted
 ///    the four slots and pushed the stack, at the highest address, out; raising the slot count from 4
 ///    to 8 only relieved it — the stack landed fifth in the comparison chain and was still 0.87
@@ -988,7 +1019,10 @@ fn the_stack_keeps_a_window_when_the_heap_needs_several_spans() {
     let spans = mem.fast_spans();
     let present = |base: u32| spans.iter().any(|span| span.0 == base && span.2 > 0);
     assert!(present(stack), "the stack must get a window: {spans:?}");
-    assert!(present(module), "the image segment must be kept too: {spans:?}");
+    assert!(
+        present(module),
+        "the image segment must be kept too: {spans:?}"
+    );
     assert_eq!(
         spans.iter().filter(|s| *s != &(0, 0, 0)).count(),
         3,
@@ -1057,10 +1091,47 @@ fn a_published_window_stays_fully_mapped_when_new_pages_arrive() {
         );
         assert!(mem.page_ptr(start_page + p).is_some());
     }
-    assert!(base + 0x8000 >= win_end, "the new page must land outside the frozen window");
+    assert!(
+        base + 0x8000 >= win_end,
+        "the new page must land outside the frozen window"
+    );
 
     // Republishing really would produce a longer window — and because it would, the JIT has to freeze
     // it rather than have each new block ask `fast_spans` again (block linking shares one primary
     // window base).
     assert!(mem.fast_spans()[0].2 > pages);
+}
+
+/// `--compat unmapped-read` answers an unmapped read with zero: a handset's map is continuous RAM,
+/// so a pack that reads past the end of its own image gets whatever was there rather than a data
+/// abort. This host maps exactly what it was asked to, so the same read faults — right about the
+/// address, wrong about the machine.
+///
+/// What it must not do is invent memory to *write* into. A store past the map is a bug on the
+/// handset too, and turning it into a silent drop would move one corruption's evidence somewhere
+/// else entirely, which is the failure shape this repository treats as the worst one.
+#[test]
+fn compat_unmapped_read_answers_zero_and_stores_still_fault() {
+    let mut mem = Mem::new();
+    mem.map(0x1000_0000, 0x1000);
+
+    assert_eq!(
+        mem.read_u32(0x1000_4000),
+        Err(Fault::Unmapped { addr: 0x1000_4000 }),
+        "unmapped reads fault by default"
+    );
+
+    mem.set_compat_read_zero(true);
+    assert_eq!(mem.read_u32(0x1000_4000).unwrap(), 0, "zeros under compat");
+    assert_eq!(mem.read_u8(0).unwrap(), 0, "page zero is included");
+    assert_eq!(
+        mem.read_bytes(0x1000_4000, 8).unwrap(),
+        vec![0u8; 8],
+        "and a run of bytes reads as zeros"
+    );
+
+    assert!(
+        mem.write_u8(0x1000_4000, 1).is_err(),
+        "a store past the map is still a fault"
+    );
 }

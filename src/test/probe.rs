@@ -147,7 +147,7 @@ fn arm_image() -> Vec<u8> {
     out
 }
 
-/// A pack laid out the way the corpus lays one out: `<root>/<title>/<appid>/<title>.mod`, its sibling
+/// A pack laid out the way the sample set lays one out: `<root>/<title>/<appid>/<title>.mod`, its sibling
 /// files in that same directory, and the `<appid>.mif` manifest one level above it.
 fn pack(
     tag: &str,
@@ -200,7 +200,7 @@ fn pic(from: &str, id: u32, width: usize, height: usize) -> Picture {
 #[test]
 fn word0_is_read_both_ways_and_the_host_says_which_it_would_use() {
     // The claim this makes is only as strong as the decoder, so it prints both readings rather than one
-    // bit test. `push {r4, lr}` — the word every `AEEMod_Load` in this corpus opens with — reads as ARM,
+    // bit test. `push {r4, lr}` — the word every `AEEMod_Load` in this sample set opens with — reads as ARM,
     // and is entered as ARM.
     let e = entry(&0xe92d_00f0u32.to_le_bytes());
     assert_eq!(e.word, 0xe92d_00f0);
@@ -248,7 +248,7 @@ fn the_loader_says_what_a_run_would_have_said() {
 
 #[test]
 fn the_report_prints_the_warning_once() {
-    // A duplicated `⚠` line went unnoticed for a whole corpus run because nothing asserted over the
+    // A duplicated `⚠` line went unnoticed for a whole sample set run because nothing asserted over the
     // report, so the report is now a list of lines and this counts it.
     let mod_path = pack(
         "report",
@@ -311,7 +311,7 @@ fn the_scroll_strip_is_not_the_screen() {
 
 #[test]
 fn a_bar_spanning_the_canvas_sets_the_width() {
-    // The shape most of the corpus is: one full-width strip near the top or bottom, and sprites that
+    // The shape most of the sample set is: one full-width strip near the top or bottom, and sprites that
     // are taller than it is wide. The strip is the only picture whose width is the screen's width.
     let pics = [
         pic("a", 1, 176, 38),
@@ -347,7 +347,7 @@ fn a_portrait_pack_is_read_the_same_way() {
 
 #[test]
 fn thin_evidence_is_called_thin() {
-    // Thirteen of the corpus's thirty-five builds mount nothing but their three icons, and the width
+    // Thirteen of the sample set's thirty-five builds mount nothing but their three icons, and the width
     // answer still prints for them. The report has to say the evidence is an icon, not the art.
     let mod_path = pack(
         "thin",
@@ -398,7 +398,7 @@ fn thin_mounted_art_with_anonymous_art_says_where_the_width_came_from() {
     let warning = p.caveat().expect("mounted art is thin");
     assert!(
         warning.contains("1 anonymous .par picture(s) also voted"),
-        "the warning must name the other witness: {warning}"
+        "the warning must name the other record: {warning}"
     );
     assert!(
         !warning.contains("describes an icon"),
@@ -412,7 +412,7 @@ fn the_widest_bar_wins_and_a_marquee_steals_the_answer() {
     // Pinned, not praised: two spans here, and the wider one is a ticker while the 176 column carries
     // the 205-row canvas. The rule believes the widest span, so this pack is answered 320x36 and would
     // be played on the wrong canvas. Ranking bars by the picture under them fixed exactly this case in
-    // the lab and scored worse on the corpus (5 agreements against 7), so it is not what ships — and
+    // the lab and scored worse on the sample set (5 agreements against 7), so it is not what ships — and
     // the packs it disagrees on stay on the report's disagreement list until a rule wins on both.
     let pics = [
         pic("a", 1, 320, 36),
@@ -549,7 +549,7 @@ fn a_whole_pack_is_read_from_its_own_directory() {
         p.hint, None,
         "nobody typed a size into these directory names"
     );
-    assert_eq!(p.agrees(), None, "one witness is not a disagreement");
+    assert_eq!(p.agrees(), None, "one record is not a disagreement");
     assert_eq!(p.verdict(), "the art answered; the directory named no size");
     cleanup(&mod_path);
 }
@@ -579,7 +579,7 @@ fn a_directory_hint_that_disagrees_with_the_art_is_called_a_disagreement() {
 #[test]
 fn a_par_leaf_with_no_property_block_is_still_measured() {
     // `.par` stores no type, so a probe that only trusted declared MIMEs would report the whole pack
-    // as having no art. This is the shape the corpus's `ui.par` has: 85 BMPs and no blocks at all.
+    // as having no art. This is the shape the sample set's `ui.par` has: 85 BMPs and no blocks at all.
     let leaf = Record {
         kind: resource::RESTYPE_IMAGE,
         id: 4,
@@ -602,7 +602,7 @@ fn the_strings_of_a_manifest_are_printed_as_far_as_they_are_sayable() {
 #[test]
 fn the_report_marks_its_warning_exactly_once() {
     // The library's pane colours whatever `is_caution` accepts, and the report printed this line twice
-    // for a whole corpus run because nothing asserted over the report. Counted, not assumed.
+    // for a whole sample set run because nothing asserted over the report. Counted, not assumed.
     let thin = pack(
         "caution",
         "1004",
@@ -673,7 +673,7 @@ fn the_brew_header_reports_where_its_own_words_lands() {
 /// two ways it was known.
 ///
 /// The line used to be one hand-written `starts_with("audio/")` over declared MIMEs, which got both
-/// facts wrong in opposite directions: a pack whose ring tones are registered under the SDK's older
+/// facts wrong in opposite directions: a pack whose ring tones are registered under the platform's older
 /// `SOUND_MIME_BASE` (and spell the whole set that way) reported no
 /// audio at all, while a pack whose payloads are declared `audio/mid` but are 8 bytes of header was
 /// reported as music this host could play. Neither mistake is visible in a number that does not say
@@ -811,7 +811,7 @@ fn par_pack(children: &[Vec<u8>]) -> Vec<u8> {
 
 /// A `.par` the host recognises but cannot mount must not read as "not a container".
 ///
-/// A shape the corpus contains: a bare nested header whose gzip leaves have no id above them. `read` is right to return nothing — an invented id is a name no pack asks for — but the
+/// A shape the sample set contains: a bare nested header whose gzip leaves have no id above them. `read` is right to return nothing — an invented id is a name no pack asks for — but the
 /// report has to name the file and the leaves it could not file, or a silent mount looks like a
 /// missing resource.
 #[test]

@@ -49,7 +49,7 @@ fn a_save_directory_keeps_what_the_app_writes() {
     );
 
     // And the next run finds them, as *written* entries: a pack that also ships a file of that
-    // name gets its own save back rather than the shipped template.
+    // name gets its own save back rather than the reference template.
     let mut next = Volume::default();
     next.mount_beside(&pack.join("app.mod"));
     let loaded = next.persist_to(&home);
@@ -131,7 +131,7 @@ fn a_pack_beside_the_module_arrives_as_rom_until_the_app_writes_it() {
     assert_eq!(v.read(&f, 5), b"bytes", "and from wherever the pointer is");
     // Writing it takes a copy of itself. The bytes the run edits are its own and live in memory,
     // so the pack on disk still belongs to the next run; refusing the open instead would deny
-    // every pack that stores its game in the directory it shipped in.
+    // every pack that stores its game in the directory it reference in.
     let mut w = v.open("res.bar", g::_OFM_READWRITE).unwrap();
     assert_eq!(v.write(&mut w, b"x"), Ok(1));
     let r = v.open("res.bar", g::_OFM_READ).unwrap();
@@ -146,7 +146,7 @@ fn a_pack_beside_the_module_arrives_as_rom_until_the_app_writes_it() {
         b"container-bytes",
         "and the host's copy is exactly what it was"
     );
-    // A shipped file the run never took over is still the pack's, and removing that is the pack
+    // A pack file the run never took over is still the pack's, and removing that is the pack
     // disappearing rather than being edited. The one it has written is the app's own, and goes.
     assert_eq!(v.remove("app.mod"), g::AEE_EFAILED);
     assert_eq!(
@@ -228,7 +228,7 @@ fn enumeration_reports_the_text_it_was_given_and_a_failed_start_drops_the_walk()
         ("logs/", "logs/a.dat"),
         // ⚠ Only the **leading** separators are dropped. `CFileMgr_EnumInit` stores the caller's text
         // after a loop that skips a leading `/` or `\` and nothing else, so a `./` the app typed comes
-        // back in every name the walk reports. That is the shipped answer, odd as it reads.
+        // back in every name the walk reports. That is the reference answer, odd as it reads.
         ("./logs", "./logs/a.dat"),
     ] {
         assert_eq!(
@@ -623,10 +623,10 @@ fn a_nearly_full_volume_refuses_a_growing_seek_and_shortens_a_growing_write() {
 }
 
 /// The three facts a `GetInfo` reports come out of the entry itself, which is how a handle over the
-/// pack's shipped bytes answers what `FillConstInfo` puts in the record: `FA_READONLY|FA_CONST`
+/// pack's reference bytes answers what `FillConstInfo` puts in the record: `FA_READONLY|FA_CONST`
 /// (`0x14`) and that view's own length (`*(a1[32] + 8)`), with no date. A file the app wrote is
 /// `FA_NORMAL`. ⚠ The `AEE_FA_FIXED` bit the body ORs in for a view that cannot be overridden has no
-/// answer here: [`Volume::open`] turns a shipped name into a written copy the moment a handle asks for
+/// answer here: [`Volume::open`] turns a reference name into a written copy the moment a handle asks for
 /// write access, which is exactly the overridability that bit says a file does **not** have.
 #[test]
 fn a_shipped_file_reports_the_attributes_its_own_view_carries() {
@@ -910,10 +910,7 @@ fn the_volume_keeps_the_case_a_pack_asked_for() {
     // create-mode open leaves behind: the ringer enumeration and the save-block format both depend
     // on that key, and a fold made three of those tests fail during this investigation.
     assert_eq!(normalize("Main.rlb"), Resolved::Here("Main.rlb".into()));
-    assert_eq!(
-        normalize("fs:/Main.rlb"),
-        Resolved::Here("Main.rlb".into())
-    );
+    assert_eq!(normalize("fs:/Main.rlb"), Resolved::Here("Main.rlb".into()));
     assert_eq!(
         normalize("fs:/~/Main.rlb"),
         Resolved::Here("Main.rlb".into())
@@ -924,6 +921,22 @@ fn the_volume_keeps_the_case_a_pack_asked_for() {
         Resolved::Here("\u{e9}A.TXT".into())
     );
     assert_eq!(normalize("../x"), Resolved::Rejected);
+}
+
+#[test]
+fn a_fat_backed_volume_folds_case_but_keeps_the_created_spelling() {
+    let mut v = Volume::default();
+    v.set_case_insensitive(true);
+    v.entries
+        .insert("img.bar".into(), Entry::Written(b"art".to_vec()));
+    let f = v.open("Img.bar", g::_OFM_READ).expect("the shipped casing");
+    assert_eq!(v.read(&f, 3), b"art");
+    assert_eq!(v.test("IMG.BAR"), g::AEE_SUCCESS);
+
+    let created = v.open("Save.DAT", g::_OFM_CREATE).unwrap();
+    assert_eq!(created.name, "Save.DAT", "a new key keeps its own spelling");
+    assert_eq!(v.test("save.dat"), g::AEE_SUCCESS, "and folds afterwards");
+    assert_ne!(v.test("missing.dat"), g::AEE_SUCCESS);
 }
 
 #[test]
@@ -941,9 +954,7 @@ fn a_module_directory_prefix_opens_the_file_it_shipped() {
         g::AEE_SUCCESS,
         "a module directory prefix reaches the shipped nested file"
     );
-    let f = v
-        .open("fs:/mod/app/res/gbk2uc.map", g::_OFM_READ)
-        .unwrap();
+    let f = v.open("fs:/mod/app/res/gbk2uc.map", g::_OFM_READ).unwrap();
     assert_eq!(v.read(&f, 3), b"map");
     assert_eq!(
         v.test("main.rlb"),
@@ -973,7 +984,7 @@ fn a_written_block_round_trips_and_a_foreign_one_is_refused_whole() {
     volume
         .entries
         .insert("存档/一".into(), Entry::Written(vec![9]));
-    // Neither of these belongs in a block: a shipped file comes back from the pack, and a directory
+    // Neither of these belongs in a block: a pack file comes back from the pack, and a directory
     // is not worth a name in a format that has to stay parseable.
     volume
         .entries
@@ -1022,4 +1033,156 @@ fn a_written_block_round_trips_and_a_foreign_one_is_refused_whole() {
         block,
         "and none of the refusals changed what was already there"
     );
+}
+
+#[cfg(windows)]
+fn make_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+    std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn make_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).is_ok()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn make_junction(_link: &std::path::Path, _target: &std::path::Path) -> bool {
+    false
+}
+
+#[test]
+fn rmdir_removes_the_whole_host_directory_even_files_the_volume_never_loaded() {
+    let home = scratch("rmdir-home");
+    let mut v = Volume::default();
+    v.persist_to(&home);
+    assert_eq!(v.mkdir("sub"), g::AEE_SUCCESS);
+
+    // A file the guest never loaded, because it was not there when the volume started. The guest
+    // removed the directory, so the host directory goes with it; the removal is announced on stderr.
+    std::fs::write(home.join("sub").join("host-only.txt"), b"keep").unwrap();
+    assert_eq!(v.rmdir("sub"), g::AEE_SUCCESS);
+    assert!(
+        !home.join("sub").exists(),
+        "the guest removed the directory, so the host tree went too"
+    );
+    assert!(v.info("sub").is_none());
+}
+
+#[test]
+fn a_failed_host_write_is_reported_and_rolled_back_in_memory() {
+    let home = scratch("write-fail-home");
+    let mut v = Volume::default();
+    v.persist_to(&home);
+    let mut f = v
+        .open("save.dat", g::_OFM_READWRITE | g::_OFM_CREATE)
+        .unwrap();
+    assert_eq!(v.write(&mut f, b"old"), Ok(3));
+    assert_eq!(std::fs::read(home.join("save.dat")).unwrap(), b"old");
+
+    // Put a directory where the mirror has to write a file. The guest must not be told the write
+    // succeeded, and the bytes it already had must still be what a later read sees.
+    std::fs::remove_file(home.join("save.dat")).unwrap();
+    std::fs::create_dir(home.join("save.dat")).unwrap();
+    assert_eq!(v.write(&mut f, b"new!"), Err(g::AEE_EFAILED));
+    assert_ne!(v.last_error(), 0, "the reason is left in GetLastError");
+    assert_eq!(v.info("save.dat").map(|i| i.size), Some(3));
+    let r = v.open("save.dat", g::_OFM_READ).unwrap();
+    assert_eq!(v.read(&r, 16), b"old");
+}
+
+#[test]
+fn rmdir_never_follows_a_link_inside_the_directory_it_removes() {
+    let home = scratch("rmdir-link-home");
+    let outside = scratch("rmdir-link-outside");
+    std::fs::write(outside.join("secret"), b"secret").unwrap();
+    let mut v = Volume::default();
+    v.persist_to(&home);
+    assert_eq!(v.mkdir("sub"), g::AEE_SUCCESS);
+    if !make_junction(&home.join("sub").join("escape"), &outside) {
+        eprintln!("quoin: skipping link test: the host would not create a junction");
+        return;
+    }
+
+    assert_eq!(v.rmdir("sub"), g::AEE_SUCCESS);
+    assert!(!home.join("sub").exists());
+    assert_eq!(
+        std::fs::read(outside.join("secret")).unwrap(),
+        b"secret",
+        "the link went with the directory; what it pointed at did not"
+    );
+}
+
+#[test]
+fn a_link_out_of_the_save_directory_is_not_loaded_or_written_through() {
+    let home = scratch("link-home");
+    let outside = scratch("link-outside");
+    std::fs::write(outside.join("secret"), b"secret").unwrap();
+    if !make_junction(&home.join("escape"), &outside) {
+        eprintln!("quoin: skipping link test: the host would not create a junction");
+        return;
+    }
+
+    let mut v = Volume::default();
+    assert!(
+        v.persist_to(&home).is_empty(),
+        "a link that leaves the save directory is not one of the guest's files"
+    );
+    assert!(v.open("escape/secret", g::_OFM_READ).is_err());
+
+    let mut f = v
+        .open("escape/new", g::_OFM_READWRITE | g::_OFM_CREATE)
+        .unwrap();
+    assert_eq!(v.write(&mut f, b"x"), Err(g::AEE_EFAILED));
+    assert!(
+        !outside.join("new").exists(),
+        "nothing may be created through a link that leaves the save directory"
+    );
+}
+
+#[test]
+fn a_link_out_of_the_pack_directory_is_not_mounted() {
+    let pack = scratch("link-pack");
+    std::fs::write(pack.join("app.mod"), b"image").unwrap();
+    let outside = scratch("link-pack-outside");
+    std::fs::write(outside.join("secret"), b"secret").unwrap();
+    if !make_junction(&pack.join("escape"), &outside) {
+        eprintln!("quoin: skipping link test: the host would not create a junction");
+        return;
+    }
+
+    let mut v = Volume::default();
+    let mounted = v.mount_beside(&pack.join("app.mod"));
+    assert!(
+        !mounted.iter().any(|name| name == "escape"),
+        "a link that leaves the pack directory is not mounted"
+    );
+    assert!(v.open("escape/secret", g::_OFM_READ).is_err());
+}
+
+#[test]
+fn write_back_to_mirrors_new_and_rewritten_files_into_the_pack_directory() {
+    let pack = scratch("write-back-pack");
+    std::fs::write(pack.join("app.mod"), b"image").unwrap();
+    std::fs::write(pack.join("s0.save"), b"old").unwrap();
+
+    let mut v = Volume::default();
+    v.mount_beside(&pack.join("app.mod"));
+    assert!(v.write_back_to(&pack));
+
+    // A file the app creates lands beside the module, not in a separate save directory.
+    let mut f = v
+        .open("new.sav", g::_OFM_READWRITE | g::_OFM_CREATE)
+        .unwrap();
+    assert_eq!(v.write(&mut f, b"new"), Ok(3));
+    assert_eq!(std::fs::read(pack.join("new.sav")).unwrap(), b"new");
+
+    // A save the pack provides writable once the app opens it for writing; the write goes home.
+    let mut s = v.open("s0.save", g::_OFM_READWRITE).unwrap();
+    assert_eq!(v.write(&mut s, b"new!"), Ok(4));
+    assert_eq!(std::fs::read(pack.join("s0.save")).unwrap(), b"new!");
 }

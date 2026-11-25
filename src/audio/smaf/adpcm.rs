@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn matches_the_reference_decoder_on_a_fixed_vector() {
-        // Witness: the vendored C++ `YamahaAdpcm::decodeAll(..., false)` on this exact
+        // Record: the vendored C++ `YamahaAdpcm::decodeAll(..., false)` on this exact
         // buffer prints these sixteen samples.
         let data = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
         assert_eq!(

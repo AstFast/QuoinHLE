@@ -17,7 +17,9 @@
 //!   `0xad05`, `0xf7ff:0xede4`. The tests execute those bytes rather than hand-written ones.
 //!
 //! The sweep settles which slots are *not* ARMv5TE and must stay faults: `0xB1xx`/`0xB3xx`/
-//! `0xB6xx`-`0xBFxx` carry `cbz`/`sxth`/`rev`/`bkpt`/`it`.
+//! `0xB6xx`-`0xBFxx` carry `cbz`/`rev`/`bkpt`/`it`. `0xB2xx` was on that list too, until a reference
+//! pack executed `uxth` on its start-up path: the four ARMv6 extends are answered now (shared with
+//! the ARM decoder), and only the byte-reverse/`cbz`/hint groups remain faults.
 //!
 //! It does not settle `0011x`, and the sweep's own rendering is *why*: it prints `0x300c`
 //! as `adds r0, 0xc`, with the destination as the only operand, which is the ARMv6.1 reading.
@@ -361,9 +363,9 @@ impl Cpu {
         Ok(())
     }
 
-    /// `0xB000`-`0xB0FF` moves SP by a multiple of four, `0xB400`-`0xB5FF` is `PUSH`. Everything
-    /// else in the group — `cbz`, `sxth`, the high-register `PUSH` — belongs to a later
-    /// architecture and is refused.
+    /// `0xB000`-`0xB0FF` moves SP by a multiple of four, `0xB200`-`0xB2FF` is the ARMv6 extend
+    /// group, `0xB400`-`0xB5FF` is `PUSH`. Everything else in the group — `cbz`, the high-register
+    /// `PUSH`, `rev` — belongs to a later architecture and is refused.
     fn thumb_stack_adjust_or_push(&mut self, pc: u32, insn: u32) -> Result<(), Stop> {
         if insn & 0xff00 == 0xb000 {
             let amount = (insn & 0x7f) * 4;
@@ -373,6 +375,20 @@ impl Cpu {
                 self.r[13].wrapping_add(amount)
             };
             return Ok(());
+        }
+        // `SXTH`/`SXTB`/`UXTH`/`UXTB`: bits 7-6 pick the pair and the width. A pack built for an
+        // ARMv6 handset uses them on its start-up path, and the ARM decoder already computes the
+        // same four — this is the one decoder gap, not a new operation.
+        if insn & 0xff00 == 0xb200 {
+            let rd = insn & 7;
+            let rm = (insn >> 3) & 7;
+            let (signed, bits) = match (insn >> 6) & 3 {
+                0 => (true, 16),
+                1 => (true, 8),
+                2 => (false, 16),
+                _ => (false, 8),
+            };
+            return self.extend_register(rd, rm, signed, bits);
         }
         if insn & 0xfe00 == 0xb400 {
             return self.thumb_push(pc, insn);
@@ -445,7 +461,7 @@ impl Cpu {
     }
 
     /// Formats 18 and 19: `STMIA`/`LDMIA`. Both write back, which is why Thumb `PUSH`/`POP` and
-    /// these two share the "base always moves" shape — with one exception the corpus found: a *load*
+    /// these two share the "base always moves" shape — with one exception the sample set found: a *load*
     /// whose own base register sits in the register list leaves that register holding the word it
     /// loaded, which `a_load_whose_base_is_in_its_own_list_keeps_the_loaded_word` pins down.
     fn thumb_block_transfer(&mut self, pc: u32, insn: u32) -> Result<(), Stop> {

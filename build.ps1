@@ -10,7 +10,7 @@ param(
     [string] $Target = "",
     [switch] $Locked,
     [switch] $Offline,
-    # Faces to put in the release archive, if one is asked for. Both are paths on this machine:
+    # Faces to put in the release archive, if one is asked for. Both are caller-supplied paths:
     # nothing is bundled by default, and the interface falls back to the system's own fonts.
     # `-Font` names files, `-FontDir` takes every .ttf/.otf/.ttc/.otc in a directory.
     [string[]] $Font = @(),

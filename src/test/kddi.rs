@@ -1,7 +1,7 @@
-//! The au/KDDI private extensions: the two `CreateInstance` classes, their slot tables, and the
+//! The carrier extensions: the two `CreateInstance` classes, their slot tables, and the
 //! answers this host can honestly give for a handset it is not.
 //!
-//! Every test here is corpus-free. The slot order is the one the shipped header declares, which is
+//! Every test here is sample-free. The slot order is the one the reference header declares, which is
 //! what a pack compiled against that header calls; the reference module's own table is a revision
 //! older and is deliberately not what `IFACES` publishes.
 
@@ -345,7 +345,7 @@ fn the_private_table_matches_the_compiled_layout_and_the_header_values() {
     };
     let size = |name: &str| jp::JP_STRUCTS.iter().find(|s| s.name == name).unwrap().size;
 
-    // The witness is `gcc -m32` reading the same headers: 32-bit pointers, `boolean` is a byte,
+    // The record is `gcc -m32` reading the same headers: 32-bit pointers, `boolean` is a byte,
     // `JulianType` is seven uint16, and both structures round up to their own alignment.
     assert_eq!(size("KDDIHistory"), 40);
     assert_eq!(field("KDDIHistory", "pszPhoneNumber"), (0, 17));
@@ -366,4 +366,50 @@ fn the_private_table_matches_the_compiled_layout_and_the_header_values() {
     assert_eq!(size("ShimMUAInfo"), 32);
     assert_eq!(field("ShimMUAInfo", "to_list"), (12, 4));
     assert_eq!(field("ShimMUAInfo", "body"), (28, 4));
+}
+
+/// `AEECLSID_IUNICODE_SJIS` is the carrier class a J2B environment asks for at startup; a refusal is
+/// a null store inside its own environment, not a quiet gap. The two conversions are the codec
+/// [`crate::resource`] already runs for the `FD FE`-marked container strings, so the test pins the
+/// bytes for two characters rather than only round-tripping the host against itself.
+#[test]
+fn the_unicode_sjis_extension_converts_both_ways_and_refuses_a_short_buffer() {
+    let mut rt = Runtime::new();
+    let obj = create(&mut rt, abi::AEECLSID_IUNICODE_SJIS);
+    assert_eq!(rt.hle.object(obj).unwrap().iface, "IUnicodeSjis");
+    let to_sjis = abi::method_id(abi::UNICODESJIS_IFACE, abi::UNICODESJIS_UCS2TOSJIS);
+    let from_sjis = abi::method_id(abi::UNICODESJIS_IFACE, abi::UNICODESJIS_SJISTOUCS2);
+    // "あア" (U+3042 U+30A2), NUL-terminated.
+    let src = out_buffer(&mut rt, 8);
+    rt.cpu.mem.write_u16(src, 0x3042).unwrap();
+    rt.cpu.mem.write_u16(src + 2, 0x30a2).unwrap();
+    rt.cpu.mem.write_u16(src + 4, 0).unwrap();
+    let dst = out_buffer(&mut rt, 16);
+    assert_eq!(
+        call(&mut rt, to_sjis, obj, &[src, dst, 16]).unwrap(),
+        g::TRUE
+    );
+    assert_eq!(
+        rt.cpu.mem.read_cstr(dst, 16).unwrap(),
+        vec![0x82, 0xa0, 0x83, 0x41],
+        "あ is 82 A0 and ア is 83 41 in Shift-JIS"
+    );
+    // Four bytes plus the terminator do not fit in four.
+    let short = out_buffer(&mut rt, 4);
+    assert_eq!(
+        call(&mut rt, to_sjis, obj, &[src, short, 4]).unwrap(),
+        g::FALSE
+    );
+    // And back, including the terminator.
+    let back = out_buffer(&mut rt, 8);
+    assert_eq!(
+        call(&mut rt, from_sjis, obj, &[dst, back, 8]).unwrap(),
+        g::TRUE
+    );
+    assert_eq!(rt.cpu.mem.read_u16(back).unwrap(), 0x3042);
+    assert_eq!(rt.cpu.mem.read_u16(back + 2).unwrap(), 0x30a2);
+    assert_eq!(rt.cpu.mem.read_u16(back + 4).unwrap(), 0);
+    // The i-mode slot has no mapping here; the header's failure answer is the input.
+    let imode = abi::method_id(abi::UNICODESJIS_IFACE, abi::UNICODESJIS_IMODESJISTOSJIS);
+    assert_eq!(call(&mut rt, imode, obj, &[0x1234]).unwrap(), 0x1234);
 }

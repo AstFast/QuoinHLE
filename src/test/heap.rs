@@ -413,7 +413,11 @@ fn a_node_ending_exactly_at_high_is_still_a_node() {
     m.write_word(HEADER, size);
     assert_eq!(h.node_at(&m, HEADER), Some((size, false)));
     m.write_word(HEADER, size + 4);
-    assert_eq!(h.node_at(&m, HEADER), None, "one byte past the end is not a node");
+    assert_eq!(
+        h.node_at(&m, HEADER),
+        None,
+        "one byte past the end is not a node"
+    );
 }
 
 /// The free-list walk reads the same guest-writable size words, and `push_node` reaches it without
@@ -441,14 +445,25 @@ fn merging_free_nodes_survives_a_scribbled_size_word() {
 fn the_report_walks_survive_a_scribbled_size_word() {
     let (h, mut m) = heap(1 << 16);
     m.write_word(HEADER, 0xffff_ffff);
-    assert!(h.audit(&m).is_err(), "a broken chain is a disagreement, not a crash");
-    assert_eq!(h.walk(&m).len(), 1, "the walk stops at the node it cannot step past");
+    assert!(
+        h.audit(&m).is_err(),
+        "a broken chain is a disagreement, not a crash"
+    );
+    assert_eq!(
+        h.walk(&m).len(),
+        1,
+        "the walk stops at the node it cannot step past"
+    );
     let _ = h.spare(&m);
     let _ = h.free_blocks(&m);
     // And the fix must not reject a heap that is fine.
     let (ok, mut bytes) = heap(1 << 16);
     let _ = ok.alloc(&mut bytes, 64, true);
-    assert!(ok.audit(&bytes).is_ok(), "{}", ok.audit(&bytes).unwrap_err());
+    assert!(
+        ok.audit(&bytes).is_ok(),
+        "{}",
+        ok.audit(&bytes).unwrap_err()
+    );
 }
 
 /// `owner_of` walks the same guest-written chain and had neither a saturating step nor a step budget:

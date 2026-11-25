@@ -124,7 +124,7 @@ fn a_file_that_is_not_a_pack_is_refused_by_its_first_four_bytes() {
     assert!(format!("{err}").contains("signature"), "{err}");
 }
 
-/// The shape the corpus has in a group of files: a header holding a bare header, whose leaves are
+/// The shape the sample set has in a group of files: a header holding a bare header, whose leaves are
 /// gzip members and nothing above them names an id.
 ///
 /// `read` must still return nothing — inventing an id would be a name no pack ever asks for — but

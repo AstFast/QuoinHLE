@@ -44,7 +44,7 @@ fn seeded() -> RandomSource {
 }
 
 /// A stream drawn with the refills in order, so `drawn` counts the times the pool was emptied —
-/// which is the shape of the shipped code: the twenty OEM bytes are asked for inside the refill.
+/// which is the shape of the platform code: the twenty OEM bytes are asked for inside the refill.
 /// A stream drawn with the mixing block's own entropy order — `REFILL[i]` for the `i`th draw — so
 /// `drawn` says how many times the body reached for the OEM's twenty bytes.
 fn draw_counted(source: &mut RandomSource, n: usize) -> Option<(Vec<u8>, usize)> {

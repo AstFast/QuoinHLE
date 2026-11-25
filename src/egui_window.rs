@@ -346,7 +346,7 @@ fn label_size(painter: &egui::Painter, text: &str, cell: PointRect) -> f32 {
 
 /// The PC key a handset key stands for.
 ///
-/// The names are the SDK's and the codes come from the generated ABI table, so this table and the
+/// The names are the platform's and the codes come from the generated ABI table, so this table and the
 /// keypad laid out by [`crate::handset`] cannot drift apart, and a name that stops existing is a
 /// panic rather than a key that silently sends something else.
 #[cfg(test)]
@@ -447,7 +447,7 @@ const FACE_LIMIT: usize = 4;
 /// else, and refusing to start over a font would be the worse outcome.
 ///
 /// The first candidate that exists is the one the host meant — the manager's saved choice, a font
-/// the person installed, or a face the build shipped in `ui-fonts`. The paths are per platform
+/// the person installed, or a face the build reference in `ui-fonts`. The paths are per platform
 /// because the manager and this window are both meant to build and run somewhere other than
 /// Windows. One face is not always enough: a bundled webfont family is Latin-only, and loading it
 /// alone would turn every Chinese string into boxes that used to be text. So when the chosen face
@@ -1115,7 +1115,11 @@ impl Frontend {
                 // The assertion is not decoration: `expand565` stops at the shorter slice, and the
                 // arrival buffer below is sized from the window, so a frame of a different shape would
                 // produce a correctly-shaped image with half of it black rather than a panic.
-                debug_assert_eq!(pixels.len(), size[0] * size[1] * 2, "a 5-6-5 frame of this size");
+                debug_assert_eq!(
+                    pixels.len(),
+                    size[0] * size[1] * 2,
+                    "a 5-6-5 frame of this size"
+                );
                 let mut wide = vec![0u8; size[0] * size[1] * 4];
                 crate::screen::expand565(pixels, &mut wide);
                 ColorImage::from_rgba_premultiplied(size, &wide)

@@ -1,7 +1,7 @@
-//! M5: read what a shipped app's art and text actually live in.
+//! M5: read what a guest app's art and text actually live in.
 //!
 //! Two halves. The synthetic container runs everywhere and pins the format down from the field
-//! layout, so a regression in the parser cannot hide behind one machine's corpus. The rest is gated
+//! layout, so a regression in the parser cannot hide behind one machine's sample set. The rest is gated
 //! on `BREW_GAME_DIR` pointing at a directory of real third-party apps, because the only proof that
 //! the layout is right is that the files themselves add up — they are not vendored here.
 
@@ -142,7 +142,7 @@ fn a_container_written_from_the_layout_parses_back() {
     assert_eq!(first.props, b"image/bmp\0", "the property block is its own");
     // `ISHELL_LoadResData` hands the app *these* bytes, block included, because the app reads the
     // block's own length out of the first byte and steps over it itself. Stripping the block here
-    // instead makes that skip land in the middle of the picture - which is what stopped a shipped
+    // instead makes that skip land in the middle of the picture - which is what stopped a reference
     // game from ever drawing one.
     assert_eq!(
         &first.stored[..2],
@@ -185,7 +185,7 @@ fn a_container_written_from_the_layout_parses_back() {
 #[test]
 fn a_terminal_offset_past_the_end_is_tolerated_rather_than_refusing_the_container() {
     let table = 0x20 + 4 * 8;
-    // The closing table entry is a sentinel: shipped writers put it past the end of the file as a
+    // The closing table entry is a sentinel: reference writers put it past the end of the file as a
     // matter of course (943 of 2 343 containers do), and the parser reads the slot but never
     // follows it. Refusing here would hide every record behind one stale word.
     let mut bytes = synthetic();
@@ -232,7 +232,7 @@ fn a_table_that_ends_away_from_the_data_section_is_refused_by_name() {
     );
 }
 
-/// The proof that matters: every real container in a third-party corpus, parsed and decoded.
+/// The proof that matters: every real container in a external sample set, parsed and decoded.
 #[test]
 fn every_real_container_adds_up() {
     let Some(root) = game_dir() else {
@@ -256,7 +256,7 @@ fn every_real_container_adds_up() {
         let bytes = std::fs::read(path).expect("read the container");
         let c = match Container::parse(&bytes) {
             Ok(c) => c,
-            // Not every `.mif` is this container: one in the corpus does not even carry the
+            // Not every `.mif` is this container: one in the sample set does not even carry the
             // signature. Reported rather than assumed, because it bounds what "the format" means.
             Err(e) => {
                 foreign += 1;
@@ -289,7 +289,7 @@ fn every_real_container_adds_up() {
                         placeholders += 1;
                         continue;
                     }
-                    // The kind number says which table the handset filed this under, and the corpus
+                    // The kind number says which table the handset filed this under, and the sample set
                     // files plenty under the wrong one: music is `RESTYPE_IMAGE` holding `audio/mid`
                     // and a "Loading." caption is `RESTYPE_IMAGE` holding `text/plain`.
                     // So the MIME is what makes the claim checkable — anything that says it is an

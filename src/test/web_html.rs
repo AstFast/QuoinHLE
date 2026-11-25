@@ -203,7 +203,10 @@ fn layout_honours_indent_vspace_scrollbar_and_colours() {
     };
     let rows = placed(&quoted, &inset, 60);
     assert_eq!(rows[0].x, 6, "HVOPT_N_INDENT is one step in");
-    assert_eq!(rows[0].dx, 100, "and `<blockquote>` takes it off both sides");
+    assert_eq!(
+        rows[0].dx, 100,
+        "and `<blockquote>` takes it off both sides"
+    );
     assert_eq!(rows[0].color, 0x00ff_0000, "HVOPT_RGB_TEXT");
     let outside = placed(&doc, &inset, 60);
     assert_eq!(outside[0].x, 0, "no indent block, no step");
@@ -297,7 +300,7 @@ fn a_line_that_ends_on_a_word_boundary_keeps_that_last_word() {
 
 #[test]
 fn a_word_wider_than_the_column_overflows_rather_than_being_split() {
-    // Latin has no break opportunity inside a word, and the shipped engine hands an item that fits
+    // Latin has no break opportunity inside a word, and the reference engine hands an item that fits
     // nowhere its full width and lets it run past the column. Breaking it into two halves would be
     // an invention: nothing in the ABI says where a hyphen belongs.
     let doc = doc_of("<p>antidisestablishmentarianism is a word</p>");
@@ -697,7 +700,7 @@ fn a_list_item_puts_a_two_by_two_square_five_pixels_left_of_its_first_word() {
         dot.x, 5,
         "and the square hangs in the gutter that step opened"
     );
-    // Painted in the order the shipped walk paints: the square is drawn as the tag is met, before
+    // Painted in the order the reference walk paints: the square is drawn as the tag is met, before
     // the words that follow it.
     let dot_at = rows.iter().position(|r| r.mark.is_some()).unwrap();
     let word_at = rows.iter().position(|r| r.text == "a").unwrap();
@@ -744,7 +747,10 @@ fn an_indent_block_moves_its_rows_in_by_one_step_per_level() {
     let quote = doc_of("<blockquote>q</blockquote>");
     let rows = placed(&quote, &opts, 200);
     assert_eq!(rows[0].x, 10, "one step in");
-    assert_eq!(rows[0].dx, 100, "and one step off the far side of a 120-pixel rect");
+    assert_eq!(
+        rows[0].dx, 100,
+        "and one step off the far side of a 120-pixel rect"
+    );
 
     let deep = doc_of("<blockquote><blockquote>q</blockquote></blockquote>");
     let rows = placed(&deep, &opts, 200);
@@ -898,7 +904,7 @@ fn a_rule_takes_a_line_and_hangs_eight_pixels_above_the_next() {
         "a's own line and the rule's, with a paragraph margin on either side of the rule"
     );
     // And the margin moves the rule with the line it hangs from, because the rule is read off that
-    // line: the shipped pass has no other source for its top.
+    // line: the reference pass has no other source for its top.
     let rule = rows.iter().find(|r| r.mark == Some(Mark::Rule)).unwrap();
     assert_eq!(
         rule.y,
@@ -1007,11 +1013,7 @@ fn a_blank_line_inside_a_preformatted_block_is_a_line() {
     // height as the two around it, even with `HVOPT_N_VSPACE` at its default of zero — which is
     // where the paragraph gap would have made it vanish.
     let doc = doc_of("<pre>a\n\nb</pre>");
-    let texts: Vec<&str> = doc
-        .runs
-        .iter()
-        .map(|run| run.text.as_str())
-        .collect();
+    let texts: Vec<&str> = doc.runs.iter().map(|run| run.text.as_str()).collect();
     // The two outer empty runs are `<pre>`'s own: it opens and closes with a margin row like every
     // block. The one in the middle is the blank line, and it is a row of its own.
     assert_eq!(
@@ -1040,11 +1042,7 @@ fn a_blank_line_inside_a_preformatted_block_is_a_line() {
     // Outside `<pre>` the blank line is source formatting and goes: HTML has no use for it.
     let folded = doc_of("<p>a\n\nb</p>");
     let rows = placed(&folded, &Options::default(), 200);
-    assert_eq!(
-        rows.len(),
-        2,
-        "two words and no blank line between them"
-    );
+    assert_eq!(rows.len(), 2, "two words and no blank line between them");
 }
 
 #[test]
@@ -1434,7 +1432,7 @@ fn a_picture_shares_the_line_with_the_words_around_it() {
 
 #[test]
 fn a_picture_too_wide_for_the_line_moves_to_the_next_one_whole() {
-    // The shipped rule for an item with no break inside it: end the line and start the next one
+    // The reference rule for an item with no break inside it: end the line and start the next one
     // with the item at its full width. Nothing shrinks a picture to make it fit.
     let doc = doc_of("<p>hello<img src=p.png width=100 height=8>tail</p>");
     let rows = placed(&doc, &Options::default(), 200);
@@ -1514,10 +1512,7 @@ fn half_a_size_is_no_size_at_all() {
         (100, 50),
         "one attribute alone does not scale a picture"
     );
-    assert_eq!(
-        picture_of("<img src=p.png height=20>", 100, 50),
-        (100, 50)
-    );
+    assert_eq!(picture_of("<img src=p.png height=20>", 100, 50), (100, 50));
 }
 
 #[test]
@@ -2001,12 +1996,12 @@ fn the_view_state_is_the_shipped_pair_of_numbers_and_the_form_words() {
     }
     values.set_checked(at_c, true);
 
-    // The shipped writer: `<scroll>,<focuspos>` and then the forms' words, encoded the way a
+    // The reference writer: `<scroll>,<focuspos>` and then the forms' words, encoded the way a
     // submission posts them. A `?` in a value cannot break the frame around it.
     let state = view_state_shim(&doc, &values, 7, 2);
     assert_eq!(state, "7,2?a=hello%3F&s=2&c=v");
 
-    // And the shipped reader: the same string comes apart into the position, the focus and the
+    // And the reference reader: the same string comes apart into the position, the focus and the
     // words — plus the `#anchor` form, which names an element instead.
     match parse_view_state(&state) {
         ViewRestore::Restore {

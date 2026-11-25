@@ -1,4 +1,4 @@
-//! Zero-corpus JIT frame costs: `cargo bench --features jit --bench jit_frame`.
+//! Zero-sample set JIT frame costs: `cargo bench --features jit --bench jit_frame`.
 //!
 //! Two things a throughput number cannot see, both of them JIT-specific and both of them capable of
 //! eating a whole frame without retiring a single expensive guest instruction:
@@ -16,7 +16,7 @@
 //!    guest can reach the host 16x more often per second than the interpreter ever could.
 //!
 //! Everything here is hand-written ARM words mapped into a fresh `Mem`: no `.mod`, no window, no HLE
-//! service, no corpus. Same category as `benches/interp.rs`: self-contained, with no guest pack.
+//! service, no sample set. Same category as `benches/interp.rs`: self-contained, with no guest pack.
 //!
 //! The numbers are not a game's frame time. They are the price of one unit of work, so that a trace
 //! saying "N host calls this frame" can be turned into milliseconds.

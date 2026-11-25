@@ -216,6 +216,30 @@ fn device_items_follow_the_documented_size_negotiation() {
         .device_item(&mem, g::AEE_DEVICEITEM_BKEY, 0)
         .unwrap()
         .is_none());
+
+    // The carrier's subscriber number, which is not in the generated table and so has no `g::` path. The
+    // pack that found it (`w62ca_new-ex-mahjong`) asks only the null-buffer question — "how many
+    // bytes?" — while initialising its Carrier system, and treated `EUNSUPPORTED` as "no handset":
+    // it printed `INITKDDISYSTEM` and returned from `AEEClsCreateInstance` without an applet.
+    let number = p
+        .device_item(
+            &mem,
+            crate::device::AEE_DEVICEITEM_CARRIER_KDDI_SUBSCRIBER_NO,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(number, b"09012345678 ".to_vec());
+
+    // That null-buffer form, through the door the guest actually uses: the answer is a byte count and
+    // `SUCCESS`, not a buffer.
+    let size = mem.alloc(4, 4).unwrap();
+    mem.write_u32(size, 0).unwrap();
+    assert_eq!(
+        put_sized_item(&mut mem, &number, 0, size).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(mem.read_u32(size).unwrap(), 12);
 }
 
 /// Key support is an in/out structure: the caller names the key, we answer for that key.

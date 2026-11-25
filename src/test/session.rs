@@ -1,7 +1,7 @@
 //! The two-thread session, measured on a machine that is deliberately made to hang.
 //!
 //! These run hand-written ARM words, not a pack: the whole point is a guest function that never
-//! returns, and the only honest way to have one is to write one. Nothing here reads the corpus.
+//! returns, and the only honest way to have one is to write one. Nothing here reads the sample set.
 
 use crate::abi::generated as g;
 use crate::runtime::{Job, Runtime};
@@ -454,7 +454,7 @@ fn speed_moves_the_gate_not_the_slice() {
 /// 60–86 M instr/s that is 0.4 s to 17 s, while the window's `FPS --` threshold is only 250 ms
 /// (`src/egui_window.rs:82`).
 ///
-/// The program here is a hand-written `b .` and reads no corpus: what is asserted is the semantics
+/// The program here is a hand-written `b .` and reads no sample set: what is asserted is the semantics
 /// "the return happens exactly at the instruction budget", which depends neither on machine speed nor
 /// on a guest game (no-guest-run rule).
 #[cfg(feature = "jit")]
@@ -469,7 +469,10 @@ fn jit_run_has_no_wall_clock_exit_only_the_instruction_budget_ends_it() {
     c.mem.write_u32(CODE, 0xeaff_fffe).unwrap(); // b .
     c.pc = CODE;
     c.enable_jit();
-    assert!(c.jit_enabled(), "this reproduction must really run on the JIT backend");
+    assert!(
+        c.jit_enabled(),
+        "this reproduction must really run on the JIT backend"
+    );
 
     let budget = 8 * CANCEL_LOOK;
     let before = c.steps;
@@ -582,7 +585,10 @@ fn a_turn_that_never_returns_starves_frames_but_publishes_activity() {
         status.turns, 0,
         "the turn counter is still written only at the end; reads during a long turn still see 0"
     );
-    assert_eq!(status.clock_ms, 0, "the virtual clock likewise advances only after pump returns");
+    assert_eq!(
+        status.clock_ms, 0,
+        "the virtual clock likewise advances only after pump returns"
+    );
     assert_eq!(
         status.emulator,
         Duration::ZERO,
@@ -747,7 +753,10 @@ fn jit_sampling_sees_compilation_and_a_full_flush() {
     // fills.
     c.set_jit_arena_limit(2);
     let flushed = sample_jit_blocks(c.jit_cached_blocks(), &mut prev, &mut invalidations).unwrap();
-    assert_eq!(flushed.invalidations, 1, "a full-table flush must be recorded as one flush");
+    assert_eq!(
+        flushed.invalidations, 1,
+        "a full-table flush must be recorded as one flush"
+    );
     assert_eq!(flushed.blocks, 0, "the block count is zero after a flush");
 }
 
@@ -756,8 +765,12 @@ fn jit_sampling_sees_compilation_and_a_full_flush() {
 /// that caused it; a hidden window's absence is not replayed.
 #[test]
 fn alignment_pays_a_stall_back_in_bounded_turns_not_one_giant_pump() {
-    let base = pace(Duration::from_millis(410), SPEED_ONE).expect("a slow turn still opens one round");
-    assert_eq!(base, 16, "pace is still a fixed frame and ignores wall clock entirely");
+    let base =
+        pace(Duration::from_millis(410), SPEED_ONE).expect("a slow turn still opens one round");
+    assert_eq!(
+        base, 16,
+        "pace is still a fixed frame and ignores wall clock entirely"
+    );
     assert_eq!(
         pace(Duration::from_secs(60), SPEED_ONE),
         Some(16),
@@ -781,14 +794,26 @@ fn alignment_pays_a_stall_back_in_bounded_turns_not_one_giant_pump() {
     let mut turns = 1;
     while debt > 0 {
         let (e, next) = catch_up(Duration::from_millis(16), debt);
-        assert!(base + e <= 16 + ALIGN_CATCHUP_MS, "a single turn must still stay within bounds during amortisation");
+        assert!(
+            base + e <= 16 + ALIGN_CATCHUP_MS,
+            "a single turn must still stay within bounds during amortisation"
+        );
         paid += e;
         debt = next;
         turns += 1;
-        assert!(turns < 200, "the debt must converge, not grow with every payment");
+        assert!(
+            turns < 200,
+            "the debt must converge, not grow with every payment"
+        );
     }
-    assert_eq!(paid, 394, "a 410 ms stall owes 394 ms, recovered exactly in the end");
-    assert_eq!(turns, 50, "about fifty turns, under a second, rather than one burst");
+    assert_eq!(
+        paid, 394,
+        "a 410 ms stall owes 394 ms, recovered exactly in the end"
+    );
+    assert_eq!(
+        turns, 50,
+        "about fifty turns, under a second, rather than one burst"
+    );
 }
 
 #[test]

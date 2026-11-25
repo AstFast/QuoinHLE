@@ -75,7 +75,7 @@ impl Default for RandomSource {
 
 impl RandomSource {
     /// The `.bss` image before anyone has run: zeros everywhere, so `seeded` is false and a `Read`
-    /// refuses. The shipped `New` is the only thing that changes this.
+    /// refuses. The reference `New` is the only thing that changes this.
     pub fn new() -> Self {
         Self {
             xkey: [0; KEY],
@@ -105,7 +105,7 @@ impl RandomSource {
     /// `AEEAccumulateRandomnessForFIPS186`: XOR each byte into the pool at the cursor, wrapping before
     /// `pool[54]`. The first call of the run initialises the cursor to `pool[1]` and marks the pool
     /// started at `pool[0]`. The cursor itself is kept inside the pool, at `pool[56..60]`, which is why
-    /// the shipped loop reads and writes it as an address.
+    /// the reference loop reads and writes it as an address.
     pub fn accumulate(&mut self, data: &[u8]) {
         if self.pool[0] == 0 {
             self.set_cursor(POOL_FIRST as u32);

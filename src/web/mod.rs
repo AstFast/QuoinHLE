@@ -128,7 +128,7 @@ pub fn make_url(base: &[u8], rel: &[u8]) -> (Vec<u8>, usize) {
         //: the base contributes nothing, and the reference contributes all of it.
         (0, false)
     } else if r[6] != r[1] {
-        //: a reference with its own authority keeps only the base's scheme.
+        //: a comes with its own authority keeps only the base's scheme.
         (b[1], false)
     } else if r[7] != r[6]
         && ((b[6] == b[1] && byte_at(base, b[6]) != b'/') || byte_at(rel, r[6]) == b'/')
@@ -170,7 +170,7 @@ fn equal_folded(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The byte at `at`, or the zero of the terminator when `at` is the end of the text — which is what
-/// the shipped member reads there too, since every one of its `cpcPath[0]` tests is allowed to land
+/// the reference member reads there too, since every one of its `cpcPath[0]` tests is allowed to land
 /// on the NUL.
 fn byte_at(s: &[u8], at: usize) -> u8 {
     s.get(at).copied().unwrap_or(0)
@@ -193,7 +193,7 @@ fn remove_dots(url: &[u8]) -> Vec<u8> {
     if u[6] == u[1] && byte_at(url, u[6]) != b'/' {
         return url.to_vec();
     }
-    // The slash the shipped member makes room for, when the answer came out of the merge with an
+    // The slash the reference member makes room for, when the answer came out of the merge with an
     // authority and no path at all.
     let insert = byte_at(url, u[6]) != b'/';
     let mut seg = Vec::new();
@@ -251,7 +251,7 @@ fn pop_segment(out: &mut Vec<u8>) {
 /// `src` they came from, so a caller that ran out of room can tell a truncated result from a
 /// complete one without walking the escapes to find a boundary.
 ///
-/// The set that survives unescaped is the shipped one — letters, digits, and `* -. _`
+/// The set that survives unescaped is the reference one — letters, digits, and `* -. _`
 /// (`ISUNRESERVED`, the delivered body, chosen against IE and Mozilla rather than against RFC), and a
 /// space becomes a `+` rather than an escape. A `~` is therefore escaped, and a `*` is
 /// not. Everything else becomes `%` and two **uppercase** hex digits from `gszHexDigits`.
@@ -283,7 +283,7 @@ fn needs_escape(b: u8) -> bool {
 ///
 /// A `%` that is not followed by two hex digits is emitted as itself and costs one byte; a `%` with
 /// fewer than two bytes left after it stops the walk **without consuming itself**,
-/// because the shipped member does not decode partial escapes. That is why the second half of the
+/// because the reference member does not decode partial escapes. That is why the second half of the
 /// answer is a count of bytes read and not simply the length of the input.
 pub fn url_decode(src: &[u8], limit: usize) -> (Vec<u8>, usize) {
     let mut out = Vec::new();
@@ -340,13 +340,13 @@ pub fn b64_encode(src: &[u8]) -> Vec<u8> {
 
 /// `DecodeBase64`: the bytes it wrote, and whether it finished.
 ///
-/// The second half of the answer is the interface's `-1`, and it is not a rollback: the shipped
+/// The second half of the answer is the interface's `-1`, and it is not a rollback: the reference
 /// member writes each byte as it decodes it, so a string that turns out to be bogus part-way
 /// through leaves its prefix in the caller's buffer (precedes the checks at, and
 /// every `return -1` abandons the walk from there). A caller that reads the buffer only on a
 /// non-negative answer never sees it; one that reads it anyway sees what a handset wrote.
 ///
-/// Three ways a string is refused, all of them before a byte is looked at in the shipped order:
+/// Three ways a string is refused, all of them before a byte is looked at in the reference order:
 /// its length is not a multiple of four (so `"QQ"` is refused and `"QQ=="` is not); a
 /// character outside the alphabet, which the table `index_64` extends to every control
 /// character, space, `-`, `.`, and every byte at or above 128; and padding in the wrong

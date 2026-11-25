@@ -106,7 +106,7 @@ fn a_result_with_an_authority_and_no_path_is_given_its_slash() {
     assert_eq!(make_url(b"http://a", b"").0, b"http://a/");
     assert_eq!(make_url(b"http://a/b/c", b"?q").0, b"http://a/b/c?q");
     // A reference that is a lone query against a base with nothing but an authority takes the
-    // slash the shipped member only inserts when the cut stopped at the query.
+    // slash the reference member only inserts when the cut stopped at the query.
     assert_eq!(make_url(b"http://a", b"?q").0, b"http://a/?q");
 }
 
@@ -205,7 +205,7 @@ fn base64_round_trips_every_group_length() {
     assert_eq!(b64_decode(b"YQ=="), (b"a".to_vec(), true), "two pads");
     assert_eq!(b64_decode(b"YWI="), (b"ab".to_vec(), true), "one pad");
     // refuses on the length before it looks at a single character, which is why the
-    // unpadded pair and the wrapped line are both refused here: the shipped member takes a
+    // unpadded pair and the wrapped line are both refused here: the reference member takes a
     // null-terminated string and has no notion of folding at all.
     assert_eq!(b64_decode(b"YQ"), (Vec::new(), false), "an unpadded pair");
     assert_eq!(

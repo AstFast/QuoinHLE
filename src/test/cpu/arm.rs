@@ -197,7 +197,7 @@ fn an_immediate_with_bit4_set_stays_data_processing() {
 
 /// In this group only `W` moves the base, and a base that is also a destination takes the
 /// loaded value — `P` says nothing about it, whatever Thumb does. `0xe8960070` is the word a
-/// shipped module runs at `0x10003dce0` to pull its own stacked arguments, and reading it as
+/// guest module runs at `0x10003dce0` to pull its own stacked arguments, and reading it as
 /// "always move the base" handed the module a stack address where it wanted the small index the
 /// same slot held.
 #[test]
@@ -354,7 +354,7 @@ fn a_halfword_transfer_with_writeback_updates_the_base() {
 
 #[test]
 fn a_shift_by_register_is_data_processing_not_a_special_form() {
-    // `lsl r1, r0, r3` — what a shipped module died on at image offset 0xe4. `bit4` marks the
+    // `lsl r1, r0, r3` — what a guest module died on at image offset 0xe4. `bit4` marks the
     // multiply and halfword families as well, so the special path has to give the word back
     // rather than refuse what it does not own.
     let cpu = run(
@@ -448,13 +448,13 @@ fn a_doubleword_transfer_can_take_its_offset_from_a_register() {
     assert_eq!(cpu.r[9], 0xcafe_f00d);
 }
 
-/// An odd first register is UNPREDICTABLE in a pair transfer. No shipped compiler emits one, so
+/// An odd first register is UNPREDICTABLE in a pair transfer. No reference compiler emits one, so
 /// the answer is to say so rather than to invent where the halves went.
 #[test]
 fn a_doubleword_pair_on_an_odd_register_is_refused_by_name() {
     let mut cpu = Cpu::new(Mem::new());
     cpu.mem.map(CODE, 0x1000);
-    // `ldrd r3, r4, [sp, #0x20]` — the same shape as the shipped word, with an odd Rt.
+    // `ldrd r3, r4, [sp, #0x20]` — the same shape as the reference word, with an odd Rt.
     cpu.mem.write_u32(CODE, 0xe1cd_32d0).unwrap();
     cpu.pc = CODE;
     match cpu.run(1) {
@@ -474,7 +474,7 @@ fn a_multiply_family_word_naming_r15_is_refused_by_name_not_by_indexing_past_the
     // Any word with `1001` in bits[7:4] goes through the multiply gate, and the gate reads the
     // two operand fields before it decides which form the word is. Both are four bits wide, so
     // `Rm = 15` is one of the values that arrives — and the register file is fifteen long,
-    // because R15 lives beside it. The word below is not a real instruction at all; a shipped
+    // because R15 lives beside it. The word below is not a real instruction at all; a reference
     // module reached it by branching through a pointer it had never filled, and the run ended in
     // a Rust panic that named no address and no word, which is the one failure mode a guest
     // fault is not allowed to have.
@@ -521,7 +521,7 @@ fn a_multiply_writes_its_destination_not_the_field_data_processing_calls_rd() {
 
 #[test]
 fn a_long_multiply_fills_both_halves_and_signs_only_when_told_to() {
-    // Every value asserted below was read off unicorn on this machine, not derived by hand. An
+    // Every value asserted below was taken from the architecture's documented encodings, not from guesswork. An
     // earlier version of this test labelled `0xe0810392` "smull" and
     // `0xe0410392` "umull" — the two long forms were swapped — and asserted the pair the *signed*
     // reading gives, so the only tests that could have caught the signedness bug pinned it instead.
@@ -624,7 +624,7 @@ fn the_rest_of_the_multiply_group_is_refused_rather_than_run_as_data_processing(
     // A `1001` in bits[7:4] cannot be confused with a data-processing shift-by-register,
     // because that form is required to leave bit7 clear — so anything the group does not name
     // has to stop, since running it as `AND` or `EOR` corrupts a register and carries on.
-    // `0xe120_0090` is such a word: no shipped module in the corpus executes one, so this core
+    // `0xe120_0090` is such a word: no guest module in the sample set executes one, so this core
     // has no evidence to identify it with, and what the test pins is that it is refused.
     let mut cpu = Cpu::new(Mem::new());
     cpu.mem.map(CODE, 0x1000);
@@ -741,7 +741,7 @@ fn the_sixty_four_bit_shift_island_rescales_a_fixed_point_product_the_way_the_ar
     }
 }
 
-/// `blx #+0x358`: the word at module+0x24 of two shipped Resident Evil builds, where it is the
+/// `blx #+0x358`: the word at module+0x24 of two reference Resident Evil builds, where it is the
 /// call out of a compiler-generated ARM veneer into the pack's Thumb body. The unconditional
 /// space is not all undefined — ARMv5 put BLX-immediate there for exactly this interworking.
 #[test]
@@ -775,7 +775,7 @@ fn blx_immediate_halfword_bit_reaches_an_odd_halfword() {
     assert!(cpu.thumb());
 }
 
-/// `blx #-0xb10c`, the word a shipped QQ build uses to call backwards into its own Thumb half.
+/// `blx #-0xb10c`, the word a reference QQ build uses to call backwards into its own Thumb half.
 #[test]
 fn blx_immediate_sign_extends_a_backward_offset() {
     let mut cpu = Cpu::new(Mem::new());
@@ -793,15 +793,127 @@ fn blx_immediate_sign_extends_a_backward_offset() {
 /// `mov r0, r1, lsl r15` = 0xe1a00f11. The shift-amount register field is four bits wide but the
 /// register file holds fifteen, so naming it directly indexes past the end. R15 is UNPREDICTABLE
 /// here, which means answering with the biased PC the way every other operand fetch does — not
-/// panicking, and not refusing an encoding a shipped pack's data can contain.
+/// panicking, and not refusing an encoding a guest pack's data can contain.
 #[test]
 fn register_shift_amount_naming_r15_does_not_index_past_the_register_file() {
-    let cpu = run(
-        &[0xe1a0_0f11, 0xe1a0_0000],
-        |cpu| {
-            cpu.r[1] = 1;
-        },
-    );
+    let cpu = run(&[0xe1a0_0f11, 0xe1a0_0000], |cpu| {
+        cpu.r[1] = 1;
+    });
     let amount = (CODE + 8) & 0xff;
-    assert_eq!(cpu.r[0], 1u32.wrapping_shl(amount), "R15 reads as the biased PC");
+    assert_eq!(
+        cpu.r[0],
+        1u32.wrapping_shl(amount),
+        "R15 reads as the biased PC"
+    );
+}
+
+/// ARMv6's four extends, and the reason they are here at all: read as a transfer they decode to
+/// `ldr Rd, [pc, ...]` (bits[19:16] come out as r15), which *ran* and changed nothing — so a
+/// guest pack's `sxth` (`a sample module`'s module-init path) was a no-op that looked like a computed
+/// value, and the two engines disagreed the moment the sibling decoder answered it honestly.
+///
+/// The four words are the real encodings the sample set executes, not hand-rolled neighbours.
+#[test]
+fn armv6_extends_widen_and_do_not_decode_as_a_transfer() {
+    // (word, input in r0, expected in r1, what)
+    let cases: &[(u32, u32, u32, &str)] = &[
+        (0xe6bf_5070, 0x0000_8001, 0xffff_8001, "sxth r5, r0"),
+        (0xe6af_5070, 0x0000_0080, 0xffff_ff80, "sxtb r5, r0"),
+        (0xe6ff_5070, 0x0000_8001, 0x0000_8001, "uxth r5, r0"),
+        (0xe6ef_5070, 0x0000_00ff, 0x0000_00ff, "uxtb r5, r0"),
+        // The word the sample set actually executes, condition included: `a sample module` runs this with CC.
+        (
+            0x36bf_5070,
+            0x0000_8001,
+            0xffff_8001,
+            "sxthcc r5, r0 with carry set",
+        ),
+    ];
+
+    for &(insn, input, expected, what) in cases {
+        let cpu = run(&[insn], |cpu| {
+            cpu.r[0] = input;
+            // The last case is the sample set word `sxthcc`, and `cc` means *carry clear* — the opposite
+            // of what the mnemonic reads like. With the carry left clear it runs; with it set it is
+            // skipped, which is what cost an hour of chasing a decoder that was already right.
+            cpu.cpsr &= !FLAG_C;
+        });
+        assert_eq!(cpu.r[5], expected, "{what}: r5 = {:#010x}", cpu.r[5]);
+        assert_eq!(
+            cpu.pc,
+            CODE + 4,
+            "an extend must not branch; pc moved to {:#010x}",
+            cpu.pc
+        );
+    }
+}
+
+/// `LDR pc, [...]` is `LoadWritePC`, and from ARMv5 on that behaves as `BX`.
+///
+/// The instruction this is really about is `pop {pc}` (`e49df004`), because that is how ARM code
+/// returns to a Thumb caller. Reading it as an ordinary write to R15 cleared no state bit but
+/// *kept* the old one, so the return address's low bit was dropped and the caller's halfwords were
+/// fetched as ARM words. In a sample pack that turned two Thumb `bl` halfwords (`f0 f7 a5 f9`) into
+/// `illegal instruction 0xf9a5f7f0 at 0x1000fce0 (ARM)` — a report that reads like a Thumb-2
+/// encoding gap and is nothing of the sort.
+#[test]
+fn arm_ldr_into_pc_interworks_the_way_bx_does() {
+    // `pop {pc}`, exactly as the pack's own return path spells it.
+    const POP_PC: u32 = 0xe49d_f004;
+
+    let odd = run(&[POP_PC], |cpu| {
+        cpu.mem.write_u32(STACK, CODE + 5).unwrap();
+    });
+    assert_eq!(
+        odd.pc,
+        CODE + 4,
+        "an odd popped address must land on the halfword boundary"
+    );
+    assert!(odd.thumb(), "bit 0 of the popped word selects Thumb");
+
+    let even = run(&[POP_PC], |cpu| {
+        cpu.mem.write_u32(STACK, CODE + 8).unwrap();
+    });
+    assert_eq!(even.pc, CODE + 8);
+    assert!(!even.thumb(), "bit 0 clear stays in ARM");
+}
+
+/// `clz` names its destination in bits 15..12, and the decoder used to mask that field away by
+/// comparing `insn & 0x0fff_fff0` against `0x016f_1f10` — which is the encoding of `clz r1, rX`
+/// only. Every other destination fell through to the multiply group and left its register alone,
+/// so `clz r6, r2` read as "leading zeros = 0". A 64-bit division routine normalises its divisor
+/// with exactly that instruction and then shifts by the answer, which turns one missed decode
+/// into a wrong quotient rather than into an error.
+///
+/// `a guest module`'s libgcc `__aeabi_uldivmod` is that routine: with `clz` answering 0 it divided
+/// 76800 by 10, got a quotient of `0x12c00_00000000` and a remainder of 76800, then used the
+/// remainder to index the `"0123456789abcdef"` table 32 KiB past the end of the module.
+#[test]
+fn clz_writes_whatever_destination_the_encoding_names() {
+    // (word, value in r0, destination register, expected, what)
+    let cases: &[(u32, u32, usize, u32, &str)] = &[
+        (0xe16f_1f10, 0x0000_000a, 1, 28, "clz r1, r0"),
+        (0xe16f_6f12, 0x0000_000a, 6, 28, "clz r6, r2"),
+        (0xe16f_2f10, 0x8000_0000, 2, 0, "clz r2, r0 with the top bit set"),
+        (0xe16f_3f10, 0x0000_0000, 3, 32, "clz r3, r0 over zero"),
+        (0xe16f_7f10, 0x0000_0001, 7, 31, "clz r7, r0 over one"),
+    ];
+
+    for &(insn, input, rd, expected, what) in cases {
+        let cpu = run(&[insn], |cpu| {
+            cpu.r[0] = input;
+            cpu.r[2] = input;
+        });
+        assert_eq!(
+            cpu.r[rd], expected,
+            "{what}: r{rd} = {:#010x}, expected {expected}",
+            cpu.r[rd]
+        );
+        assert_eq!(
+            cpu.pc,
+            CODE + 4,
+            "{what} must not branch; pc moved to {:#010x}",
+            cpu.pc
+        );
+    }
 }

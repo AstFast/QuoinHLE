@@ -15,9 +15,9 @@ fn text_of(bytes: &[u8], base: u32, thumb: bool, limit: usize) -> Vec<String> {
 
 #[test]
 fn arm_words_read_back_as_the_instructions_they_are() {
-    // The first two words of every shipped `.mod` in the corpus: a branch to the entry point and
+    // The first two words of every reference `.mod` in the sample set: a branch to the entry point and
     // a branch to its neighbour. Both were read off real images, so a decoder that disagrees with
-    // these disagrees with the corpus.
+    // these disagrees with the sample set.
     let words = [0xea00_000eu32, 0xea00_000fu32];
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let lines = disassemble(&bytes, 0x1000_0000, false, 8);

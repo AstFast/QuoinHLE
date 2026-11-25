@@ -384,11 +384,7 @@ fn dump_frame(screen: &Screen, width: u32, height: u32) {
 }
 
 /// Boot a `.mod` through the same calls the command line uses.
-fn boot(
-    path: &str,
-    save_dir: Option<&str>,
-    screen: Option<(u16, u16)>,
-) -> Result<Runtime, String> {
+fn boot(path: &str, save_dir: Option<&str>, screen: Option<(u16, u16)>) -> Result<Runtime, String> {
     let path = Path::new(path);
     let save_dir = save_dir.map(Path::new);
     // The panel comes from the pack's directory name or a core option.
@@ -829,8 +825,7 @@ pub extern "C" fn retro_run() {
                 }
             }
             if diag() {
-                let packed =
-                    unsafe { state(0, DEVICE_JOYPAD, 0, ID_JOYPAD_MASK) as u32 } & 0xffff;
+                let packed = unsafe { state(0, DEVICE_JOYPAD, 0, ID_JOYPAD_MASK) as u32 } & 0xffff;
                 if core.frames % 30 == 0 || mask != 0 || packed != 0 {
                     eprintln!(
                         "quoin diag input frame={} packed={:04x} buttons={:04x}",
@@ -954,7 +949,11 @@ pub extern "C" fn retro_run() {
                     return;
                 }
                 // The fallback needs the three-byte screen shape; assert it.
-                debug_assert_eq!(core.screen.format(), Format::Rgb888, "the fallback packs RGB888");
+                debug_assert_eq!(
+                    core.screen.format(),
+                    Format::Rgb888,
+                    "the fallback packs RGB888"
+                );
                 let pitch = pixels_of(width, false);
                 let pixels = (width as usize) * (height as usize);
                 // Pack only the rows that changed.

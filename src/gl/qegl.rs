@@ -2,7 +2,7 @@
 //!
 //! `ISHELL_CreateInstance(AEECLSID_QEGL)` does not make one object. It makes an EGL display and,
 //! alongside it, every face a pack can reach with `QueryInterface`: the GLES rasterizer, the 1.1
-//! and extension faces on top of it, the EGL 1.1 face, and the Qualcomm color-buffer and imageon
+//! and extension faces on top of it, the EGL 1.1 face, and the vendor color-buffer and imageon
 //! faces. They are allocated together and released together, so they are one thing with eleven
 //! names rather than eleven things that happen to know each other.
 //!
@@ -10,7 +10,7 @@
 //! `QueryInterface` arms: **which face answers which iid**, and **which face is which address**.
 //! Nothing here touches the guest; the caller supplies the address and writes the answer back.
 //!
-//! The reachability is deliberately not symmetric, because the shipped layers are not: `IGLES11`
+//! The reachability is deliberately not symmetric, because the reference layers are not: `IGLES11`
 //! cannot answer `AEEIID_EGL11`, and `IEGL10` cannot answer `AEEIID_GLES11` at all — the 1.1 faces
 //! are reached from `IGLES10`, not from the EGL object. Widening it would be a compatibility change
 //! that no header asks for.
@@ -88,7 +88,7 @@ impl Face {
 
     /// The iids this face answers *as itself*, which is what `answer_qi` is given.
     ///
-    /// `IEGL10` answers two: the shipped runtime registers `AEECLSID_QEGL` under the same object
+    /// `IEGL10` answers two: the reference runtime registers `AEECLSID_QEGL` under the same object
     /// as `AEEIID_EGL10`, and packs query both. `AEEIID_IQI` is added by `answer_qi` for every
     /// interface, so it is not repeated here.
     pub const fn own_iids(self) -> &'static [u32] {
@@ -191,7 +191,7 @@ pub struct Occupant {
 
 /// What a `QueryInterface` does when the edge has no answer.
 ///
-/// Two shapes, because the shipped layers have two. An edge that is part of the object's own
+/// Two shapes, because the reference layers have two. An edge that is part of the object's own
 /// structure answers the caller's pointer (`unwrap_or(this)` in the arms this replaced): asking
 /// `IGLES10` for `AEEIID_EGL10` on something that is not a QEGL family still hands back what it
 /// was given. An edge into an optional face declines, and the caller falls through to the identity
@@ -213,17 +213,27 @@ pub enum Miss {
 /// this table. `AEEIID_IQI` and the identity iids are not rows — [`Face::own_iids`] covers them.
 const ANSWERS: &[(Face, u32, Face, Miss)] = &[
     // `IEGL10`: `CEGL10_QueryInterface` hands back the embedded rasterizer, the EGL 1.1 face and
-    // the two Qualcomm color-buffer faces, all of which hang directly off the EGL object.
+    // the two vendor color-buffer faces, all of which hang directly off the EGL object.
     (Face::Egl, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
     (Face::Egl, g::AEEIID_EGL11, Face::Egl11, Miss::Decline),
-    (Face::Egl, g::AEEIID_EGLGETCOLORBUFFER, Face::ColorBuffer, Miss::Decline),
+    (
+        Face::Egl,
+        g::AEEIID_EGLGETCOLORBUFFER,
+        Face::ColorBuffer,
+        Miss::Decline,
+    ),
     (
         Face::Egl,
         g::AEEIID_EGLGETCOLORBUFFERINFO,
         Face::ColorBufferInfo,
         Miss::Decline,
     ),
-    (Face::Egl, g::AEEIID_GLESIMAGEONEXT, Face::ImageOn, Miss::Decline),
+    (
+        Face::Egl,
+        g::AEEIID_GLESIMAGEONEXT,
+        Face::ImageOn,
+        Miss::Decline,
+    ),
     (
         Face::Egl,
         g::AEEIID_GLESIMAGEONEXT_V1,
@@ -235,39 +245,119 @@ const ANSWERS: &[(Face, u32, Face, Miss)] = &[
     (Face::Gl, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
     (Face::Gl, g::AEEIID_GLES11, Face::Gl11, Miss::Decline),
     (Face::Gl, g::AEEIID_GLES10EXT, Face::Gl10Ext, Miss::Decline),
-    (Face::Gl, g::AEEIID_GLESIMAGEONEXT, Face::ImageOn, Miss::Decline),
-    (Face::Gl, g::AEEIID_GLESIMAGEONEXT_V1, Face::ImageOnV1, Miss::Decline),
+    (
+        Face::Gl,
+        g::AEEIID_GLESIMAGEONEXT,
+        Face::ImageOn,
+        Miss::Decline,
+    ),
+    (
+        Face::Gl,
+        g::AEEIID_GLESIMAGEONEXT_V1,
+        Face::ImageOnV1,
+        Miss::Decline,
+    ),
     // `IGLES11`.
     (Face::Gl11, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
     (Face::Gl11, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
-    (Face::Gl11, g::AEEIID_GLES11EXT, Face::Gl11Ext, Miss::Decline),
+    (
+        Face::Gl11,
+        g::AEEIID_GLES11EXT,
+        Face::Gl11Ext,
+        Miss::Decline,
+    ),
     // `IGLES11Ext`.
-    (Face::Gl11Ext, g::AEEIID_GLES11, Face::Gl11, Miss::AnswerSelf),
-    (Face::Gl11Ext, g::AEEIID_GLES11EXTPAK, Face::Gl11ExtPak, Miss::Decline),
+    (
+        Face::Gl11Ext,
+        g::AEEIID_GLES11,
+        Face::Gl11,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::Gl11Ext,
+        g::AEEIID_GLES11EXTPAK,
+        Face::Gl11ExtPak,
+        Miss::Decline,
+    ),
     (Face::Gl11Ext, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
     (Face::Gl11Ext, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
     // `IGLES11ExtPak`. The packed face sits at the bottom of the chain, so it answers every face
     // above it; the reverse direction (ext -> pak) is the one `openglesextension.dll` adds.
-    (Face::Gl11ExtPak, g::AEEIID_GLES11EXT, Face::Gl11Ext, Miss::AnswerSelf),
-    (Face::Gl11ExtPak, g::AEEIID_GLES11, Face::Gl11, Miss::AnswerSelf),
-    (Face::Gl11ExtPak, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
-    (Face::Gl11ExtPak, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
+    (
+        Face::Gl11ExtPak,
+        g::AEEIID_GLES11EXT,
+        Face::Gl11Ext,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::Gl11ExtPak,
+        g::AEEIID_GLES11,
+        Face::Gl11,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::Gl11ExtPak,
+        g::AEEIID_GLES10,
+        Face::Gl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::Gl11ExtPak,
+        g::AEEIID_EGL10,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
     // `IEGL11` and the two color-buffer faces: back down to `IEGL10`, and out to each other.
     (Face::Egl11, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
     (Face::Egl11, g::AEECLSID_QEGL, Face::Egl, Miss::AnswerSelf),
-    (Face::Egl11, g::AEEIID_EGLGETCOLORBUFFER, Face::ColorBuffer, Miss::Decline),
+    (
+        Face::Egl11,
+        g::AEEIID_EGLGETCOLORBUFFER,
+        Face::ColorBuffer,
+        Miss::Decline,
+    ),
     (
         Face::Egl11,
         g::AEEIID_EGLGETCOLORBUFFERINFO,
         Face::ColorBufferInfo,
         Miss::Decline,
     ),
-    (Face::ColorBuffer, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
-    (Face::ColorBuffer, g::AEECLSID_QEGL, Face::Egl, Miss::AnswerSelf),
-    (Face::ColorBuffer, g::AEEIID_EGL11, Face::Egl11, Miss::Decline),
-    (Face::ColorBufferInfo, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
-    (Face::ColorBufferInfo, g::AEECLSID_QEGL, Face::Egl, Miss::AnswerSelf),
-    (Face::ColorBufferInfo, g::AEEIID_EGL11, Face::Egl11, Miss::Decline),
+    (
+        Face::ColorBuffer,
+        g::AEEIID_EGL10,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ColorBuffer,
+        g::AEECLSID_QEGL,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ColorBuffer,
+        g::AEEIID_EGL11,
+        Face::Egl11,
+        Miss::Decline,
+    ),
+    (
+        Face::ColorBufferInfo,
+        g::AEEIID_EGL10,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ColorBufferInfo,
+        g::AEECLSID_QEGL,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ColorBufferInfo,
+        g::AEEIID_EGL11,
+        Face::Egl11,
+        Miss::Decline,
+    ),
     // `IGLES10Ext`: up to the rasterizer and its EGL object, nothing else.
     (Face::Gl10Ext, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
     (Face::Gl10Ext, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
@@ -275,11 +365,36 @@ const ANSWERS: &[(Face, u32, Face, Miss)] = &[
     (Face::ImageOn, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
     (Face::ImageOn, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
     (Face::ImageOn, g::AEECLSID_QEGL, Face::Egl, Miss::AnswerSelf),
-    (Face::ImageOn, g::AEEIID_GLESIMAGEONEXT_V1, Face::ImageOnV1, Miss::Decline),
-    (Face::ImageOnV1, g::AEEIID_GLES10, Face::Gl, Miss::AnswerSelf),
-    (Face::ImageOnV1, g::AEEIID_EGL10, Face::Egl, Miss::AnswerSelf),
-    (Face::ImageOnV1, g::AEECLSID_QEGL, Face::Egl, Miss::AnswerSelf),
-    (Face::ImageOnV1, g::AEEIID_GLESIMAGEONEXT, Face::ImageOn, Miss::Decline),
+    (
+        Face::ImageOn,
+        g::AEEIID_GLESIMAGEONEXT_V1,
+        Face::ImageOnV1,
+        Miss::Decline,
+    ),
+    (
+        Face::ImageOnV1,
+        g::AEEIID_GLES10,
+        Face::Gl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ImageOnV1,
+        g::AEEIID_EGL10,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ImageOnV1,
+        g::AEECLSID_QEGL,
+        Face::Egl,
+        Miss::AnswerSelf,
+    ),
+    (
+        Face::ImageOnV1,
+        g::AEEIID_GLESIMAGEONEXT,
+        Face::ImageOn,
+        Miss::Decline,
+    ),
 ];
 
 /// What `from` answers `iid` with, or `None` for "not an edge".
@@ -334,12 +449,15 @@ mod tests {
     }
 
     /// The 1.1 faces are reachable from `IGLES10` and from each other, never from the EGL object.
-    /// This is the shape the shipped layers have; see the module comment.
+    /// This is the shape the reference layers have; see the module comment.
     #[test]
     fn the_one_one_faces_hang_off_gles10() {
         assert_eq!(answer(Face::Egl, g::AEEIID_GLES11), None);
         assert_eq!(answer(Face::Egl, g::AEEIID_GLES11EXT), None);
-        assert_eq!(answer(Face::Gl, g::AEEIID_GLES11), Some((Face::Gl11, Miss::Decline)));
+        assert_eq!(
+            answer(Face::Gl, g::AEEIID_GLES11),
+            Some((Face::Gl11, Miss::Decline))
+        );
         assert_eq!(
             answer(Face::Gl11, g::AEEIID_GLES11EXT),
             Some((Face::Gl11Ext, Miss::Decline))

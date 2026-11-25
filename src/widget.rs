@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use crate::abi::{self, generated as g};
 use crate::device::{make_rgb, RGB_NONE};
 use crate::display::{Display, Rect};
+use crate::encoding::TextEncoding;
 use crate::font::Font;
 use crate::hle::{Error as HleError, HResult};
 use crate::locale::{self, Language};
@@ -22,7 +23,7 @@ use crate::mem::Mem;
 use crate::runtime::{civil_from_days, days_from_civil};
 use crate::web::html::Html;
 
-/// The interfaces one [`Control`] answers. A shipped app may call an inherited slot through
+/// The interfaces one [`Control`] answers. A guest app may call an inherited slot through
 /// whichever name it holds — `IMENUCTL_SetProperties` reaches the dispatch as an `IMenuCtl` id —
 /// so these are one family, not seven unrelated tables.
 pub const WIDGET_IFACES: &[&str] = &[
@@ -62,7 +63,7 @@ const MP_ALLOW_DUPE_IDS: u32 = 0x0004_0000;
 /// clock counts from 1 January 1970, so the two are four days apart, and the conversion between them
 /// lives here rather than in either of the two callers.
 const JULIAN_EPOCH_DAYS_BEFORE_1970: i64 = 4;
-/// The day number `DateToJDay` answers for 28 December 1969 — the Sunday the shipped control puts at
+/// The day number `DateToJDay` answers for 28 December 1969 — the Sunday the reference control puts at
 /// zero (with `JDAY_OFFSET 719_465` from the header). It is the one triple
 /// that converts to `0` and is still a legal date, which is why `SetDate` has to name it.
 const EPOCH_YEAR: i32 = 1969;
@@ -109,7 +110,7 @@ struct Item {
 
 /// What a control's own key door decided.
 ///
-/// `Post` carries the `wParam` of the `EVT_COMMAND` the shipped member hands to
+/// `Post` carries the `wParam` of the `EVT_COMMAND` the reference member hands to
 /// `ISHELL_HandleEvent`, and the control's answer *is* the applet's answer to that event
 /// (the delivered body, the delivered body) — so only the runtime, which can call the
 /// guest, can finish the answer.
@@ -117,7 +118,7 @@ struct Item {
 pub enum Key {
     NotHandled,
     Handled,
-    /// Claimed, and the shipped body repaints from inside the handler. `Menu_MoveSelect`
+    /// Claimed, and the documented behaviour repaints from inside the handler. `Menu_MoveSelect`
     /// (`0x23d8`) is the one that does: it ends on `Menu_Draw` or
     /// `Menu_DrawNewSelectItem`, both of which paint and ask for the frame, and it skips them when
     /// the selection did not actually move. The runtime needs the cursor to follow the key the way
@@ -156,10 +157,10 @@ pub struct Control {
     owner_draw: u32,
     owner_draw_data: u32,
     owner_draw_mask: u16,
-    /// The selection of a date control, as the year/month/day triple the shipped object keeps. The
+    /// The selection of a date control, as the year/month/day triple the reference object keeps. The
     /// day number and the weekday are **re-derived** from it rather than stored: `select_julian` is the
     /// only way the triple is written, and it stores the triple `JDayToDate` answers for that number,
-    /// so the round trip is exact — including a refused set, where the shipped member leaves the triple
+    /// so the round trip is exact — including a refused set, where the reference member leaves the triple
     /// at zeros and `DateToJDay` answers zero for zeros. the delivered body/ hand back those
     /// two stored numbers, and this answers the same value.
     date: (i32, u32, u32),
@@ -178,7 +179,7 @@ pub struct Control {
     enum_mode: u32,
     /// `ITextCtl::SetPropertiesEx`'s word, handed back unchanged by `GetPropertiesEx`.
     props_ex: u32,
-    /// `IImageCtl::SetImage`'s picture. The shipped body does not just remember the pointer: it
+    /// `IImageCtl::SetImage`'s picture. The documented behaviour does not just remember the pointer: it
     /// releases the one it held and takes a reference on the new one, so
     /// the control keeps the image alive; [`Widgets::set_image`] hands the previous one back for the
     /// arm to release.
@@ -195,7 +196,7 @@ pub struct Control {
     ms_valid: bool,
     increment: u16,
     edit_field: u16,
-    /// The control's own two item-style records — the shipped object's `+356` and `+364`, **eight
+    /// The control's own two item-style records — the reference object's `+356` and `+364`, **eight
     /// bytes apiece**. `MenuCtl_New` fills them from `ISHELL_GetItemStyle`, `IMenuCtl_SetStyle`
     /// memmoves eight bytes in from each non-null argument, and `IMenuCtl_GetStyle` memmoves eight
     /// back out; the header's `AEEItemStyle` is twelve bytes counting `roImage` at `+8`, and this
@@ -203,7 +204,7 @@ pub struct Control {
     style: [[u8; 8]; 2],
     /// The `AEEMenuColors` the control carries, as ten words: the mask halfword at `+0` and the
     /// padding beside it, then the nine colours at `+4..+36`. They are **system-colour indices**, not
-    /// pixels — the shipped member turns them into colours at draw time through three
+    /// pixels — the reference member turns them into colours at draw time through three
     /// `IDisplay::SetColor(CLR_USER_*, value)` calls (`Menu_InitColors`), and no slot of this
     /// interface ever writes the first word.
     colors: [u32; 10],
@@ -280,7 +281,7 @@ impl Control {
             owner_draw: 0,
             owner_draw_data: 0,
             owner_draw_mask: 0,
-            // A control that has never been given a date answers zero, which is what the shipped
+            // A control that has never been given a date answers zero, which is what the reference
             // object leaves after `AEE_NewClass` zeroes it: `IDateCtl_Reset` does not clear the date
             // and `IDateCtl_GetDateString` happily formats whatever is there
             // ( has no "is the date set" test), so a fresh the delivered body control says `0 0 '00`.
@@ -397,6 +398,16 @@ pub struct Widgets {
     /// command line: a control's own slots carry nowhere to name one, and a pack cannot supply the
     /// words because they are the platform's. See [`crate::locale`].
     language: &'static Language,
+    /// The device's own 8-bit encoding, for the pages an `IHtmlViewer` parses.
+    ///
+    /// `IHtmlViewer::SetData` promises its stream is in "an 8-bit encoding compatible with the
+    /// native encoding of the device", and this is that encoding — the same word the device
+    /// publishes as `AEEDeviceInfo::wEncoding`. `None` is a `Widgets` with no device behind it (a
+    /// unit test's), where the bytes stay UTF-8 as they always were.
+    encoding: Option<&'static encoding_rs::Encoding>,
+    /// The encoding an `AECHAR` buffer holds, for the words this host writes into one — a
+    /// date control's weekday and month names, and the time string.
+    text_encoding: TextEncoding,
 }
 
 impl Default for Widgets {
@@ -405,6 +416,8 @@ impl Default for Widgets {
             controls: HashMap::new(),
             scratch: 0,
             language: locale::find(locale::DEFAULT),
+            encoding: None,
+            text_encoding: TextEncoding::Unicode,
         }
     }
 }
@@ -544,7 +557,7 @@ impl Widgets {
     /// active would draw `01:05` where a handset draws `1:05`. A deactivated control also loses its
     /// selected field, which is the time control's own `m_nSelect`.
     ///
-    /// The answer is not the call's result — that is `void` — but whether the shipped body repaints
+    /// The answer is not the call's result — that is `void` — but whether the documented behaviour repaints
     /// from here, which a caller with a `Display` in hand has to honour. It is a per-class fact and
     /// the two classes disagree:
     ///
@@ -557,7 +570,7 @@ impl Widgets {
     ///   `Menu_Draw`, whose last statement is `IDisplay::Update(po, TRUE)`: a menu repaint *is* a
     ///   frame, which is why the caller is told which class it was.
     ///
-    /// Nothing else in the family has a witness for repainting, so everything else answers FALSE and
+    /// Nothing else in the family has a record for repainting, so everything else answers FALSE and
     /// the call stays a store — which is what a pack that draws from its own event handler expects.
     pub fn set_active(&mut self, addr: u32, on: u32, is_stopwatch: bool) -> HResult<bool> {
         let c = self.control(addr)?;
@@ -575,10 +588,10 @@ impl Widgets {
         if on == 0 && c.class == "ITimeCtl" {
             c.edit_field = 0;
         }
-        // Both shipped bodies test the stored bit before painting, so a `SetActive` that asks for
+        // Both platform routines test the stored bit before painting, so a `SetActive` that asks for
         // what is already true is a no-op on a handset too. `MP_NO_REDRAW` is a menu property; the
         // same bit means `ST_TEXTALLOC` on a static, and reading it as a paint hint there would
-        // silence a control that the shipped body does repaint.
+        // silence a control that the documented behaviour does repaint.
         if was == c.active {
             return Ok(false);
         }
@@ -589,6 +602,39 @@ impl Widgets {
         })
     }
 
+    /// The encoding the pages in this run are read in.
+    pub(crate) fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        self.encoding
+    }
+
+    /// The `IHtmlViewer` controls that owe a paint at the next presented frame.
+    ///
+    /// A control with no rectangle has nowhere to paint, so it is not owed one yet: it owes it from
+    /// the `SetRect` that gives it somewhere to be, and that call marks the page dirty too. A
+    /// control holding no document is not owed one either — there are no bytes to show, and filling
+    /// its rectangle with paper would be this host erasing something the pack drew there.
+    pub(crate) fn html_views_to_paint(&self) -> Vec<u32> {
+        self.controls
+            .iter()
+            .filter(|(_, c)| {
+                !c.rect.is_empty()
+                    && c.html
+                        .as_ref()
+                        .map_or(false, |h| h.dirty && !h.data.is_empty())
+            })
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// The page has been painted, so the debt [`Html::dirty`] stands for is paid.
+    pub(crate) fn html_painted(&mut self, addr: u32) {
+        if let Ok(control) = self.control(addr) {
+            if let Some(html) = control.html.as_mut() {
+                html.dirty = false;
+            }
+        }
+    }
+
     pub fn is_active(&self, addr: u32) -> HResult<u32> {
         Ok(u32::from(self.peek(addr)?.active))
     }
@@ -596,6 +642,21 @@ impl Widgets {
     pub fn set_properties(&mut self, addr: u32, props: u32) -> HResult<()> {
         self.control(addr)?.props = props;
         Ok(())
+    }
+
+    /// The device's 8-bit encoding, as `AEEDeviceInfo::wEncoding` publishes it.
+    ///
+    /// Called once, when the runtime is built from a device profile: a handset does not change its
+    /// encoding under a running applet. An `AEE_ENC_*` this host has no codec for leaves the pages
+    /// reading as UTF-8, which is the same `None` a `Widgets` with no device has.
+    pub fn set_encoding(&mut self, aee: u32) {
+        self.encoding = crate::web::html::encoding_of(aee);
+        self.text_encoding = TextEncoding::of(aee);
+    }
+
+    /// The encoding an `AECHAR` buffer holds.
+    pub fn text_encoding(&self) -> TextEncoding {
+        self.text_encoding
     }
 
     pub fn properties(&self, addr: u32) -> HResult<u32> {
@@ -632,7 +693,7 @@ impl Widgets {
     /// `IDateCtl::EnableCommand`: the flag is `bEnable != 0`, and the id is
     /// stored **only when enabling**, so disabling keeps the last id for the next
     /// enable. What the flag is for is the payoff this host does not have yet: on `AVK_SELECT` the
-    /// shipped control re-posts `EVT_COMMAND` with that id through the shell, which is
+    /// reference control re-posts `EVT_COMMAND` with that id through the shell, which is
     /// the reason the slot exists. Registered as a gap rather than silently half-done.
     /// `IMenuCtl::EnableCommand(boolean bEnable)` — one parameter, no id: the delivered body stores
     /// only `m_bSendCmd`, and the item a confirm reports is the *selected* one, read when the key
@@ -656,7 +717,7 @@ impl Widgets {
     /// is a refusal even if the number was accepted before. A negative value is always refused; the
     /// one-day bound belongs to the clock alone (`IsAlarmClock`), and it is an `>` test, so exactly
     /// 86 400 000 is accepted. `bIncUpdate` only decides what happens to the drawn-string cache, which
-    /// this host has none of — and the shipped tail calls `TimeCtl_Redraw`, which the host's paint
+    /// this host has none of — and the reference tail calls `TimeCtl_Redraw`, which the host's paint
     /// path does in its own turn.
     pub fn set_time(&mut self, addr: u32, tod: i32, is_clock: bool) -> HResult<u32> {
         let c = self.control(addr)?;
@@ -729,7 +790,7 @@ impl Widgets {
     /// `GTS_AMPM` appends the hardcoded `" PM"`/`" AM"` — no shell, no locale, no resource, unlike the
     /// date control's words. `nSize` is bytes and 0 means "write nothing".
     ///
-    /// What is *not* witnessed here: the shipped decomposition is `aee_MSECSToHM`, which has only a
+    /// What is *not* recorded here: the published decomposition is `aee_MSECSToHM`, which has only a
     /// declaration in this drop. The 12-hour fold and the PM flag
     /// are taken from the same file's own editing rule (`TimeCtl_BumpHours`,: 1..12 with
     /// the flip at 12 up / 11 down), which is a **B**, not a copy.
@@ -743,7 +804,7 @@ impl Widgets {
         active: bool,
     ) -> HResult<()> {
         let text = Self::time_text(ms, flags, active);
-        Self::put_words(mem, dest, size as i32, &text)?;
+        self.put_words(mem, dest, size as i32, &text)?;
         Ok(())
     }
 
@@ -809,10 +870,9 @@ impl Widgets {
             flags |= g::GTS_MSECS;
         }
         let text = Self::time_text(i64::from(c.ms), flags, c.active);
-        let units: Vec<u16> = text.encode_utf16().collect();
         let width = |font: u32| -> u32 {
             Font::of(font)
-                .map(|f| f.measure_chars(&units))
+                .map(|f| f.measure_text(&text))
                 .unwrap_or_default()
         };
         let n_width = i64::from(width(c.font_text));
@@ -850,7 +910,7 @@ impl Widgets {
     /// that call, so it is handed back here.
     pub fn handle_key(&mut self, addr: u32, evt: u32, code: u32) -> HResult<Key> {
         let c = self.control(addr)?;
-        // Both spellings are the same key to a shipped control. `IMenuCtl_HandleEvent`
+        // Both spellings are the same key to a reference control. `IMenuCtl_HandleEvent`
         // (`0x870`) acts on `a2 == 256`, which is the older `EVT_KEY` that carries a
         // press and a release in one event — `chess.mod` sends exactly that. `EVT_KEY_PRESS` is what
         // this host posts from its own keyboard, and a pack that uses the split pair never sends
@@ -1012,7 +1072,7 @@ impl Widgets {
         Ok(u32::from(text != 0))
     }
 
-    /// `IStatic::SetTextEx(..., bAppend)`: the shipped body only resets when it is *not* appending,
+    /// `IStatic::SetTextEx(..., bAppend)`: the documented behaviour only resets when it is *not* appending,
     ///so the new text is added to what the control already holds.
     pub fn append_text(&mut self, mem: &mut Mem, addr: u32, text: u32) -> HResult<u32> {
         let Some(add) = Self::cut_str(mem, text)? else {
@@ -1076,7 +1136,7 @@ impl Widgets {
     /// `ITextCtl::GetText(pBuffer, nMaxChars)`. The body's shape is the
     /// one thing that is certain: a short buffer is **truncated** rather than refused ( copies
     /// through `WSTRNCOPYN`, and its answer is not consulted) and the return is TRUE whenever the
-    /// text object exists, not "was it all copied". The unit of `nMaxChars` is what two witnesses
+    /// text object exists, not "was it all copied". The unit of `nMaxChars` is what two records
     /// disagree about: the header calls it a count of characters, while the body hands it straight to
     /// a helper whose parameter is `cbDest` — a byte count. This reads it as characters with the
     /// terminator inside the count, which is the header's contract.
@@ -1130,7 +1190,7 @@ impl Widgets {
         let c = self.control(addr)?;
         // The delivered body
         // thing an id is checked for is duplication, and that check is skipped entirely
-        // while `MP_ALLOW_DUPE_IDS` is on. The shipped "we cannot show anything" gate is
+        // while `MP_ALLOW_DUPE_IDS` is on. The reference "we cannot show anything" gate is
         // `!pImage && !bSingleFrame && !pText && (!pszResText || !wText)` — a single-frame
         // menu takes a label-less item, and so does any menu that loads the text itself out of
         // `pszResText` + `wText`. This store keeps a label and nothing else, so an item
@@ -1307,11 +1367,11 @@ impl Widgets {
         // The body reads a word only *inside* the `if` that names it — `if (mask & 1) *(a1+444) =
         // *(a2+4)` — so a caller that points at a short record and names one field gets that field
         // rather than a fault. Collecting all nine words first is the shape that would end a run the
-        // shipped member answers, which is why the read sits down the branch, next to the write.
+        // reference member answers, which is why the read sits down the branch, next to the write.
         let mask = if pc == 0 { 0 } else { mem.read_u16(pc)? as u32 };
         let c = self.control(addr)?;
         if pc == 0 {
-            // The shipped reset writes the nine words and leaves the mask word alone — and nothing in
+            // The reference reset writes the nine words and leaves the mask word alone — and nothing in
             // the member ever writes that word, so a caller that reads the record back finds the zero
             // the allocation left, not the mask it sent.
             for i in 1..c.colors.len() {
@@ -1332,7 +1392,7 @@ impl Widgets {
     /// `if (pc) aee_memmove(pc, &m_c, 40)`. Every word of the control's record goes out, the mask word
     /// included, whether or not anything ever set it — so this answers the control's own state rather
     /// than a theme. The bar this host *draws* behind the selected row is still its own constant; the
-    /// shipped member turns the stored index into a colour by asking the display
+    /// reference member turns the stored index into a colour by asking the display
     /// (`Menu_InitColors`: three `IDisplay::SetColor(CLR_USER_*, value)` calls), and that resolution is
     /// recorded against the display, not invented here.
     pub fn menu_colors(&self, addr: u32, mem: &mut Mem, out: u32) -> HResult<()> {
@@ -1386,7 +1446,7 @@ impl Widgets {
         Ok(1)
     }
 
-    /// `IDateCtl::SetJulianDay`, which is the one place the shipped control writes its selection.
+    /// `IDateCtl::SetJulianDay`, which is the one place the reference control writes its selection.
     ///`JDayToDate` refuses two things and refuses them **before** writing
     /// the caller's three integers: a negative day number, and one at or past
     /// `((uint32)0xffffffff - JDAY_OFFSET*4)/4`, then a year above 9999. A refusal
@@ -1467,28 +1527,35 @@ impl Widgets {
     /// the terminator **inside** it. Reading `max` as a character count — which is what this door did —
     /// writes twice what the caller's buffer holds, into memory the pack never reserved for us.
     ///
-    /// The first number is what `pnChars` gets (the shipped getter sets it from `WSTRLEN` of the buffer
+    /// The first number is what `pnChars` gets (the reference getter sets it from `WSTRLEN` of the buffer
     /// afterwards, the delivered body//); the second says whether the whole word fit.
-    fn put_words(mem: &mut Mem, buf: u32, max_bytes: i32, text: &str) -> HResult<(usize, bool)> {
+    fn put_words(
+        &self,
+        mem: &mut Mem,
+        buf: u32,
+        max_bytes: i32,
+        text: &str,
+    ) -> HResult<(usize, bool)> {
         let room = max_bytes / 2;
         if buf == 0 || room <= 0 {
             return Ok((0, false));
         }
+        let units = self.text_encoding.string_to_units(text);
         let mut n = 0usize;
-        for ch in text.chars() {
+        for unit in &units {
             if n as i32 >= room - 1 {
                 break;
             }
-            mem.write_u16(buf + (n as u32) * 2, u32::from(ch as u16))?;
+            mem.write_u16(buf + (n as u32) * 2, u32::from(*unit))?;
             n += 1;
         }
         mem.write_u16(buf + (n as u32) * 2, 0)?;
-        Ok((n, n == text.chars().count()))
+        Ok((n, n == units.len()))
     }
 
     /// `pBuffer + nChars + 1` in `AECHAR *` arithmetic — one unit **past** the
     /// terminator, which on a refusal is just `pBuffer + 2`. The header's "NULL if unsuccessful"
-    /// is not what the body does, and the body is the witness.
+    /// is not what the body does, and the body is the record.
     fn word_end(buf: u32, chars: usize) -> u32 {
         buf.wrapping_add(((chars + 1) * 2) as u32)
     }
@@ -1508,7 +1575,7 @@ impl Widgets {
         let at = c.weekday() as usize;
         let name = self.language.days.get(at);
         let (n, _) = match name {
-            Some(word) => Self::put_words(mem, buf, max, word)?,
+            Some(word) => self.put_words(mem, buf, max, word)?,
             None => (0, false),
         };
         if pchars != 0 {
@@ -1538,7 +1605,7 @@ impl Widgets {
         });
         let (n, _) = match (buf, at) {
             (0, _) => (0, false),
-            (_, Some(i)) => Self::put_words(mem, buf, max, self.language.months[i])?,
+            (_, Some(i)) => self.put_words(mem, buf, max, self.language.months[i])?,
             _ => (0, false),
         };
         if pchars != 0 {
@@ -1552,7 +1619,7 @@ impl Widgets {
     /// and the body's `return(FALSE)` at/); `nMaxChars` is bytes; and of the
     /// `DFMT_*` word **only** `dwDateFormat & DFMT_FORMAT_MASK` is examined, so the
     /// `DFMT_SLASH_SEP`/`DASH_SEP`/`SPACE_SEP` bits this door used to honour are dead code in the
-    /// shipped member — the delimiter is fixed per format (`'/'` at//, `'.'` for
+    /// reference member — the delimiter is fixed per format (`'/'` at//, `'.'` for
     /// `DFMT_INT_YYYY_MM_DD`). An unnamed format falls to `default: return(FALSE)` at, and
     /// the control's own properties are **not** consulted here.
     ///
@@ -1590,7 +1657,7 @@ impl Widgets {
         // and then has its caller stamp `psz[3] = 0` over whatever the buffer
         // already held — copying that would be copying the caller's old bytes. The four numeric forms
         // print the stored numbers and never ask for a name, so they answer for month 0
-        // exactly as the shipped body does rather than refusing with it.
+        // exactly as the documented behaviour does rather than refusing with it.
         let month: &str = match fmt {
             g::DFMT_DD_MONTH_YYYY..=g::DFMT_MON_DD_YY => match (m as usize).checked_sub(1) {
                 Some(i) if i < self.language.months.len() => self.language.months[i],
@@ -1617,7 +1684,7 @@ impl Widgets {
             g::DFMT_INT_YYYY_MM_DD => format!("{year}.{m}.{d}"),
             _ => return Ok(0),
         };
-        let (n, fits) = Self::put_words(mem, buf, max, &text)?;
+        let (n, fits) = self.put_words(mem, buf, max, &text)?;
         if !fits {
             return Ok(0);
         }
@@ -1841,7 +1908,7 @@ impl Widgets {
         Rect::new(c.rect.x, c.rect.y + row * height, c.rect.dx, height).write(mem, prc)
     }
 
-    /// How many lines an `IStatic`'s body wraps to in its own width — the quantity the shipped
+    /// How many lines an `IStatic`'s body wraps to in its own width — the quantity the reference
     /// `AStatic_Recalc` lays out as `m_nLines`. `IsScrollable` compares it with
     /// the lines its rect shows, and `GoToLine` refuses a line at or past it.
     fn static_lines(
@@ -2083,7 +2150,7 @@ impl Widgets {
             self.scratch = mem.alloc(8, 4)?;
         }
         let scratch = self.scratch;
-        // Both shipped paints open the same way — `Menu_Draw` (`0x1acc`) and
+        // Both reference paints open the same way — `Menu_Draw` (`0x1acc`) and
         // `AStatic_Redraw` both begin with `IDisplay::DrawRect(po, &rect, -1, 2, 2)`, filling the
         // control's own rectangle with `CLR_USER_BACKGROUND` before a single character lands. A
         // repaint that skipped it could only ever add: a menu that replaced its six items with two

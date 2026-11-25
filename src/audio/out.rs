@@ -9,7 +9,7 @@
 //!
 //! # Why these crates
 //!
-//! [`rustysynth`] is the instrument. The corpus is 616 payloads this host plays as `audio/mid` and not
+//! [`rustysynth`] is the instrument. The sample set holds many payloads this host plays as `audio/mid` and not
 //! one waveform (both corpora, 827 packs, counted from the pack census),
 //! so
 //! what had to be built was never a sample player: a Standard MIDI File is a score,
@@ -46,7 +46,7 @@
 //! # One voice per `ISoundPlayer`, which is the second decision this file got wrong
 //!
 //! An earlier shape of this module had a single sequencer, and a play replaced whatever was playing.
-//! That reads as harmless — "the corpus starts one clip at a time" — and it is wrong the moment a
+//! That reads as harmless — "the sample set starts one clip at a time" — and it is wrong the moment a
 //! pack does anything more than that. A pack that turns its music off and on again makes a `Play`
 //! each time; with one sequencer the music comes back as whichever effect happened to be started in
 //! the same frame, chosen by the iteration order of a `HashMap`.
@@ -92,7 +92,7 @@
 //! it labels that conclusion weak and says not to use it as one
 //! (the source itself disclaims it), so nothing in this file may lean on it:
 //! what the built-in bank claims is that a handset plays MIDI without a file from the user, which is
-//! what the two strong witnesses say, not what the instrument inside the phone was made of.
+//! what the two strong records say, not what the instrument inside the phone was made of.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -150,7 +150,7 @@ const BLOCK: usize = 1024;
 ///
 /// A pack asks for as many `ISoundPlayer`s as it likes; a handset stops at whatever its audio
 /// hardware manages, and this is that ceiling by another name. Eight is a music track, an ambient
-/// loop and half a dozen effects, which is more than anything in the corpus uses at one moment, and
+/// loop and half a dozen effects, which is more than anything in the sample set uses at one moment, and
 /// the voices cost nothing until they are used.
 const VOICES: usize = 8;
 
@@ -648,7 +648,7 @@ fn shift_key(tune: i32, channel: u8, command: u8, key: u8) -> Option<u8> {
 #[derive(Debug)]
 pub struct Playing {
     voices: HashMap<u32, (u32, u32, u32, u32)>,
-    /// The volume last handed to each voice, in the SDK's 0..`AEE_MAX_VOLUME` scale.
+    /// The volume last handed to each voice, in the platform's 0..`AEE_MAX_VOLUME` scale.
     volumes: HashMap<u32, u32>,
     /// The tempo last handed to the speaker. Starts at the header's default, so a runtime that has
     /// never been told otherwise is not a change.
@@ -700,7 +700,7 @@ pub enum Request {
     Play { voice: u32, index: usize },
     /// Silence this voice.
     Stop { voice: u32 },
-    /// Set one voice's gain, in the SDK's 0..`AEE_MAX_VOLUME` scale.
+    /// Set one voice's gain, in the platform's 0..`AEE_MAX_VOLUME` scale.
     Volume { voice: u32, volume: u32 },
     /// Set the tempo every voice plays at, as a percentage of normal speed.
     ///
@@ -1139,7 +1139,7 @@ enum Command {
     Stop {
         voice: u32,
     },
-    /// Set one voice's gain, in the SDK's 0..`AEE_MAX_VOLUME` scale.
+    /// Set one voice's gain, in the platform's 0..`AEE_MAX_VOLUME` scale.
     Volume {
         voice: u32,
         volume: u32,
@@ -1907,7 +1907,7 @@ impl Mixer {
     /// sound better than the thing it is standing in for — which is the one thing an HLE must not
     /// do. A compressor is a feature, not a correction: it would need an attack, a release and a
     /// threshold to argue about, and it would change the sample values every existing render test
-    /// pins. What would make it worth adding is a pack whose normal mix clips, and no corpus pack
+    /// pins. What would make it worth adding is a pack whose normal mix clips, and no sample pack
     /// has been measured doing that.
     fn render_into(&mut self, left: &mut [f32], right: &mut [f32]) {
         assert_eq!(
@@ -2378,9 +2378,11 @@ impl Speaker {
         _soundfont: Option<&Path>,
         _backend: Arc<AtomicU8>,
     ) -> Result<Speaker, String> {
-        Err("this build has no device backend (built without the `device` feature); \
+        Err(
+            "this build has no device backend (built without the `device` feature); \
              use Speaker::without_device and render the frames yourself"
-            .to_string())
+                .to_string(),
+        )
     }
 
     /// Start one of the run's clips on one voice, parsing it if this is the first time it has been
@@ -2807,7 +2809,7 @@ impl Speaker {
         &self.source
     }
 
-    /// What the speaker could not use. Empty on a corpus it can play whole.
+    /// What the speaker could not use. Empty on a sample set it can play whole.
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
@@ -3019,10 +3021,18 @@ pub fn clip_length_ms(bytes: &[u8]) -> Option<u32> {
 pub const MIME_MIDI: &str = "audio/mid";
 
 /// Yamaha SMAF (`MMMD` container). The media format table in the header files
-/// `AEECLSID_MEDIAMMF` under this exact string, and the KDDI extension module registers
+/// `AEECLSID_MEDIAMMF` under this exact string, and the Carrier extension module registers
 /// `audio/mmf` for it; the host follows the published pair rather than inventing an extension
 /// spelling. (`AEEMedia.bid` carries the class id only, not the MIME.)
 pub const MIME_MMF: &str = "audio/mmf";
+
+/// Yamaha SPF, the third face of the same Carrier media module.
+///
+/// `IMediaMA3.dll` registers `audio/spf` against `AEECLSID_MEDIAPHR` beside the MIDI and MMF rows
+/// and implements all three with one 14-slot `IMedia` body, differing only in a format flag
+/// (`BREW_JP_ABI.md` §6.1). It is a separate string because `GetHandler` is asked by name; the
+/// player behind it is the same SMAF engine the `audio/mmf` row names.
+pub const MIME_SPF: &str = "audio/spf";
 
 /// The QCELP/EVRC container under the name the header's format table gives it.
 pub const MIME_QCP: &str = "audio/qcp";
@@ -3068,7 +3078,7 @@ pub const MIME_MIDI_LEGACY: &str = "snd/midi";
 /// with `trim` + ASCII lowercase, and the reason written there is that MIME types and URL scheme
 /// names are case-insensitive by definition. A caller that forgot this would answer "that names no
 /// sound" for `SND/MIDI` while the registry answered with the media class for the same text.
-/// **No such declaration exists in either corpus** (all 827 packs, every declared MIME: only
+/// **No such declaration exists in either sample set** (all 827 packs, every declared MIME: only
 /// lowercase `audio/…` shows up, and the header itself spells its constants without a trailing
 /// space), so this is consistency with the rest of the host, not a correction to a measured number.
 pub fn names_a_sound(mime: &str) -> bool {
@@ -3100,7 +3110,10 @@ pub fn names_a_sound(mime: &str) -> bool {
 /// the name is here because Symphonia converts the frames, not because a class id was served.
 ///
 /// What it costs is a parse, and what it gives up is precision on a partial buffer — the same price
-/// [`crate::resource::sniff`] documents for a PNG whose bytes ran out.
+/// [`crate::resource::sniff`] documents for a PNG whose bytes ran out. MIDI is the one format whose
+/// *complete* parse cannot answer from the window `IShell::DetectType` offers (32 bytes, and the
+/// documented media probe offers exactly that much), so its header is checked instead; the full
+/// parse below remains as the fallback for a header this test refuses.
 pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
     if crate::audio::smaf::looks_like(bytes) {
         return Some(MIME_MMF);
@@ -3122,9 +3135,36 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
     if adts_audio(bytes) {
         return Some(MIME_AAC);
     }
-    MidiFile::new(&mut Cursor::new(bytes))
-        .is_ok()
-        .then_some(MIME_MIDI)
+    if midi_header(bytes) || MidiFile::new(&mut Cursor::new(bytes)).is_ok() {
+        return Some(MIME_MIDI);
+    }
+    None
+}
+
+/// The 14-byte Standard MIDI File header, checked well enough to name the format from the
+/// detection window alone.
+///
+/// `IShell::DetectType` answers from at most `TYPE_DETECT_WINDOW` (32) bytes, and the documented
+/// media probe (`AEEMediaUtil_FindClass`) offers exactly that much. A track of any real score is
+/// longer, so [`MidiFile::new`] — which reads the whole file — refuses every score that arrives
+/// through that door. The header is the format's own definition and carries the fields that
+/// separate a MIDI from bytes that merely begin with `MThd`; the player still parses the whole file
+/// when it plays, and a malformed track is its failure to report, not detection's.
+fn midi_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || &bytes[..4] != b"MThd" {
+        return false;
+    }
+    let header_len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let format = u16::from_be_bytes([bytes[8], bytes[9]]);
+    let tracks = u16::from_be_bytes([bytes[10], bytes[11]]);
+    let division = u16::from_be_bytes([bytes[12], bytes[13]]);
+    if !(header_len >= 6 && format <= 2 && tracks > 0 && division != 0) {
+        return false;
+    }
+    // A header alone is a shape, not a file: the first track chunk has to be behind it. The
+    // detection window (32 bytes) holds `MTrk` and its length word, but never the track itself.
+    let track = 8usize.saturating_add(header_len as usize);
+    bytes.len() >= track + 8 && &bytes[track..track + 4] == b"MTrk"
 }
 
 /// A raw AAC ADTS header: twelve sync bits, layer `00`, and a legal sampling-frequency index.
@@ -3138,7 +3178,7 @@ fn adts_audio(bytes: &[u8]) -> bool {
 /// `**`audio/mp3`**` / mp3`, and the header defines `MT_AUDIO_MP3 "audio/mp3"` with
 /// the 1.x twin at (`MT_MP3 "snd/mp3"`) and `MP3_EXTENSION "mp3"` at.
 ///
-/// **No container in either corpus writes this spelling.** The sound payloads that carry an MPEG family
+/// **No container in either sample set writes this spelling.** The sound payloads that carry an MPEG family
 /// name declare `audio/mpeg` — 205 records of it in the pack census, which is
 /// not a string in either header. That is why this constant exists separately from the declared text
 /// rather than replacing it: a census row keyed by what the container *said* stays keyed by that, and
@@ -3153,7 +3193,7 @@ pub const MIME_MP3: &str = "audio/mp3";
 /// records actually held needed an answer that was not also a promise of playback. `symphonia` closed
 /// that gap — every format [`sniff`] names is now one this host can sound — so the two questions have
 /// collapsed into the same one. The name stays because its callers ask it for a different purpose:
-/// [`crate::probe`] uses it to say what a pack shipped, and resource loading reads a `None` as "this
+/// [`crate::probe`] uses it to say what a pack provides, and resource loading reads a `None` as "this
 /// is not audio at all" rather than as "not playable".
 ///
 /// That history is worth keeping because it is the shape a second decoder entry takes: a declared MIME

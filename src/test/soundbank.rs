@@ -1,4 +1,4 @@
-//! Tests for the built-in tone bank. None of them reads a corpus file or opens a device: the bank is
+//! Tests for the built-in tone bank. None of them reads a sample set file or opens a device: the bank is
 //! bytes this crate makes, and the render goes through `audio::render_clip`, which is the same
 //! synthesizer the callback drives with the sound card taken out of the picture.
 

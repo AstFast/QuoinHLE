@@ -17,13 +17,19 @@ impl Runtime {
     ///
     /// ⚠ `GetDefaultNetwork` answers non-zero, and its own page names both its returns — "`AEE_NET_SUCCESS`:
     /// the default data network was filled in", "`AEE_EFAILED`: operation failed". The data
-    /// network of a device with no data network is `AEE_NETWORK_DEFAULT`, which the SDK defines as zero and
+    /// network of a device with no data network is `AEE_NETWORK_DEFAULT`, which the platform defines as zero and
     /// which is what "whatever the device defaults to" means; filling that in is filling in the truth.
     ///
     /// `ExtFunc` is the one slot with no page at all — the vtable comment introduces it as an "Extension
     /// Function to allow future enhancement to the interface without breaking its binary compatibility"
     /// — so the honest answer is that this host has no extension to offer.
-    pub(crate) fn inetutils(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn inetutils(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -107,7 +113,13 @@ impl Runtime {
     /// shape for it to copy: this host has a transport to put behind a socket — the loopback machine, and
     /// a real one whenever the run names `--net-proxy` — so the manager hands out the same `ISocket` face
     /// an `ISockPort` would, with the same gates and the same provider.
-    pub(crate) fn inetmgr(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn inetmgr(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -131,7 +143,7 @@ impl Runtime {
                 }
                 Ok(0)
             }
-            // The shipped body writes the failure into the record and then resumes the caller's
+            // The documented behaviour writes the failure into the record and then resumes the caller's
             // callback through `IShell::Resume`; a caller that waits on it must not be left waiting.
             "GetHostByName" => {
                 let [result, _host, cb] = self.args()?;
@@ -141,7 +153,7 @@ impl Runtime {
                     self.cpu.mem.write_u32(result + at, code)?;
                 }
                 if cb != 0 {
-                    // The shipped body calls `IShell::Resume` — the same door every other arming
+                    // The documented behaviour calls `IShell::Resume` — the same door every other arming
                     // route takes, so the block is gated, cancelled out of wherever it was, and
                     // stamped with the queue's leg before it is queued.
                     self.dispatcher_resume(cb, false)?;
@@ -293,7 +305,7 @@ impl Runtime {
                         return Ok(g::AEE_EMEMPTR);
                     }
                     // The value itself is filled by a bridle call this box cannot make; the size
-                    // half above is exact, the data half has no witness.
+                    // half above is exact, the data half has no record.
                     self.display.note(
                         "INetMgr::GetOpt: the UMTS value comes from a bridle call this host cannot make",
                     );
@@ -350,7 +362,13 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn idnsconfig(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn idnsconfig(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -587,7 +605,7 @@ impl Runtime {
         Ok(addr)
     }
 
-    /// `AEEHostSocket_New` reached the way the shipped runtime reaches it — the `gICList` row for
+    /// `AEEHostSocket_New` reached the way the reference runtime reaches it — the `gICList` row for
     /// `0x01012d96`, whose `pVoid` is the shell and whose class test is against the row's own id.
     ///
     /// The class check comes before the allocation and there is **no** `AEE_CheckPtr` on `ppv`, unlike
@@ -658,13 +676,19 @@ impl Runtime {
 
     /// Every `ISockPort` slot, as the loopback provider delivers them — 26 of them. The name in
     /// `abi::method` is the header's, and [`Runtime::SOCKPORT_LAYOVER`] is what makes the byte offsets
-    /// agree with the shipped object, so this match can be keyed by name like every other machine.
+    /// agree with the reference object, so this match can be keyed by name like every other machine.
     ///
     /// What is *not* here is the `AEESockPort` port object: its own 26 slots reach `AEENet_*`,
-    /// `OEM_GetConfig` and `bridle_SystemCall` on every path that is not a refusal, and that witness is
-    /// absent on this box. The ledger row for the delivered body names the missing witness per slot.
+    /// `OEM_GetConfig` and `bridle_SystemCall` on every path that is not a refusal, and that record is
+    /// absent on this box. The ledger row for the delivered body names the missing record per slot.
     #[inline(never)]
-    pub(crate) fn isockport(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn isockport(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1042,7 +1066,12 @@ impl Runtime {
     /// host substitutes the same provider for that second family, which is the only way
     /// [`socket::Manager`]'s real datagram (`policy.real && family == INET`) is ever built. `0` is the
     /// refusal, already written to the port's error cell with `-1` as the answer.
-    pub(crate) fn port_provider(&mut self, base: u32, family: u16, protocol: u32) -> Result<u32, Error> {
+    pub(crate) fn port_provider(
+        &mut self,
+        base: u32,
+        family: u16,
+        protocol: u32,
+    ) -> Result<u32, Error> {
         let Ok(host_slot) = self.host_sockets.born(self.shell, socket::CLS_HOSTSOCKET) else {
             return self.port_refuse(base, socket::AEE_ENOMEMORY).map(|_| 0);
         };
@@ -1093,7 +1122,7 @@ impl Runtime {
             .or_else(|| self.ports.contains_key(&this).then_some(this))
     }
 
-    /// Write `[+178]` and answer the shipped `return -1`.
+    /// Write `[+178]` and answer the reference `return -1`.
     pub(crate) fn port_refuse(&mut self, base: u32, errno: u32) -> Result<u32, Error> {
         if let Some(port) = self.ports.get_mut(&base) {
             port.error = errno as u16;
@@ -1480,14 +1509,20 @@ impl Runtime {
     ///
     /// The two shapes below are the host's, not the body's, and both come from one missing thing: no
     /// address in this host is a function a pack can call. A socket the module built is asked through
-    /// its own table, which is the shipped call. A socket this host built is [`Runtime::host_sockets`]
+    /// its own table, which is the reference call. A socket this host built is [`Runtime::host_sockets`]
     /// state, whose chains take a callback **block** and are woken by the runtime — so the record goes
     /// on the chain in the block's place and the pair waits in [`tls::Abi`] for the wake that reads it.
     /// The address parked differs by direction (the record for readable, its `ISocket` face at
     /// `record + 20` for writeable) because a chain carries one word and two directions have to be told
     /// apart when it fires; both map back to the record through [`Runtime::ssl_base`]'s two tables.
     #[inline(never)]
-    pub(crate) fn ssl_arm_socket(&mut self, base: u32, read: bool, pfn: u32, pv: u32) -> Result<(), Error> {
+    pub(crate) fn ssl_arm_socket(
+        &mut self,
+        base: u32,
+        read: bool,
+        pfn: u32,
+        pv: u32,
+    ) -> Result<(), Error> {
         let sock = self.cpu.mem.read_u32(base + 16)?;
         self.cpu.mem.read_u32(sock)?;
         let Some(slot) = self.ssl_socket_slot(sock) else {
@@ -1515,7 +1550,7 @@ impl Runtime {
             self.host_sockets
                 .writeable_source(slot, (base + 20) as usize)
         };
-        // `Arm::Resume` is the socket saying the bytes are already there. The shipped provider resumes
+        // `Arm::Resume` is the socket saying the bytes are already there. The reference provider resumes
         // on the spot; queueing here is the order the chain itself keeps — empty first, then the wake —
         // and it keeps the pack out of the frame that is still inside its own `Readable`.
         if matches!(armed, socket::Arm::Resume) {
@@ -1578,7 +1613,13 @@ impl Runtime {
     }
 
     #[inline(never)]
-    pub(crate) fn issl(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn issl(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1685,7 +1726,13 @@ impl Runtime {
     /// `QueryInterface` is answered, and it goes through the record because the count at `+24` is
     /// shared.
     #[inline(never)]
-    pub(crate) fn issl_socket(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn issl_socket(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1893,7 +1940,7 @@ impl Runtime {
                     self.cpu.mem.write_u32(base + at + 4, 0)?;
                     // A socket this host built holds the registration itself, and its provider has no
                     // `Cancel` slot to ask — so the pair that just came out of the record comes off the
-                    // chains here too, which is what the shipped forward achieves by sending the pair to
+                    // chains here too, which is what the reference forward achieves by sending the pair to
                     // the socket.
                     if ours {
                         self.ssl_disarm(base, read);
@@ -1936,7 +1983,13 @@ impl Runtime {
     }
 
     #[inline(never)]
-    pub(crate) fn ssl_stream(&mut self, base: u32, write: bool, buf: u32, count: u32) -> Result<u32, Error> {
+    pub(crate) fn ssl_stream(
+        &mut self,
+        base: u32,
+        write: bool,
+        buf: u32,
+        count: u32,
+    ) -> Result<u32, Error> {
         if self.ssl.get(&base).map(|a| a.state) != Some(768) {
             return self.ssl_face_not_ready(base);
         }
@@ -2022,7 +2075,7 @@ impl Runtime {
     /// The socket is the pack's own when it made one, and then both calls go through **its** table —
     /// slot 4 is `ISocket::Cancel`, slot 1 `IBase::Release`. A socket this host built has no table of
     /// its own to call, so its registration is taken off the chains instead ([`Runtime::ssl_disarm`]),
-    /// which is the same effect the shipped forward has.
+    /// which is the same effect the reference forward has.
     pub(crate) fn ssl_reset(&mut self, base: u32) -> Result<(), Error> {
         self.ssl_cancel_block(base + 48)?;
         let armed = self.cpu.mem.read_u32(base + 96)?;
@@ -2106,7 +2159,13 @@ impl Runtime {
     /// the four read/write slots, and leaves every other INET path inside `AEENet_*` /
     /// `bridle_SystemCall` / `OEM_GetConfig` — the OEM net module this box does not have.
     #[inline(never)]
-    pub(crate) fn port_slot(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn port_slot(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -2167,7 +2226,7 @@ impl Runtime {
             //: a four-byte body, `return 20`.
             "Open" => Ok(socket::AEE_EUNSUPPORTED),
             // `AEENet_SelectNetwork(network, shell, &me->net)` — the net module's own entry and the only
-            // writer of `[+108]`. C: the witness is the OEM net module behind the delivered body.
+            // writer of `[+108]`. C: the record is the OEM net module behind the delivered body.
             "SelectNetwork" => Err(Error::Hle(unimplemented())),
             "OpenEx" => {
                 let [family, protocol] = self.args()?;
@@ -2752,7 +2811,13 @@ impl Runtime {
     /// `Writeable` keep the callback pair in the face's own words and then forward the block built under
     /// them, so the record's gates still answer; `Cancel` withdraws those blocks; `IOCtl` is the one slot
     /// that never reaches the transport at all.
-    pub(crate) fn port_isocket(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn port_isocket(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -2828,7 +2893,7 @@ impl Runtime {
             "Cancel" => {
                 let [pfn, pv] = self.args()?;
                 let wildcard = (pfn | pv) == 0;
-                // Shipped order: the connect pair, then readable, then writeable. `clear_pair` marks the
+                // Reference order: the connect pair, then readable, then writeable. `clear_pair` marks the
                 // one write that has nothing to do with a chain.
                 for (pair, block, clear_pair) in [(92, 64, true), (24, 8, false), (52, 36, false)] {
                     if !wildcard
@@ -2873,7 +2938,7 @@ impl Runtime {
 
     /// The socket record behind a caller's `ISocket` pointer, when this host built that socket: a host
     /// socket object, or a port whose local provider is one. `None` means the pointer names an object
-    /// this host did not make, and the shipped registration hands *that* object a runtime entry address
+    /// this host did not make, and the reference registration hands *that* object a runtime entry address
     /// — the one thing [`StreamSource`] already says this host cannot produce. The source is still built
     /// either way, because the factory asks the socket for nothing; it is `Readable` that has nowhere to
     /// park, and it says so.
@@ -2960,7 +3025,7 @@ impl Runtime {
             // and `a_released_socket_source_…` encode that parking a block here leaves its `+8` alone
             // until the source drains it, and gating it through `dispatcher_prepare` moved that state
             // under them (the cancel leg unlinks the chain entry the test is watching). Until those two
-            // witnesses are re-derived against a stamped queue, this path records the owner only.
+            // records are re-derived against a stamped queue, this path records the owner only.
             self.dispatcher.resume_from(head, self.applet);
         }
         Ok(0)
@@ -2968,7 +3033,7 @@ impl Runtime {
 
     /// `gvtSockSource_ISource`'s slots over the caller's socket. `socket` comes out of the record with
     /// the same lookup that routed the call here, because both live slots reach through it. `AddRef` and
-    /// `Release` never arrive: the shipped record counts at `+12`, which is where the generic layer
+    /// `Release` never arrive: the reference record counts at `+12`, which is where the generic layer
     /// already counts.
     #[inline(never)]
     pub(crate) fn sock_source(
@@ -3025,7 +3090,7 @@ impl Runtime {
                     return Ok(0);
                 }
                 self.cancel_sock_pcb(pcb)?;
-                // The shipped body arms the block: an unregister hook in `pfnCancel` and this source in
+                // The documented behaviour arms the block: an unregister hook in `pfnCancel` and this source in
                 // `pCancelData`. The hook is a runtime C function on a handset; here it is the address
                 // [`Runtime::host_fn`] mints for [`HostFn::SockSourceCancel`], so a pack that calls
                 // `CALLBACK_Cancel` on its own block withdraws the registration the way the delivery
@@ -3067,11 +3132,11 @@ impl Runtime {
                     .expect("isource routed here by the record's own address");
                 let old = one.chain.first().copied().unwrap_or(0);
                 one.chain.insert(0, pcb);
-                // `*pcb = old; me[+16] = pcb;` — both halves live in guest memory, where the shipped
+                // `*pcb = old; me[+16] = pcb;` — both halves live in guest memory, where the reference
                 // walk (and a pack that reads its own block) finds them; the host's `Vec` is a mirror.
                 self.cpu.mem.write_u32(pcb + field("pNext"), old)?;
                 self.cpu.mem.write_u32(this + 16, pcb)?;
-                // `Arm::Resume` is the socket saying the bytes are already there. The shipped answer
+                // `Arm::Resume` is the socket saying the bytes are already there. The reference answer
                 // resumes the block it was handed, whose notify is `SockSource_ReadableCB`, which drains
                 // this chain — one queue hop deeper than doing it here, and the same blocks coming out in
                 // the same order, because a resume only ever queues.
@@ -3086,7 +3151,7 @@ impl Runtime {
 
     /// `SockSource_ReadableCB`: pop every waiting block, clear the unregister hook each one
     /// carries on the way out, and resume the block itself through the shell — `IShell::Resume` is
-    /// `gvtIShell + 144`, and its second word is the callback, which is the register the shipped loop
+    /// `gvtIShell + 144`, and its second word is the callback, which is the register the reference loop
     /// leaves holding it. Nothing is *called* here: a resume only queues, so a caller still inside
     /// `Readable` is not re-entered from under itself.
     #[inline(never)]
@@ -3191,4 +3256,56 @@ impl Runtime {
         Ok(bytes)
     }
 
+    /// One `Read` from an `IAStream`, which is what a caller that feeds a decompressor a window at a
+    /// time needs.
+    ///
+    /// [`Runtime::drain_stream`] answers "everything the stream will give up", which is the wrong
+    /// question for `IUnzipAStream`: there, the source is refilled *between* the caller's reads, so
+    /// asking for everything once would end the stream at its first window. This asks once, and a
+    /// short answer is passed on as it came.
+    ///
+    /// The host's own file handles are served from the volume rather than downcalled, for the same
+    /// reason `IFile::Read` is: their position belongs to the volume, and a copy taken through the
+    /// vtable would have to guess where to put it back.
+    pub(crate) fn read_stream_chunk(&mut self, stream: u32, want: u32) -> HResult<Vec<u8>> {
+        if stream == 0 || want == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(open) = self.files.get(&stream).cloned() {
+            let left = self
+                .volume
+                .info(&open.name)
+                .map(|i| i.size.saturating_sub(open.pos))
+                .unwrap_or(0);
+            let take = want.min(left);
+            if take == 0 {
+                return Ok(Vec::new());
+            }
+            let bytes = self.volume.read(&open, take);
+            if let Some(open) = self.files.get_mut(&stream) {
+                open.pos = open.pos.saturating_add(bytes.len() as u32);
+            }
+            return Ok(bytes);
+        }
+        let down = |e: Error| match e {
+            Error::Hle(h) => h,
+            other => HleError::Unsupported {
+                what: other.to_string(),
+            },
+        };
+        let read = self.guest_slot(stream, "IAStream", "Read").map_err(down)?;
+        let buf = self.cpu.mem.alloc_zeroed(want)?;
+        let got = self.call_guest(read, &[stream, buf, want]).map_err(down)?;
+        let n = match i32::try_from(got) {
+            Ok(v) if v <= 0 => 0,
+            _ => got.min(want) as usize,
+        };
+        let bytes = if n == 0 {
+            Vec::new()
+        } else {
+            self.cpu.mem.read_bytes(buf, n)?
+        };
+        self.cpu.mem.free(buf);
+        Ok(bytes)
+    }
 }

@@ -27,7 +27,17 @@ impl Widgets {
 
     /// `IHtmlViewer::SetOption`: `HVOpt` is `void *`, so the value is stored verbatim.
     pub fn html_set_option(&mut self, addr: u32, id: i32, value: u32) -> HResult<()> {
-        self.html(addr)?.options.insert(id, value);
+        let html = self.html(addr)?;
+        html.options.insert(id, value);
+        // Colours, indents, paragraph spacing and the scrollbar width all change what the page
+        // looks like, and one of them (`HVOPT_SZ_TYPE`) changes what it even is.
+        html.dirty = true;
+        Ok(())
+    }
+
+    /// Ask for one more paint of this page at the next presented frame. See [`Html::dirty`].
+    pub fn html_mark_dirty(&mut self, addr: u32) -> HResult<()> {
+        self.html(addr)?.dirty = true;
         Ok(())
     }
 
@@ -64,6 +74,7 @@ impl Widgets {
         html.focus = 0;
         html.content = 0;
         html.content_key = None;
+        html.dirty = true;
         Ok(())
     }
 
@@ -98,6 +109,9 @@ impl Widgets {
         // A picture that has just settled gives its row a height it did not have a frame ago, so
         // the page's measured height is no longer the page's height.
         html.pictures = html.pictures.wrapping_add(1);
+        // An `<img>` that arrives after the frame it was named in owes that frame one more paint:
+        // the page already went out without it, and nothing else will ask again.
+        html.dirty = true;
         Ok(())
     }
 
@@ -165,6 +179,7 @@ impl Widgets {
         html.values.clear();
         // A pen that is still down went down on the page that is gone, so the gesture goes with it.
         html.drag = None;
+        html.dirty = true;
         Ok(())
     }
 
@@ -193,6 +208,7 @@ impl Widgets {
         html.marquee_elapsed = 0;
         html.values.clear();
         html.drag = None;
+        html.dirty = true;
         Ok(())
     }
 
@@ -211,7 +227,7 @@ impl Widgets {
     /// what "restores the HTML viewer state (such as scroll position)" means once a page has forms
     /// in it. A string this host cannot read — an older build's, or a pack's own invention — is
     /// ignored rather than refused: the interface returns `void`, so there is nobody to tell.
-    /// `IHtmlViewer::GetViewState`: the shipped string — position, focus and the forms' words —
+    /// `IHtmlViewer::GetViewState`: the reference string — position, focus and the forms' words —
     /// that `SetViewState` reads back.
     pub fn html_view_state(
         &mut self,
@@ -257,14 +273,14 @@ impl Widgets {
         faces: crate::font::Faces<'_>,
     ) -> HResult<()> {
         use crate::web::html::ViewRestore;
-        // A restore *replaces* what the user did rather than merging with it: the shipped reader
+        // A restore *replaces* what the user did rather than merging with it: the reference reader
         // resets the text, list and tick fields before it applies the string's words,
         //so a page a state does not mention comes back as the
         // page itself.
         self.html(addr)?.values.clear();
         match crate::web::html::parse_view_state(state) {
             ViewRestore::Anchor(name) => {
-                // `id` first, then `name`, case folded — the shipped match is `aee_stricmp`.
+                // `id` first, then `name`, case folded — the reference match is `aee_stricmp`.
                 //The first element that answers is the one
                 // `Dox_NextItem` lands on.
                 let needle = name.to_ascii_lowercase();
@@ -311,7 +327,7 @@ impl Widgets {
                 focus,
                 fields,
             } => {
-                // The words go to the fields they name, in document order — the shipped reader
+                // The words go to the fields they name, in document order — the reference reader
                 // walks the forms in order and matches each word against the field it is on.
                 //A word that names nothing in this document is
                 // dropped: a state restored across a document change must not paint a box that is
@@ -391,7 +407,7 @@ impl Widgets {
                 }
                 let html = self.html(addr)?;
                 html.scroll = scroll.clamp(0, i32::from(i16::MAX)) as i16;
-                // The shipped reader only moves the focus when the string names one;
+                // The reference reader only moves the focus when the string names one;
                 //-1 leaves it where the page has it.
                 if focus > -1 && !doc.focus_items().is_empty() {
                     html.focus = (focus as usize).min(doc.focus_items().len() - 1);
@@ -411,13 +427,17 @@ impl Widgets {
         &mut self,
         addr: u32,
     ) -> HResult<std::sync::Arc<crate::web::html::Document>> {
+        // The device's encoding is read before the page borrow starts: it is one word for the whole
+        // run, and the parse below needs both at once.
+        let encoding = self.encoding();
         let html = self.html(addr)?;
         if let Some(doc) = &html.parsed {
             return Ok(std::sync::Arc::clone(doc));
         }
-        let doc = std::sync::Arc::new(crate::web::html::Document::parse_as(
+        let doc = std::sync::Arc::new(crate::web::html::Document::parse_as_in(
             &html.data,
             &html.doc_type,
+            encoding,
         ));
         html.parsed = Some(std::sync::Arc::clone(&doc));
         Ok(doc)

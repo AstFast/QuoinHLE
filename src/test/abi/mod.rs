@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod generations;
+
 #[test]
 fn vtable_order_matches_the_evidence() {
     // Slot 0 of every interface is AddRef because AEEGETPVTBL puts the vptr at offset 0
@@ -82,14 +84,27 @@ fn the_host_registry_agrees_with_itself() {
         // The shadowing case, written down rather than left to be rediscovered: only the generated
         // `IModel` is reachable by name, and the MP vector model is reached by its index alone.
         if host.index == VECTORMODEL_IFACE {
-            assert_eq!(iface_index("IModel"), IFACES.iter().position(|i| i.name == "IModel"));
+            assert_eq!(
+                iface_index("IModel"),
+                IFACES.iter().position(|i| i.name == "IModel")
+            );
             assert_eq!(iface_index("IListModel"), Some(VECTORMODEL_IFACE));
             assert_eq!(iface_index("IVectorModel"), Some(VECTORMODEL_IFACE));
         }
         // `IBase` first, for the same reason every generated interface is checked for it: a guest
         // reads slot 0 as `AddRef` before it knows anything else about the object.
         assert!(host.methods.len() >= 3, "{}", host.names[0]);
-        for (slot, expected) in [(0, "AddRef"), (1, "Release"), (2, "QueryInterface")] {
+        // The carrier's device-info class is the one host table with no `QueryInterface`: its firmware
+        // vtable is three slots, and the third is the info getter. Everything else keeps the
+        // `IBase` convention.
+        let slot2 = if host.names[0] == "IVirtualKtfOem" {
+            "Info"
+        } else if host.names[0] == "IKtfFc" {
+            "Set"
+        } else {
+            "QueryInterface"
+        };
+        for (slot, expected) in [(0, "AddRef"), (1, "Release"), (2, slot2)] {
             assert_eq!(host.methods[slot].1, expected, "{}", host.names[0]);
         }
         // Every slot is named for the interface the header declares it on, not for the table's

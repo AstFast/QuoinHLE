@@ -60,7 +60,7 @@ fn the_fit_leaves_room_for_the_desktop_and_falls_back_to_one() {
     assert_eq!(fit(Vec2::new(1024.0, 1120.0), body), 2.0);
     assert_eq!(fit(Vec2::new(1024.0, 1100.0), body), 1.0);
     // A body too big for the screen is still drawn at 1:1, never shrunk: a fractional scale is
-    // what makes shipped art unreadable, so the window clips instead.
+    // what makes reference art unreadable, so the window clips instead.
     assert_eq!(fit(Vec2::new(200.0, 200.0), Vec2::new(900.0, 700.0)), 1.0);
 }
 

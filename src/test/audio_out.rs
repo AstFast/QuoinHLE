@@ -137,6 +137,29 @@ fn a_midi_file_with_nothing_on_the_timeline_has_no_length_rather_than_a_panic() 
     );
 }
 
+#[test]
+fn a_score_that_arrives_as_the_detection_window_is_still_named_midi() {
+    // `IShell::DetectType` promises a caller the first 32 bytes (`TYPE_DETECT_WINDOW`) and takes
+    // its answer from those; the documented media probe (`AEEMediaUtil_FindClass`) offers exactly
+    // that much. Every real track is longer, so a sniffer that parses the whole file refuses a
+    // score the handset names — which is how a 3D title's load was aborted.
+    let mut window = Vec::new();
+    window.extend_from_slice(b"MThd");
+    window.extend_from_slice(&6u32.to_be_bytes());
+    window.extend_from_slice(&1u16.to_be_bytes()); // format 1
+    window.extend_from_slice(&3u16.to_be_bytes()); // three tracks
+    window.extend_from_slice(&192u16.to_be_bytes());
+    window.extend_from_slice(b"MTrk");
+    window.extend_from_slice(&2490u32.to_be_bytes()); // the track runs past the window
+    assert_eq!(window.len(), 22);
+    window.resize(crate::runtime::TYPE_DETECT_WINDOW as usize, 0);
+    assert_eq!(sniff(&window), Some(MIME_MIDI));
+    // The magic alone is not the format: the header must carry values a MIDI allows.
+    let mut not_midi = window.clone();
+    not_midi[0] = b'X';
+    assert_eq!(sniff(&not_midi), None);
+}
+
 /// A runtime holding one recorded source, and a player pointed at it. The player's three source
 /// fields are set to match, which is the state a real run is in by the time anything plays.
 fn run_with_one_clip() -> (Runtime, u32) {
@@ -222,7 +245,7 @@ fn a_payload_that_is_not_midi_is_refused_by_name() {
 /// registry would happily hand out the media class for the same text.
 #[test]
 fn a_declaration_is_a_sound_by_the_same_folding_the_registry_uses() {
-    // Both SDK sound bases, in the spellings the header actually ships.
+    // Both platform sound bases, in the spellings the header actually ships.
     assert!(names_a_sound("audio/mid"), "{MIME_MIDI}");
     assert!(names_a_sound(MIME_MIDI_LEGACY), "{MIME_MIDI_LEGACY}");
     assert!(names_a_sound("audio/qcelp"));
@@ -1229,7 +1252,7 @@ fn a_pcm_window_obeys_its_stop_and_plays_backwards_when_its_start_is_past_it() {
     assert_eq!(got, (0..10).map(|i| i as f32).collect::<Vec<_>>());
 }
 
-/// A note played on the built-in bank, so the window tests need no corpus file.
+/// A note played on the built-in bank, so the window tests need no sample set file.
 fn tone_score() -> crate::audio::smaf::sequencer::Score {
     use crate::audio::smaf::sequencer::{Event, Kind, Score};
     Score {
@@ -1893,7 +1916,7 @@ fn a_renamed_index_drops_its_cached_samples_and_the_count_with_them() {
 /// This is the play that used to stop the frame: a minute of MP3 is hundreds of milliseconds of
 /// codec work, and paying it between two frames is a freeze a person sees. The test uses a WAV big
 /// enough to cross the threshold rather than a real MP3 — the threshold is about bytes, and a
-/// generated file keeps the test free of a corpus.
+/// generated file keeps the test free of a sample set.
 #[test]
 fn a_large_source_decodes_off_the_calling_thread_and_starts_when_ready() {
     let (rt, voice, _) = run_with_a_large_wav();

@@ -232,3 +232,34 @@ fn an_undefined_code_point_uses_the_fallback_cell() {
     assert_eq!(face.glyph(u16::from(b'B')).index, 1);
     assert_eq!(face.advance(u16::from(b'A')), 4, "ASCII is half a cell");
 }
+
+#[test]
+fn a_face_is_unicode_keyed_unless_its_loader_says_otherwise() {
+    let parsed = Bbf::parse(&version2()).expect("a well-formed version-2 file");
+    assert_eq!(parsed.key_space(), KeySpace::Unicode);
+    let device = parsed.with_key_space(KeySpace::Device);
+    assert_eq!(device.key_space(), KeySpace::Device);
+}
+
+/// The synthetic bold used for a CJK face with no bold cut: every ink pixel grows one column,
+/// and the growth stops at its own cell's edge.
+#[test]
+fn a_single_cell_face_thickens_inside_its_cells() {
+    let face = Bbf::parse(&version2()).expect("a well-formed version-2 file");
+    assert!(
+        face.bit(0, 0),
+        "the fixture's first cell has ink at its left edge"
+    );
+    assert!(!face.bit(1, 0));
+
+    let bold = face.emboldened();
+    assert!(bold.bit(1, 0), "the pixel grew one column to the right");
+    assert!(bold.bit(9, 0), "and the second cell's pixel did too");
+    assert!(!bold.bit(2, 0), "but not two columns");
+    assert!(!bold.bit(10, 0));
+    assert_eq!(
+        bold.advance(0x41),
+        face.advance(0x41),
+        "the cell's advance is unchanged"
+    );
+}

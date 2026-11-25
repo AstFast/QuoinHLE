@@ -60,7 +60,7 @@
 //! that is [`crate::session`]'s `Frame`, and the copy it pays for is a `memcpy` rather than a
 //! conversion.
 
-use crate::display::{pack565, unpack565, Display, NATIVE_DEPTH};
+use crate::display::{pack565, unpack565, Display};
 use crate::hle::HResult;
 use crate::mem::Mem;
 
@@ -109,12 +109,14 @@ impl Format {
 pub struct Screen {
     width: u32,
     height: u32,
+    /// The device depth the shadow/row buffers are sized for: 16 or 32 for the fast path, and any
+    /// other depth takes the reference capture instead.
+    depth: u16,
     format: Format,
     /// One of the three, row-major, `width * format.bytes_per_pixel()` bytes a row.
     pixels: Vec<u8>,
-    /// The guest's own bytes for the same rows: `width * 2` a row, as they lie in guest memory
-    /// (little-endian 565). This is what a refresh compares against, and in `Rgb565` it is also what
-    /// the output is a copy of.
+    /// The guest's own bytes for the same rows: `width * 2` a row at 16 bpp, `width * 4` at 32.
+    /// This is what a refresh compares against, and it is also what the output is converted from.
     shadow: Vec<u8>,
     /// One row read out of guest memory, reused so a still screen does not allocate either.
     row: Vec<u8>,
@@ -141,6 +143,7 @@ impl Screen {
         Self {
             width: 0,
             height: 0,
+            depth: 0,
             format,
             pixels: Vec::new(),
             shadow: Vec::new(),
@@ -200,10 +203,11 @@ impl Screen {
     pub fn refresh(&mut self, display: &Display, mem: &Mem) -> HResult<()> {
         let wide = u32::from(display.device.width);
         let high = u32::from(display.device.height);
+        let depth = display.device.depth;
         let presented = display.presentations;
         // A size change has to be picked up even without a present: a device bitmap swapped under
         // the host is a different screen, and mirroring the old geometry would slice it wrong.
-        let resized = self.adopt(wide, high);
+        let resized = self.adopt(wide, high, depth);
         if !resized && self.have_shadow && presented == self.epoch {
             self.bands.clear();
             return Ok(());
@@ -213,11 +217,15 @@ impl Screen {
             self.epoch = presented;
             return Ok(());
         }
-        // A device bitmap that is not RGB565 — 8-bpp or 4-bpp — cannot be compared as words, and
-        // neither can it be copied out as words. The reference path knows how to read it, and it is
-        // rare enough that paying for a full conversion there is the honest trade rather than a
-        // second shadow format per depth.
-        if display.device.depth != NATIVE_DEPTH {
+        // A depth the row path does not pack — 8, 4, 1 — cannot be compared as words, and neither
+        // can it be copied out as words. The reference path knows how to read it, and it is rare
+        // enough that paying for a full conversion there is the honest trade.
+        let bytes = match depth {
+            16 => 2,
+            32 => 4,
+            _ => 0,
+        };
+        if bytes == 0 {
             let rgb = display.screenshot(mem)?;
             write_indexed(&rgb, &mut self.pixels, self.format);
             self.have_shadow = false;
@@ -229,7 +237,7 @@ impl Screen {
 
         self.bands.clear();
         let have_shadow = self.have_shadow;
-        let row_len = (wide as usize) * 2;
+        let row_len = (wide as usize) * bytes;
         let out_len = (wide as usize) * self.format.bytes_per_pixel();
         let format = self.format;
         let Self {
@@ -251,13 +259,25 @@ impl Screen {
             // call cannot be inlined into this loop, while three direct calls let the compiler pick
             // one arm for the whole refresh (and vectorize each one's body, which is what the
             // equal-length slices are for — see `convert_row`).
-            match format {
+            match (bytes, format) {
                 // The guest's words, straight through. `copy_from_slice` on equal-length slices is
                 // one `memcpy`; the comparison above already read these bytes, so this is the
                 // cheapest an output can be that is not a pointer into guest memory.
-                Format::Rgb565 => pixels[out..out + out_len].copy_from_slice(&row[..row_len]),
-                Format::Rgb888 => convert_row(&row[..row_len], &mut pixels[out..out + out_len]),
-                Format::Rgba8888 => expand565(&row[..row_len], &mut pixels[out..out + out_len]),
+                (2, Format::Rgb565) => pixels[out..out + out_len].copy_from_slice(&row[..row_len]),
+                (2, Format::Rgb888) => {
+                    convert_row(&row[..row_len], &mut pixels[out..out + out_len])
+                }
+                (2, Format::Rgba8888) => {
+                    expand565(&row[..row_len], &mut pixels[out..out + out_len])
+                }
+                (4, Format::Rgb565) => {
+                    convert_row32_to_565(&row[..row_len], &mut pixels[out..out + out_len])
+                }
+                (4, Format::Rgb888) => {
+                    convert_row32(&row[..row_len], &mut pixels[out..out + out_len])
+                }
+                (4, Format::Rgba8888) => expand32(&row[..row_len], &mut pixels[out..out + out_len]),
+                _ => unreachable!("the depth gate above admits only 16 and 32"),
             }
             open = match open {
                 Some((y0, y1)) if y - y1 <= MERGE_GAP => Some((y0, y + 1)),
@@ -276,17 +296,25 @@ impl Screen {
         Ok(())
     }
 
-    /// Take the display's geometry, and say whether it changed.
-    fn adopt(&mut self, wide: u32, high: u32) -> bool {
-        if self.width == wide && self.height == high {
+    /// Take the display's geometry and depth, and say whether either changed.
+    fn adopt(&mut self, wide: u32, high: u32, depth: u16) -> bool {
+        if self.width == wide && self.height == high && self.depth == depth {
             return false;
         }
         self.width = wide;
         self.height = high;
+        self.depth = depth;
         let stride = (wide as usize) * self.format.bytes_per_pixel();
+        // A shadow exists only for the two depths the row path packs. A switch to 8/4/1 leaves it
+        // empty; `refresh` takes the reference path and never indexes it.
+        let bytes = match depth {
+            16 => 2,
+            32 => 4,
+            _ => 0,
+        };
         self.pixels = vec![0u8; stride * (high as usize)];
-        self.shadow = vec![0u8; (wide as usize) * (high as usize) * 2];
-        self.row = vec![0u8; (wide as usize) * 2];
+        self.shadow = vec![0u8; (wide as usize) * (high as usize) * bytes];
+        self.row = vec![0u8; (wide as usize) * bytes];
         // A new buffer has no previous picture to compare against, so every row is a change. Saying
         // so here rather than leaving `bands` to look empty is what keeps a resized screen from
         // being uploaded as "nothing moved".
@@ -303,10 +331,7 @@ impl Screen {
 /// measured 336 µs against the 184 µs of the one-shot path it replaced, which would have made
 /// "only convert what moved" a regression for every full-screen frame.
 fn convert_row(row: &[u8], out: &mut [u8]) {
-    for (px, to) in row
-        .chunks_exact(2)
-        .zip(out.chunks_exact_mut(3))
-    {
+    for (px, to) in row.chunks_exact(2).zip(out.chunks_exact_mut(3)) {
         let (r, g, b) = unpack565(u16::from_le_bytes([px[0], px[1]]));
         to[0] = r;
         to[1] = g;
@@ -322,14 +347,37 @@ fn convert_row(row: &[u8], out: &mut [u8]) {
 /// Alpha is `255` — a handset screen has no transparency, and a premultiplied consumer is therefore
 /// looking at the same picture as an unpremultiplied one.
 pub fn expand565(words: &[u8], out: &mut [u8]) {
-    for (px, to) in words
-        .chunks_exact(2)
-        .zip(out.chunks_exact_mut(4))
-    {
+    for (px, to) in words.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
         let (r, g, b) = unpack565(u16::from_le_bytes([px[0], px[1]]));
         to[0] = r;
         to[1] = g;
         to[2] = b;
+        to[3] = 255;
+    }
+}
+
+/// One row of guest `0x00RRGGBB` words into `RGB888`.
+fn convert_row32(row: &[u8], out: &mut [u8]) {
+    for (px, to) in row.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        to[0] = px[2];
+        to[1] = px[1];
+        to[2] = px[0];
+    }
+}
+
+/// One row of `0x00RRGGBB` words into 5-6-5, for a consumer that wants the guest's cheaper shape.
+fn convert_row32_to_565(row: &[u8], out: &mut [u8]) {
+    for (px, to) in row.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
+        to.copy_from_slice(&pack565(px[2], px[1], px[0]).to_le_bytes());
+    }
+}
+
+/// [`convert_row32`] with an opaque alpha byte on the end.
+fn expand32(row: &[u8], out: &mut [u8]) {
+    for (px, to) in row.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        to[0] = px[2];
+        to[1] = px[1];
+        to[2] = px[0];
         to[3] = 255;
     }
 }

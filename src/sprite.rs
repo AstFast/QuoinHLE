@@ -1,14 +1,14 @@
 //! `ISprite`: four sprite buffers, four tile buffers, one destination, and the two walks that turn a
 //! caller's command list or map array into rectangle copies.
 //!
-//! The shipped body contains no drawing of its own: every
+//! The documented behaviour contains no drawing of its own: every
 //! pixel leaves through a blit on the destination the caller handed to `SetDestination` —
 //! `IBITMAP_BltIn` for the simple bodies and
 //! `ITRANSFORM_TransformBlt{Simple,Complex}` for the other pair. That is why
 //! the geometry here is arithmetic over integers rather than drawing code — the object's job is to
 //! decide *which* rectangles, and the host already knows how to blit one.
 //!
-//! The two bodies the shipped object ships for each draw slot are picked by `SetDestination`: it asks
+//! The two bodies the reference object ships for each draw slot are picked by `SetDestination`: it asks
 //! the destination for an `ITransform` and installs the transform-backed bodies over its own
 //! vtable if it gets one or the simple ones if it does not. The two walks are the
 //! same arithmetic, so only the last step differs — and the difference is visible: the transform bodies
@@ -112,7 +112,7 @@ pub struct Slot {
 /// `Sprite_DrawSpritesSimple` and `Sprite_DrawSprites`, as far as
 /// the plan goes.
 ///
-/// The list is walked once per layer, `SPRITE_LAYER_MAX` times, because the shipped `for` is outside
+/// The list is walked once per layer, `SPRITE_LAYER_MAX` times, because the reference `for` is outside
 /// the `while`: overlap is resolved by layer, and within a layer by list order. A size
 /// outside the four does not stop the walk — it sets the result and keeps going, so the sprites after
 /// it still draw, which is why the second half of the answer is a flag and not a
@@ -262,9 +262,9 @@ pub struct Engine {
     pub matrices: u32,
     pub sprite_bufs: [u32; 4],
     pub tile_bufs: [u32; 4],
-    /// The destination. The shipped object holds **two** references to it — one through `IBitmap`, and
+    /// The destination. The reference object holds **two** references to it — one through `IBitmap`, and
     /// one through the `ITransform` it asked that bitmap for, which is the face the draw
-    /// slots then blit through. Null is the shipped "simple bodies" answer, not an error.
+    /// slots then blit through. Null is the reference "simple bodies" answer, not an error.
     pub dst: u32,
     pub transform: u32,
 }

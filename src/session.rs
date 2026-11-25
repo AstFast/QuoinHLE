@@ -133,7 +133,7 @@ pub(crate) const ALIGN_RESUME_GAP: Duration = Duration::from_secs(5);
 /// fixed 16 ms step.
 ///
 /// `--speed 2` sets `QUOIN_SPEED=2000`; `--align-clock` is the same thing at `1000`, kept because it
-/// is the spelling for "pay a stall back" that already shipped. Read once per run: the rate is a
+/// is the spelling for "pay a stall back" that already reference. Read once per run: the rate is a
 /// property of the run, not something a turn may change.
 pub fn clock_speed() -> Option<u32> {
     static WANT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();

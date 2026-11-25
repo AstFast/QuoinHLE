@@ -117,15 +117,16 @@ impl Gles {
                 Ok(0)
             }
             "ClearDepthf" | "ClearDepthx" => {
-                self.clear_depth = if name.ends_with('x') { fx(0) } else { f(0) };
+                self.clear_depth = if is_fixed(name) { fx(0) } else { f(0) };
                 Ok(0)
             }
             "DepthRangef" | "DepthRangex" => {
-                self.depth_range = if name.ends_with('x') {
+                let range = if is_fixed(name) {
                     [fx(0), fx(1)]
                 } else {
                     [f(0), f(1)]
                 };
+                self.depth_range = [range[0].clamp(0.0, 1.0), range[1].clamp(0.0, 1.0)];
                 Ok(0)
             }
             "Color4f" => {
@@ -137,7 +138,7 @@ impl Gles {
                 Ok(0)
             }
             "Normal3f" | "Normal3x" => {
-                self.current.normal = if name.ends_with('x') {
+                self.current.normal = if is_fixed(name) {
                     Vec3::new(fx(0), fx(1), fx(2))
                 } else {
                     Vec3::new(f(0), f(1), f(2))
@@ -145,40 +146,60 @@ impl Gles {
                 Ok(0)
             }
             "MultiTexCoord4f" | "MultiTexCoord4x" => {
-                let unit = (a(0).wrapping_sub(GL_TEXTURE0) as usize).min(3);
-                self.current.tex[unit] = if name.contains('x') {
+                // A unit the profile does not have is a value error, not something to fold into the
+                // last slot: the subtraction-and-clamp this replaces wrote unit 3 for any enum.
+                let Some(unit) = self.texture_unit(a(0)) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                };
+                self.current.tex[unit] = if is_fixed(name) {
                     [fx(1), fx(2)]
                 } else {
                     [f(1), f(2)]
                 };
-                self.current.tex_r[unit] = if name.contains('x') { fx(3) } else { f(3) };
+                self.current.tex_r[unit] = if is_fixed(name) { fx(3) } else { f(3) };
+                self.current.tex_q[unit] = if is_fixed(name) { fx(4) } else { f(4) };
                 Ok(0)
             }
             "MultiTexCoord3f" | "MultiTexCoord3x" => {
-                let unit = (a(0).wrapping_sub(GL_TEXTURE0) as usize).min(3);
-                self.current.tex[unit] = if name.contains('x') {
+                let Some(unit) = self.texture_unit(a(0)) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                };
+                self.current.tex[unit] = if is_fixed(name) {
                     [fx(1), fx(2)]
                 } else {
                     [f(1), f(2)]
                 };
-                self.current.tex_r[unit] = if name.contains('x') { fx(3) } else { f(3) };
+                self.current.tex_r[unit] = if is_fixed(name) { fx(3) } else { f(3) };
+                self.current.tex_q[unit] = 1.0;
                 Ok(0)
             }
             "TexCoord4f" | "TexCoord4x" => {
-                self.current.tex[0] = if name.contains('x') {
+                self.current.tex[0] = if is_fixed(name) {
                     [fx(0), fx(1)]
                 } else {
                     [f(0), f(1)]
                 };
-                self.current.tex_r[0] = if name.contains('x') { fx(2) } else { f(2) };
+                self.current.tex_r[0] = if is_fixed(name) { fx(2) } else { f(2) };
+                self.current.tex_q[0] = if is_fixed(name) { fx(3) } else { f(3) };
                 Ok(0)
             }
-            "Viewport" => {
-                self.viewport = [a(0) as i32, a(1) as i32, a(2) as i32, a(3) as i32];
-                Ok(0)
-            }
-            "Scissor" => {
-                self.scissor = [a(0) as i32, a(1) as i32, a(2) as i32, a(3) as i32];
+            "Viewport" | "Scissor" => {
+                // Only the sizes are constrained: negative origins are legal, but a negative
+                // width or height is GL_INVALID_VALUE and leaves the state untouched.
+                let width = a(2) as i32;
+                let height = a(3) as i32;
+                if width < 0 || height < 0 {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                }
+                let rect = [a(0) as i32, a(1) as i32, width, height];
+                if name == "Viewport" {
+                    self.viewport = rect;
+                } else {
+                    self.scissor = rect;
+                }
                 Ok(0)
             }
             "ColorMask" => {
@@ -212,10 +233,7 @@ impl Gles {
             }
             "BlendEquation" => {
                 let equation = a(0);
-                if !matches!(
-                    equation,
-                    GL_FUNC_ADD | GL_FUNC_SUBTRACT | GL_FUNC_REVERSE_SUBTRACT
-                ) {
+                if !blend_equation_accepted(&self.caps, equation) {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
@@ -241,9 +259,9 @@ impl Gles {
             }
             "BlendEquationSeparate" => {
                 let (rgb, alpha) = (a(0), a(1));
-                let valid =
-                    |v: u32| matches!(v, GL_FUNC_ADD | GL_FUNC_SUBTRACT | GL_FUNC_REVERSE_SUBTRACT);
-                if !valid(rgb) || !valid(alpha) {
+                if !blend_equation_accepted(&self.caps, rgb)
+                    || !blend_equation_accepted(&self.caps, alpha)
+                {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
@@ -279,15 +297,33 @@ impl Gles {
                 Ok(0)
             }
             "LineWidth" | "LineWidthx" => {
-                self.line_width = if name.contains('x') { fx(0) } else { f(0) };
+                let width = if is_fixed(name) { fx(0) } else { f(0) };
+                if width <= 0.0 {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                }
+                self.line_width = clamp_to_size_range(
+                    width,
+                    self.caps.line_width_min,
+                    self.caps.line_width_max,
+                );
                 Ok(0)
             }
             "PointSize" | "PointSizex" => {
-                self.point_size = if name.contains('x') { fx(0) } else { f(0) };
+                let size = if is_fixed(name) { fx(0) } else { f(0) };
+                if size <= 0.0 {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                }
+                self.point_size = clamp_to_size_range(
+                    size,
+                    self.caps.point_size_min,
+                    self.caps.point_size_max,
+                );
                 Ok(0)
             }
             "PolygonOffset" | "PolygonOffsetx" => {
-                if name.contains('x') {
+                if is_fixed(name) {
                     self.polygon_offset_factor = fx(0);
                     self.polygon_offset_units = fx(1);
                 } else {
@@ -296,7 +332,19 @@ impl Gles {
                 }
                 Ok(0)
             }
-            "Hint" => Ok(0),
+            "Hint" => {
+                let (target, mode) = (a(0), a(1));
+                let Some(slot) = hint_slot(target) else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                };
+                if !matches!(mode, GL_FASTEST | GL_NICEST | GL_DONT_CARE) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                self.hints[slot] = mode;
+                Ok(0)
+            }
             "PixelStorei" => {
                 let (pname, value) = (a(0), a(1));
                 match pname {
@@ -316,7 +364,7 @@ impl Gles {
                 Ok(0)
             }
             "SampleCoverage" | "SampleCoveragex" => {
-                let value = if name.ends_with('x') { fx(0) } else { f(0) };
+                let value = if is_fixed(name) { fx(0) } else { f(0) };
                 self.sample_coverage_value = value.clamp(0.0, 1.0);
                 self.sample_coverage_invert = a(1) != 0;
                 Ok(0)
@@ -350,7 +398,11 @@ impl Gles {
                     GL_SAMPLE_COVERAGE => self.sample_coverage = on,
                     GL_CULL_FACE => self.cull = on,
                     GL_SCISSOR_TEST => self.scissor_test = on,
-                    GL_TEXTURE_2D => self.texture_2d[self.active_texture] = on,
+                    // A cube map unit is switched on by its own target name. The lookup itself is
+                    // chosen from what is bound, so both names drive the same per-unit switch.
+                    GL_TEXTURE_2D | GL_TEXTURE_CUBE_MAP => {
+                        self.texture_2d[self.active_texture] = on
+                    }
                     GL_ALPHA_TEST => self.alpha_test = on,
                     GL_LIGHTING => self.lighting = on,
                     GL_NORMALIZE => self.normalize = on,
@@ -362,7 +414,15 @@ impl Gles {
                     GL_STENCIL_TEST => self.stencil_test = on,
                     GL_POLYGON_OFFSET_FILL => self.polygon_offset_fill = on,
                     x if (GL_LIGHT0..GL_LIGHT0 + 8).contains(&x) => {
-                        self.lights[(x - GL_LIGHT0) as usize].enabled = on;
+                        // The profile says how many lights this machine has. A pack asking for one
+                        // past that number gets the same answer as any other name outside the
+                        // supported enum, rather than a light that exists and does nothing.
+                        let index = (x - GL_LIGHT0) as usize;
+                        if index as u32 >= self.caps.max_lights {
+                            self.set_error(GL_INVALID_ENUM);
+                            return Ok(0);
+                        }
+                        self.lights[index].enabled = on;
                     }
                     x if (GL_CLIP_PLANE0..GL_CLIP_PLANE0 + 6).contains(&x) => {
                         self.clip_plane_enabled[(x - GL_CLIP_PLANE0) as usize] = on;
@@ -414,7 +474,7 @@ impl Gles {
                     "NormalPointer" => size == 3,
                     _ => (1..=4).contains(&size),
                 };
-                if !valid_size {
+                if !valid_size || stride < 0 {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -438,15 +498,25 @@ impl Gles {
                 Ok(e)
             }
             "GetString" => {
-                let text: &[u8] = match a(0) {
-                    0x1F00 => b"QuoinHLE\0",
-                    0x1F01 => b"QuoinHLE software GLES\0",
-                    0x1F02 => b"OpenGL ES-CM 1.0\0",
-                    0x1F03 => b"GL_ATI_texture_compression_atitc GL_IMG_texture_compression_pvrtc GL_OES_read_format GL_OES_compressed_paletted_texture GL_OES_query_matrix GL_OES_vertex_buffer_object GL_OES_draw_texture GL_OES_compressed_ETC1_RGB8_texture GL_OES_framebuffer_object GL_OES_blend_subtract GL_OES_blend_func_separate GL_OES_blend_equation_separate GL_OES_point_size_array GL_OES_texture_npot GL_OES_point_sprite GL_OES_matrix_palette GL_OES_texture_mirrored_repeat GL_EXT_texture_filter_anisotropic\0",
+                let (slot, text) = match a(0) {
+                    0x1F00 => (0, format!("{}\0", self.caps.vendor)),
+                    0x1F01 => (1, format!("{}\0", self.caps.renderer)),
+                    0x1F02 => (2, format!("{}\0", self.caps.version)),
+                    0x1F03 => (3, format!("{}\0", self.caps.extensions)),
                     _ => return Ok(0),
                 };
-                let at = mem.alloc(text.len() as u32, 1)?;
-                mem.write_bytes(at, text)?;
+                // The spec makes this storage the implementation's, not the caller's: a pack is
+                // entitled to ask every frame, and handing out a fresh buffer each time grows the
+                // guest heap without bound.
+                let at = if self.string_cache[slot] == 0 {
+                    let text = text.into_bytes();
+                    let at = mem.alloc(text.len() as u32, 1)?;
+                    mem.write_bytes(at, &text)?;
+                    self.string_cache[slot] = at;
+                    at
+                } else {
+                    self.string_cache[slot]
+                };
                 if iface == "IGL" {
                     // `IGL::GetString` answers with the pointer itself.
                     Ok(at)
@@ -463,6 +533,21 @@ impl Gles {
                 let pname = a(0);
                 let dst = a(1);
                 if dst == 0 {
+                    return Ok(0);
+                }
+                // GL_COMPRESSED_TEXTURE_FORMATS is a variable-length list, so it cannot ride the
+                // fixed four-word array the scalar queries share.
+                if pname == 0x86A3 {
+                    for (i, v) in self.caps.compressed_texture_formats.iter().enumerate() {
+                        let at = dst + i as u32 * 4;
+                        match name {
+                            "GetFloatv" => mem.write_u32(at, (*v as f32).to_bits())?,
+                            "GetFixedv" => {
+                                mem.write_u32(at, ((*v as f32) * 65536.0) as i32 as u32)?
+                            }
+                            _ => mem.write_u32(at, *v)?,
+                        }
+                    }
                     return Ok(0);
                 }
                 let matrix = match pname {
@@ -514,9 +599,16 @@ impl Gles {
                         self.point_distance_attenuation[2],
                         0.0,
                     ],
-                    GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT => [16.0, 0.0, 0.0, 0.0],
+                    GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT => {
+                        [self.caps.max_texture_max_anisotropy as f32, 0.0, 0.0, 0.0]
+                    }
                     GL_SAMPLE_COVERAGE_VALUE => [self.sample_coverage_value, 0.0, 0.0, 0.0],
                     GL_SAMPLES | GL_SAMPLE_BUFFERS => [0.0, 0.0, 0.0, 0.0],
+                    GL_PERSPECTIVE_CORRECTION_HINT => [self.hints[0] as f32, 0.0, 0.0, 0.0],
+                    GL_POINT_SMOOTH_HINT => [self.hints[1] as f32, 0.0, 0.0, 0.0],
+                    GL_LINE_SMOOTH_HINT => [self.hints[2] as f32, 0.0, 0.0, 0.0],
+                    GL_FOG_HINT => [self.hints[3] as f32, 0.0, 0.0, 0.0],
+                    GL_GENERATE_MIPMAP_HINT => [self.hints[4] as f32, 0.0, 0.0, 0.0],
                     GL_LIGHT_MODEL_LOCAL_VIEWER => {
                         [if self.local_viewer { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]
                     }
@@ -571,20 +663,93 @@ impl Gles {
                     GL_BLEND_SRC_RGB => [self.blend_src as f32, 0.0, 0.0, 0.0],
                     GL_LOGIC_OP_MODE => [self.logic_op as f32, 0.0, 0.0, 0.0],
                     GL_BLEND_DST_RGB => [self.blend_dst as f32, 0.0, 0.0, 0.0],
-                    0x0D3A => [2048.0, 2048.0, 0.0, 0.0], // GL_MAX_VIEWPORT_DIMS
-                    0x0D33 => [2048.0, 0.0, 0.0, 0.0],    // GL_MAX_TEXTURE_SIZE
-                    0x0D31 => [8.0, 0.0, 0.0, 0.0],       // GL_MAX_LIGHTS
-                    0x84E2 => [4.0, 0.0, 0.0, 0.0],       // GL_MAX_TEXTURE_UNITS
-                    GL_MAX_PALETTE_MATRICES_OES => [32.0, 0.0, 0.0, 0.0],
-                    GL_MAX_VERTEX_UNITS_OES => [4.0, 0.0, 0.0, 0.0],
+                    0x0D3A => {
+                        // Q3D answers GL_MAX_VIEWPORT_DIMS from the current display surface's
+                        // width and height rather than from a fixed cap. A call with no current
+                        // surface falls back to the viewport this context last set.
+                        let (width, height) = egl
+                            .current
+                            .and_then(|id| egl.surfaces.get(&id))
+                            .map(|s| (s.width, s.height))
+                            .unwrap_or_else(|| {
+                                (
+                                    self.viewport[2].max(0) as u32,
+                                    self.viewport[3].max(0) as u32,
+                                )
+                            });
+                        [width as f32, height as f32, 0.0, 0.0]
+                    }
+                    0x0D33 => [self.caps.max_texture_size as f32, 0.0, 0.0, 0.0], // GL_MAX_TEXTURE_SIZE
+                    0x0D31 => [self.caps.max_lights as f32, 0.0, 0.0, 0.0],       // GL_MAX_LIGHTS
+                    0x0D36 => [self.caps.max_modelview_stack_depth as f32, 0.0, 0.0, 0.0], // GL_MAX_MODELVIEW_STACK_DEPTH
+                    0x0D38 => [self.caps.max_projection_stack_depth as f32, 0.0, 0.0, 0.0], // GL_MAX_PROJECTION_STACK_DEPTH
+                    0x0D39 => [self.caps.max_texture_stack_depth as f32, 0.0, 0.0, 0.0], // GL_MAX_TEXTURE_STACK_DEPTH
+                    0x0B12 | 0x846D => [
+                        self.caps.point_size_min as f32,
+                        self.caps.point_size_max as f32,
+                        0.0,
+                        0.0,
+                    ], // GL_POINT_SIZE_RANGE / GL_ALIASED_POINT_SIZE_RANGE
+                    0x0B22 | 0x846E => [
+                        self.caps.line_width_min as f32,
+                        self.caps.line_width_max as f32,
+                        0.0,
+                        0.0,
+                    ], // GL_LINE_WIDTH_RANGE / GL_ALIASED_LINE_WIDTH_RANGE
+                    0x86A2 => [
+                        self.caps.compressed_texture_formats.len() as f32,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ], // GL_NUM_COMPRESSED_TEXTURE_FORMATS
+                    // These two are advisory in ES 1.1: the number a pack should stay under, not a
+                    // threshold a draw is refused at. The host's own ceiling for a draw is the
+                    // allocator's limit, so nothing here turns a large count into an error.
+                    0x80E8 => [self.caps.max_elements_vertices as f32, 0.0, 0.0, 0.0], // GL_MAX_ELEMENTS_VERTICES
+                    0x80E9 => [self.caps.max_elements_indices as f32, 0.0, 0.0, 0.0], // GL_MAX_ELEMENTS_INDICES
+                    0x84E2 => [self.caps.max_texture_units as f32, 0.0, 0.0, 0.0], // GL_MAX_TEXTURE_UNITS
+                    GL_MAX_PALETTE_MATRICES_OES => {
+                        [self.caps.max_palette_matrices as f32, 0.0, 0.0, 0.0]
+                    }
+                    GL_MAX_VERTEX_UNITS_OES => [self.caps.max_vertex_units as f32, 0.0, 0.0, 0.0],
                     GL_CURRENT_PALETTE_MATRIX_OES => {
                         [self.current_palette_matrix as f32, 0.0, 0.0, 0.0]
                     }
-                    0x0D56 => [16.0, 0.0, 0.0, 0.0], // GL_DEPTH_BITS
-                    0x0D57 => [8.0, 0.0, 0.0, 0.0],  // GL_STENCIL_BITS
-                    // GL_OES_read_format: the only format/type ReadPixels accepts.
-                    0x8B9B => [6408.0, 0.0, 0.0, 0.0], // GL_IMPLEMENTATION_COLOR_READ_FORMAT_OES -> GL_RGBA
-                    0x8B9A => [3585.0, 0.0, 0.0, 0.0], // GL_IMPLEMENTATION_COLOR_READ_TYPE_OES -> GL_UNSIGNED_BYTE
+                    // GL_OES_matrix_palette state: the current weight and the bound weight
+                    // array's size/type/stride. No weight buffer is bound by this pipeline, so
+                    // the two buffer-binding enums answer zero.
+                    0x8846 => [self.current.weights[0], 0.0, 0.0, 0.0], // GL_CURRENT_WEIGHT_OES
+                    0x8847 | 0x86AB => [
+                        self.client.weight.map(|a| a.size as f32).unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ], // GL_WEIGHT_ARRAY_SIZE_OES
+                    0x8848 | 0x86A9 => [
+                        self.client.weight.map(|a| a.ty as f32).unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ], // GL_WEIGHT_ARRAY_TYPE_OES
+                    0x86AA => [
+                        self.client.weight.map(|a| a.stride as f32).unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ], // GL_WEIGHT_ARRAY_STRIDE_OES
+                    0x889E => [0.0, 0.0, 0.0, 0.0], // GL_WEIGHT_ARRAY_BUFFER_BINDING_OES
+                    0x8B9E => [0.0, 0.0, 0.0, 0.0], // GL_MATRIX_INDEX_ARRAY_BUFFER_BINDING_OES
+                    // Pixel-format queries. Q3D answers these from the display object it was
+                    // handed: the 16bpp path is 5/6/5/0 with a 16-bit depth buffer.
+                    0x0D50 => [self.caps.subpixel_bits as f32, 0.0, 0.0, 0.0], // GL_SUBPIXEL_BITS
+                    0x0D52 => [self.caps.red_bits as f32, 0.0, 0.0, 0.0],      // GL_RED_BITS
+                    0x0D53 => [self.caps.green_bits as f32, 0.0, 0.0, 0.0],    // GL_GREEN_BITS
+                    0x0D54 => [self.caps.blue_bits as f32, 0.0, 0.0, 0.0],     // GL_BLUE_BITS
+                    0x0D55 => [self.caps.alpha_bits as f32, 0.0, 0.0, 0.0],    // GL_ALPHA_BITS
+                    0x0D56 => [self.caps.depth_bits as f32, 0.0, 0.0, 0.0],    // GL_DEPTH_BITS
+                    0x0D57 => [self.caps.stencil_bits as f32, 0.0, 0.0, 0.0],  // GL_STENCIL_BITS
+                    0x8B9B => [self.caps.read_format as f32, 0.0, 0.0, 0.0], // GL_IMPLEMENTATION_COLOR_READ_FORMAT_OES
+                    0x8B9A => [self.caps.read_type as f32, 0.0, 0.0, 0.0], // GL_IMPLEMENTATION_COLOR_READ_TYPE_OES
                     GL_FRAMEBUFFER_BINDING_OES => [self.bound_framebuffer as f32, 0.0, 0.0, 0.0],
                     GL_RENDERBUFFER_BINDING_OES => [self.bound_renderbuffer as f32, 0.0, 0.0, 0.0],
                     _ => {
@@ -595,6 +760,7 @@ impl Gles {
                 let count = match pname {
                     GL_VIEWPORT | GL_SCISSOR_BOX | GL_COLOR_CLEAR_VALUE | GL_CURRENT_COLOR => 4,
                     GL_DEPTH_RANGE | 0x0D3A => 2,
+                    0x0B12 | 0x0B22 | 0x846D | 0x846E => 2,
                     GL_CURRENT_NORMAL => 3,
                     GL_POINT_DISTANCE_ATTENUATION => 3,
                     _ => 1,
@@ -746,11 +912,19 @@ impl Gles {
             }
             "GetLightfv" | "GetLightxv" => {
                 let (light, pname, ptr) = (a(0), a(1), a(2));
-                let index = light.wrapping_sub(GL_LIGHT0) as usize;
-                let Some(l) = self.lights.get(index) else {
+                let Some(index) = light.checked_sub(GL_LIGHT0).map(|i| i as usize) else {
+                    self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 };
-                let fixed = name.ends_with('x');
+                if index as u32 >= self.caps.max_lights {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                let Some(l) = self.lights.get(index) else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                };
+                let fixed = is_fixed(name);
                 let (values, count): (&[f32], u32) = match pname {
                     GL_AMBIENT => (&l.ambient[..], 4),
                     GL_DIFFUSE => (&l.diffuse[..], 4),
@@ -762,14 +936,17 @@ impl Gles {
                     GL_CONSTANT_ATTENUATION => (&[l.constant_attenuation][..], 1),
                     GL_LINEAR_ATTENUATION => (&[l.linear_attenuation][..], 1),
                     GL_QUADRATIC_ATTENUATION => (&[l.quadratic_attenuation][..], 1),
-                    _ => return Ok(0),
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
+                    }
                 };
                 write_values(mem, ptr, values, count, fixed)?;
                 Ok(0)
             }
             "GetMaterialfv" | "GetMaterialxv" => {
                 let (face, pname, ptr) = (a(0), a(1), a(2));
-                let fixed = name.ends_with('x');
+                let fixed = is_fixed(name);
                 let Some(m) = self.material_for_face(face) else {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
@@ -790,10 +967,24 @@ impl Gles {
             }
             "PointParameterf" | "PointParameterx" => {
                 let pname = a(0);
-                let value = if name.ends_with('x') { fx(1) } else { f(1) };
+                let value = if is_fixed(name) { fx(1) } else { f(1) };
                 match pname {
-                    GL_POINT_SIZE_MIN => self.point_size_min = value.max(0.0),
-                    GL_POINT_SIZE_MAX => self.point_size_max = value.max(0.0),
+                    // Both endpoints live inside the range the profile reports, so a pack cannot
+                    // widen them past what the machine can draw.
+                    GL_POINT_SIZE_MIN => {
+                        self.point_size_min = clamp_to_size_range(
+                            value.max(0.0),
+                            self.caps.point_size_min,
+                            self.caps.point_size_max,
+                        )
+                    }
+                    GL_POINT_SIZE_MAX => {
+                        self.point_size_max = clamp_to_size_range(
+                            value.max(0.0),
+                            self.caps.point_size_min,
+                            self.caps.point_size_max,
+                        )
+                    }
                     GL_POINT_FADE_THRESHOLD_SIZE => self.point_fade_threshold = value.max(0.0),
                     _ => {
                         self.set_error(GL_INVALID_ENUM);
@@ -808,7 +999,7 @@ impl Gles {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
-                let ty = if name.contains('x') {
+                let ty = if is_fixed(name) {
                     GL_FIXED
                 } else {
                     GL_FLOAT
@@ -865,6 +1056,9 @@ impl Gles {
                 }
                 Ok(0)
             }
+            // Every draw here writes its pixels before it returns — there is no queue to drain and
+            // no deferred work to wait on — so both calls are already satisfied when they arrive.
+            // Answering success is the honest answer, not a stub for something unimplemented.
             "Finish" | "Flush" => Ok(0),
             "ReadPixels" => {
                 let (x, y, width, height, format, ty, pixels) = (
@@ -878,17 +1072,38 @@ impl Gles {
                 );
                 if width < 0
                     || height < 0
-                    || width > MAX_TEXTURE_SIZE as i32
-                    || height > MAX_TEXTURE_SIZE as i32
+                    || width > self.caps.max_texture_size as i32
+                    || height > self.caps.max_texture_size as i32
                 {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
                 if width == 0 || height == 0 {
+                    // The device refuses a read with nothing in it rather than answering success:
+                    // its copy path clamps the rectangle first and errors when the result is empty.
+                    self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
                 if pixels == 0 {
                     self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                }
+                // A profile that names a read-back pair narrower than the ES baseline is saying what
+                // its surface can be copied out as. Accept that pair and RGBA/UNSIGNED_BYTE, which
+                // every ES 1.1 implementation owes a caller, and refuse the rest with the error the
+                // read-format extension names. A profile that names the baseline keeps the wider
+                // set this host implements, so nothing that worked before stops working.
+                let names_a_pair = self.caps.read_format != 0
+                    && self.caps.read_type != 0
+                    && !(self.caps.read_format == GL_RGBA
+                        && self.caps.read_type == GL_UNSIGNED_BYTE);
+                let baseline = format == GL_RGBA && ty == GL_UNSIGNED_BYTE;
+                let profile_pair =
+                    format == self.caps.read_format && ty == self.caps.read_type;
+                if names_a_pair && !baseline && !profile_pair {
+                    // The device answers a pair it cannot produce with a name error, not an
+                    // operation error: the format/type combination is simply not one of its enum.
+                    self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
                 let Some(s) = self.read_surface(&*egl) else {
@@ -1028,11 +1243,19 @@ impl Gles {
             // forwards them, but they do not change a value this pipeline reads yet. The slots
             // answer success so a pack's initialisation does not stop on them.
             "ActiveTexture" => {
-                self.active_texture = (a(0).wrapping_sub(GL_TEXTURE0) as usize).min(3);
+                let Some(unit) = self.texture_unit(a(0)) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                };
+                self.active_texture = unit;
                 Ok(0)
             }
             "ClientActiveTexture" => {
-                self.client_active_texture = (a(0).wrapping_sub(GL_TEXTURE0) as usize).min(3);
+                let Some(unit) = self.texture_unit(a(0)) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                };
+                self.client_active_texture = unit;
                 Ok(0)
             }
             "ClearStencil" => {
@@ -1056,9 +1279,9 @@ impl Gles {
             }
             "StencilOp" => {
                 let (fail, pass_depth_fail, pass_depth_pass) = (a(0), a(1), a(2));
-                if !is_stencil_op(fail)
-                    || !is_stencil_op(pass_depth_fail)
-                    || !is_stencil_op(pass_depth_pass)
+                if !is_stencil_op(fail, &self.caps)
+                    || !is_stencil_op(pass_depth_fail, &self.caps)
+                    || !is_stencil_op(pass_depth_pass, &self.caps)
                 {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
@@ -1078,20 +1301,33 @@ impl Gles {
             }
             "Fogf" | "Fogx" => {
                 let pname = a(0);
-                let v = if name.contains('x') { fx(1) } else { f(1) };
+                let v = if is_fixed(name) { fx(1) } else { f(1) };
                 match pname {
-                    GL_FOG_MODE => self.fog_mode = a(1),
+                    GL_FOG_MODE => {
+                        if !matches!(a(1), GL_LINEAR | GL_EXP | GL_EXP2) {
+                            self.set_error(GL_INVALID_ENUM);
+                            return Ok(0);
+                        }
+                        self.fog_mode = a(1);
+                    }
                     GL_FOG_DENSITY => self.fog_density = v,
                     GL_FOG_START => self.fog_start = v,
                     GL_FOG_END => self.fog_end = v,
-                    _ => {}
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
+                    }
                 }
                 Ok(0)
             }
             "Fogfv" | "Fogxv" => {
                 let (pname, ptr) = (a(0), a(1));
-                if pname == GL_FOG_COLOR && ptr != 0 {
-                    let ty = if name.contains('x') {
+                if pname != GL_FOG_COLOR {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                if ptr != 0 {
+                    let ty = if is_fixed(name) {
                         GL_FIXED
                     } else {
                         GL_FLOAT
@@ -1104,15 +1340,20 @@ impl Gles {
             }
             "Lightf" | "Lightx" => {
                 let (light, pname) = (a(0), a(1));
-                let v = if name.contains('x') { fx(2) } else { f(2) };
-                if let Some(l) = self.light_mut(light) {
-                    match pname {
-                        GL_SPOT_EXPONENT => l.spot_exponent = v,
-                        GL_SPOT_CUTOFF => l.spot_cutoff = v,
-                        GL_CONSTANT_ATTENUATION => l.constant_attenuation = v,
-                        GL_LINEAR_ATTENUATION => l.linear_attenuation = v,
-                        GL_QUADRATIC_ATTENUATION => l.quadratic_attenuation = v,
-                        _ => {}
+                let v = if is_fixed(name) { fx(2) } else { f(2) };
+                let Some(l) = self.light_mut(light) else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                };
+                match pname {
+                    GL_SPOT_EXPONENT => l.spot_exponent = v,
+                    GL_SPOT_CUTOFF => l.spot_cutoff = v,
+                    GL_CONSTANT_ATTENUATION => l.constant_attenuation = v,
+                    GL_LINEAR_ATTENUATION => l.linear_attenuation = v,
+                    GL_QUADRATIC_ATTENUATION => l.quadratic_attenuation = v,
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
                     }
                 }
                 Ok(0)
@@ -1122,7 +1363,7 @@ impl Gles {
                 if ptr == 0 {
                     return Ok(0);
                 }
-                let ty = if name.contains('x') {
+                let ty = if is_fixed(name) {
                     GL_FIXED
                 } else {
                     GL_FLOAT
@@ -1147,14 +1388,20 @@ impl Gles {
                             l.position = [position.x, position.y, position.z, position.w]
                         }
                         GL_SPOT_DIRECTION => l.spot_direction = [spot.x, spot.y, spot.z],
-                        _ => {}
+                        _ => {
+                            self.set_error(GL_INVALID_ENUM);
+                            return Ok(0);
+                        }
                     }
+                } else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
                 }
                 Ok(0)
             }
             "LightModelf" | "LightModelx" => {
                 let pname = a(0);
-                let value = if name.ends_with('x') { fx(1) } else { f(1) };
+                let value = if is_fixed(name) { fx(1) } else { f(1) };
                 match pname {
                     GL_LIGHT_MODEL_TWO_SIDE => self.two_sided = value != 0.0,
                     GL_LIGHT_MODEL_LOCAL_VIEWER => self.local_viewer = value != 0.0,
@@ -1170,7 +1417,7 @@ impl Gles {
                 if ptr == 0 {
                     return Ok(0);
                 }
-                let ty = if name.contains('x') {
+                let ty = if is_fixed(name) {
                     GL_FIXED
                 } else {
                     GL_FLOAT
@@ -1219,7 +1466,7 @@ impl Gles {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
-                let value = if name.contains('x') { fx(2) } else { f(2) };
+                let value = if is_fixed(name) { fx(2) } else { f(2) };
                 if !self.set_material(face, |m| m.shininess = value) {
                     self.set_error(GL_INVALID_ENUM);
                 }
@@ -1230,7 +1477,7 @@ impl Gles {
                 if ptr == 0 {
                     return Ok(0);
                 }
-                let ty = if name.contains('x') {
+                let ty = if is_fixed(name) {
                     GL_FIXED
                 } else {
                     GL_FLOAT
@@ -1271,8 +1518,12 @@ impl Gles {
             }
             "TexEnvfv" | "TexEnvxv" => {
                 let (pname, ptr) = (a(1), a(2));
-                if pname == GL_TEXTURE_ENV_COLOR && ptr != 0 {
-                    let ty = if name.contains('x') {
+                if pname != GL_TEXTURE_ENV_COLOR {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                if ptr != 0 {
+                    let ty = if is_fixed(name) {
                         GL_FIXED
                     } else {
                         GL_FLOAT
@@ -1312,16 +1563,23 @@ impl Gles {
                 }
                 let (internal, width, height) = (a(2), a(3), a(4));
                 let (size, data) = (a(6), a(7));
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
                 if width == 0 || height == 0 || data == 0 {
                     return Ok(0);
                 }
+                if !self.caps.compressed_texture_formats.contains(&internal) {
+                    // The profile's list is the answer to "which formats exist here"; a format it
+                    // does not name is a name error, not a silent unsupported call.
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
                 let bytes = mem.read_bytes(data, size as usize)?;
                 let rgba = if (GL_PALETTE4_RGB8_OES..=GL_PALETTE8_RGB5_A1_OES).contains(&internal) {
                     let Some(decoded) = decode_paletted(&bytes, width, height, internal) else {
+                        self.set_error(GL_INVALID_VALUE);
                         return Ok(0);
                     };
                     decoded
@@ -1369,6 +1627,7 @@ impl Gles {
                         _ => return Ok(crate::abi::generated::AEE_EUNSUPPORTED),
                     };
                     if decoded.is_err() {
+                        self.set_error(GL_INVALID_VALUE);
                         return Ok(0);
                     }
                     // The decoder writes `0xAARRGGBB`; the pipeline keeps RGBA8.
@@ -1382,13 +1641,7 @@ impl Gles {
                     rgba
                 };
                 let unit = self.active_texture;
-                let id = if self.bound_texture[unit] == 0 {
-                    let id = self.next_texture;
-                    self.next_texture += 1;
-                    id
-                } else {
-                    self.bound_texture[unit]
-                };
+                let id = self.bound_texture[unit];
                 let mut tex = self
                     .textures
                     .get(&id)
@@ -1397,6 +1650,11 @@ impl Gles {
                 if level == 0 {
                     tex.width = width;
                     tex.height = height;
+                    tex.uploaded = true;
+                    Gles::note_upload(
+                        egl, "CompressedTexImage2D", id, level, width, height, internal, 0, data,
+                        &rgba,
+                    );
                     tex.rgba = rgba;
                     tex.levels.clear();
                 } else {
@@ -1417,16 +1675,21 @@ impl Gles {
                 let (xoffset, yoffset) = (a(2), a(3));
                 let (width, height, format) = (a(4), a(5), a(6));
                 let (size, data) = (a(7), a(8));
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
                 if width == 0 || height == 0 || data == 0 {
                     return Ok(0);
                 }
+                if !self.caps.compressed_texture_formats.contains(&format) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
                 let bytes = mem.read_bytes(data, size as usize)?;
                 let rgba = if (GL_PALETTE4_RGB8_OES..=GL_PALETTE8_RGB5_A1_OES).contains(&format) {
                     let Some(decoded) = decode_paletted(&bytes, width, height, format) else {
+                        self.set_error(GL_INVALID_VALUE);
                         return Ok(0);
                     };
                     decoded
@@ -1474,6 +1737,7 @@ impl Gles {
                         _ => return Ok(crate::abi::generated::AEE_EUNSUPPORTED),
                     };
                     if decoded.is_err() {
+                        self.set_error(GL_INVALID_VALUE);
                         return Ok(0);
                     }
                     let mut rgba = vec![255u8; (width * height * 4) as usize];
@@ -1521,7 +1785,7 @@ impl Gles {
                     return Ok(0);
                 }
                 let (x, y, width, height) = (a(3) as i32, a(4) as i32, a(5), a(6));
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -1548,13 +1812,7 @@ impl Gles {
                     }
                 }
                 let unit = self.active_texture;
-                let id = if self.bound_texture[unit] == 0 {
-                    let id = self.next_texture;
-                    self.next_texture += 1;
-                    id
-                } else {
-                    self.bound_texture[unit]
-                };
+                let id = self.bound_texture[unit];
                 let mut tex = self
                     .textures
                     .get(&id)
@@ -1567,6 +1825,7 @@ impl Gles {
                         let count = (width * height * 4) as usize;
                         tex.faces = vec![vec![0u8; count]; 6];
                         tex.faces[face] = rgba.clone();
+                        tex.uploaded = true;
                         if face == 0 {
                             tex.rgba = rgba;
                         }
@@ -1596,6 +1855,13 @@ impl Gles {
                 } else if level == 0 {
                     tex.width = width;
                     tex.height = height;
+                    tex.uploaded = true;
+                    Gles::note_upload_plain(
+                        egl,
+                        "CopyTexImage2D",
+                        id,
+                        &format!("level=0 {width}x{height} img=yes"),
+                    );
                     tex.rgba = rgba;
                     tex.levels.clear();
                 } else {
@@ -1620,7 +1886,7 @@ impl Gles {
                 }
                 let (xoffset, yoffset) = (a(2), a(3));
                 let (x, y, width, height) = (a(4) as i32, a(5) as i32, a(6), a(7));
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -1661,6 +1927,25 @@ impl Gles {
                 Ok(0)
             }
             "Clear" => {
+                if egl.gl_log.is_some() {
+                    let scissor = if self.scissor_test {
+                        format!(
+                            "{},{} {},{}",
+                            self.scissor[0], self.scissor[1], self.scissor[2], self.scissor[3]
+                        )
+                    } else {
+                        "off".to_string()
+                    };
+                    Gles::note_row(
+                        egl,
+                        format!(
+                            "clear mask={:#06x} colour={} depth={:.3} scissor={scissor}",
+                            a(0),
+                            diag::colour(self.clear_color),
+                            self.clear_depth
+                        ),
+                    );
+                }
                 self.clear(a(0), egl, mem)?;
                 Ok(0)
             }
@@ -1680,17 +1965,22 @@ impl Gles {
                 Ok(0)
             }
             "LoadMatrixf" | "LoadMatrixx" => {
-                let m = self.read_matrix(a(0), name.ends_with('x'), mem)?;
+                let m = self.read_matrix(a(0), is_fixed(name), mem)?;
                 self.matrices[self.mode].current = m;
                 Ok(0)
             }
             "MultMatrixf" | "MultMatrixx" => {
-                let m = self.read_matrix(a(0), name.ends_with('x'), mem)?;
+                let m = self.read_matrix(a(0), is_fixed(name), mem)?;
                 self.matrices[self.mode].current *= m;
                 Ok(0)
             }
             "PushMatrix" => {
-                if self.matrices[self.mode].stack.len() >= 32 {
+                let limit = match self.mode {
+                    0 => self.caps.max_modelview_stack_depth,
+                    1 => self.caps.max_projection_stack_depth,
+                    _ => self.caps.max_texture_stack_depth,
+                } as usize;
+                if self.matrices[self.mode].stack.len() >= limit {
                     self.set_error(GL_STACK_OVERFLOW);
                     return Ok(0);
                 }
@@ -1710,7 +2000,7 @@ impl Gles {
                 Ok(0)
             }
             "Translatef" | "Translatex" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     Vec3::new(fx(0), fx(1), fx(2))
                 } else {
                     Vec3::new(f(0), f(1), f(2))
@@ -1719,7 +2009,7 @@ impl Gles {
                 Ok(0)
             }
             "Scalef" | "Scalex" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     Vec3::new(fx(0), fx(1), fx(2))
                 } else {
                     Vec3::new(f(0), f(1), f(2))
@@ -1728,7 +2018,7 @@ impl Gles {
                 Ok(0)
             }
             "Rotatef" | "Rotatex" => {
-                let (angle, axis) = if name.ends_with('x') {
+                let (angle, axis) = if is_fixed(name) {
                     (fx(0).to_radians(), Vec3::new(fx(1), fx(2), fx(3)))
                 } else {
                     (f(0).to_radians(), Vec3::new(f(1), f(2), f(3)))
@@ -1740,7 +2030,7 @@ impl Gles {
                 Ok(0)
             }
             "Frustumf" | "Frustumx" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     [fx(0), fx(1), fx(2), fx(3), fx(4), fx(5)]
                 } else {
                     [f(0), f(1), f(2), f(3), f(4), f(5)]
@@ -1750,7 +2040,7 @@ impl Gles {
                 Ok(0)
             }
             "Orthof" | "Orthox" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     [fx(0), fx(1), fx(2), fx(3), fx(4), fx(5)]
                 } else {
                     [f(0), f(1), f(2), f(3), f(4), f(5)]
@@ -1773,12 +2063,16 @@ impl Gles {
             }
             "End" => {
                 let vertices = std::mem::take(&mut self.vertices);
-                self.submit(&vertices, self.primitive, egl, mem)?;
+                let mode = self.primitive;
+                self.arm_probe(egl, "End", mode, vertices.len());
+                let drawn = self.submit(&vertices, mode, egl, mem);
+                self.finish_probe(egl);
                 self.primitive = 0;
+                drawn?;
                 Ok(0)
             }
             "Vertex2f" | "Vertex2x" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     Vec3::new(fx(0), fx(1), 0.0)
                 } else {
                     Vec3::new(f(0), f(1), 0.0)
@@ -1787,7 +2081,7 @@ impl Gles {
                 Ok(0)
             }
             "Vertex3f" | "Vertex3x" => {
-                let v = if name.ends_with('x') {
+                let v = if is_fixed(name) {
                     Vec3::new(fx(0), fx(1), fx(2))
                 } else {
                     Vec3::new(f(0), f(1), f(2))
@@ -1796,7 +2090,7 @@ impl Gles {
                 Ok(0)
             }
             "Vertex4f" | "Vertex4x" => {
-                let (v, w) = if name.ends_with('x') {
+                let (v, w) = if is_fixed(name) {
                     (Vec3::new(fx(0), fx(1), fx(2)), fx(3))
                 } else {
                     (Vec3::new(f(0), f(1), f(2)), f(3))
@@ -1805,21 +2099,23 @@ impl Gles {
                 Ok(0)
             }
             "TexCoord2f" | "TexCoord2x" => {
-                self.current.tex[0] = if name.ends_with('x') {
+                self.current.tex[0] = if is_fixed(name) {
                     [fx(0), fx(1)]
                 } else {
                     [f(0), f(1)]
                 };
                 self.current.tex_r[0] = 0.0;
+                self.current.tex_q[0] = 1.0;
                 Ok(0)
             }
             "TexCoord3f" | "TexCoord3x" => {
-                self.current.tex[0] = if name.ends_with('x') {
+                self.current.tex[0] = if is_fixed(name) {
                     [fx(0), fx(1)]
                 } else {
                     [f(0), f(1)]
                 };
-                self.current.tex_r[0] = if name.ends_with('x') { fx(2) } else { f(2) };
+                self.current.tex_r[0] = if is_fixed(name) { fx(2) } else { f(2) };
+                self.current.tex_q[0] = 1.0;
                 Ok(0)
             }
 
@@ -1833,6 +2129,7 @@ impl Gles {
                     let id = self.next_texture;
                     self.next_texture += 1;
                     self.textures.insert(id, Texture::white());
+                    Gles::note_row(egl, format!("tex GenTextures id={id:#x} img=NO"));
                     if ptr != 0 {
                         mem.write_u32(ptr + i * 4, id)?;
                     }
@@ -1844,11 +2141,21 @@ impl Gles {
                 if !self.check_count(n, MAX_GENERATED_OBJECTS) {
                     return Ok(0);
                 }
+                let mut rebound = false;
                 for i in 0..n {
                     if ptr != 0 {
                         let id = mem.read_u32(ptr + i * 4)?;
                         self.textures.remove(&id);
+                        for unit in 0..self.bound_texture.len() {
+                            if self.bound_texture[unit] == id {
+                                self.bound_texture[unit] = 0;
+                                rebound = true;
+                            }
+                        }
                     }
+                }
+                if rebound {
+                    self.textures.entry(0).or_insert_with(Texture::white);
                 }
                 Ok(0)
             }
@@ -1860,12 +2167,25 @@ impl Gles {
                 let unit = self.active_texture;
                 self.bound_texture[unit] = a(1);
                 self.bound_target[unit] = a(0);
-                if self.bound_texture[unit] != 0
-                    && !self.textures.contains_key(&self.bound_texture[unit])
-                {
+                // Name 0 is the default texture object, not a hole: it gets the same incomplete
+                // placeholder as a generated name so an upload can make it complete.
+                if !self.textures.contains_key(&self.bound_texture[unit]) {
                     self.textures
                         .insert(self.bound_texture[unit], Texture::white());
                 }
+                let img = match self.textures.get(&self.bound_texture[unit]) {
+                    Some(t) if t.uploaded => "yes",
+                    Some(_) => "NO",
+                    None => "none",
+                };
+                Gles::note_row(
+                    egl,
+                    format!(
+                        "tex BindTexture unit={unit} target={:#x} id={:#x} img={img}",
+                        a(0),
+                        self.bound_texture[unit]
+                    ),
+                );
                 Ok(0)
             }
             "TexParameterf" | "TexParameterx" | "TexParameteri" => {
@@ -1899,7 +2219,15 @@ impl Gles {
                 }
                 let (pname, value) = (a(1), a(2));
                 let unit = self.active_texture;
-                let scalar = if name.contains('x') { fx(2) } else { f(2) };
+                let scalar = if is_fixed(name) { fx(2) } else { f(2) };
+                if pname == GL_TEXTURE_ENV_MODE && !is_tex_env_mode(value) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                if is_tex_env_source(pname) && !tex_env_source_accepted(&self.caps, value) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
                 match pname {
                     GL_TEXTURE_ENV_MODE => self.tex_env_mode[unit] = value,
                     GL_COMBINE_RGB => self.combine_rgb[unit] = value,
@@ -1918,7 +2246,10 @@ impl Gles {
                     GL_OPERAND0_ALPHA => self.operand_alpha[unit][0] = value,
                     GL_OPERAND1_ALPHA => self.operand_alpha[unit][1] = value,
                     GL_OPERAND2_ALPHA => self.operand_alpha[unit][2] = value,
-                    _ => {}
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
+                    }
                 }
                 Ok(0)
             }
@@ -1936,7 +2267,7 @@ impl Gles {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -1963,13 +2294,7 @@ impl Gles {
                         return Ok(0);
                     }
                     let unit = self.active_texture;
-                    let id = if self.bound_texture[unit] == 0 {
-                        let id = self.next_texture;
-                        self.next_texture += 1;
-                        id
-                    } else {
-                        self.bound_texture[unit]
-                    };
+                    let id = self.bound_texture[unit];
                     let mut tex = self
                         .textures
                         .get(&id)
@@ -2099,7 +2424,9 @@ impl Gles {
                 if width == 0 || height == 0 {
                     return Ok(0);
                 }
-                let mut rgba = vec![255u8; (width * height * 4) as usize];
+                // A NULL data pointer defines the image's shape, not its colours: inventing a
+                // white image here would turn a missing upload into a white surface.
+                let mut rgba = vec![0u8; (width * height * 4) as usize];
                 if pixels != 0 {
                     rgba = unpack_pixels(
                         mem,
@@ -2112,13 +2439,7 @@ impl Gles {
                     )?;
                 }
                 let unit = self.active_texture;
-                let id = if self.bound_texture[unit] == 0 {
-                    let id = self.next_texture;
-                    self.next_texture += 1;
-                    id
-                } else {
-                    self.bound_texture[unit]
-                };
+                let id = self.bound_texture[unit];
                 let old = self
                     .textures
                     .get(&id)
@@ -2133,7 +2454,12 @@ impl Gles {
                         let count = (width * height * 4) as usize;
                         tex.faces = vec![vec![0u8; count]; 6];
                         tex.faces[face] = rgba.clone();
+                        tex.uploaded = true;
                         if face == 0 {
+                            Gles::note_upload(
+                                egl, "TexImage2D", id, level as u32, width, height, format, ty, pixels,
+                                &rgba,
+                            );
                             tex.rgba = rgba;
                         }
                         tex.levels.clear();
@@ -2173,6 +2499,10 @@ impl Gles {
                 if level == 0 {
                     tex.width = width;
                     tex.height = height;
+                    tex.uploaded = true;
+                    Gles::note_upload(
+                        egl, "TexImage2D", id, level as u32, width, height, format, ty, pixels, &rgba,
+                    );
                     tex.rgba = rgba;
                     tex.levels.clear();
                 } else if level <= 16 {
@@ -2198,7 +2528,7 @@ impl Gles {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
-                if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+                if width > self.caps.max_texture_size || height > self.caps.max_texture_size {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -2219,10 +2549,13 @@ impl Gles {
                     self.unpack_alignment,
                 )?;
                 let unit = self.active_texture;
-                let Some(tex) = self.textures.get_mut(&self.bound_texture[unit]) else {
+                let id = self.bound_texture[unit];
+                let Some(tex) = self.textures.get_mut(&id) else {
+                    self.set_error(GL_INVALID_OPERATION);
                     return Ok(0);
                 };
                 let Some((target_w, target_h, target)) = tex.face_storage(target, level) else {
+                    self.set_error(GL_INVALID_OPERATION);
                     return Ok(0);
                 };
                 for row in 0..height {
@@ -2240,6 +2573,17 @@ impl Gles {
                         target[di..di + 4].copy_from_slice(&sub[si..si + 4]);
                     }
                 }
+                if level == 0 {
+                    tex.uploaded = true;
+                }
+                Gles::note_upload_plain(
+                    egl,
+                    "TexSubImage2D",
+                    id,
+                    &format!(
+                        "level={level} {width}x{height} at {xoffset},{yoffset} fmt={format:#x} type={ty:#x} px={pixels:#010x} img=yes"
+                    ),
+                );
                 Ok(0)
             }
 
@@ -2258,7 +2602,10 @@ impl Gles {
                     return Ok(0);
                 }
                 let vertices = self.read_arrays(first, count, mem)?;
-                self.submit(&vertices, mode, egl, mem)?;
+                self.arm_probe(egl, "DrawArrays", mode, vertices.len());
+                let drawn = self.submit(&vertices, mode, egl, mem);
+                self.finish_probe(egl);
+                drawn?;
                 Ok(0)
             }
             "DrawElements" => {
@@ -2274,16 +2621,26 @@ impl Gles {
                 if !self.check_count(count, MAX_DRAW_COUNT) {
                     return Ok(0);
                 }
+                let index_size = if ty == GL_UNSIGNED_BYTE { 1 } else { 2 };
+                let Some(span) = count.checked_mul(index_size) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(0);
+                };
+                if self.bound_buffer_id[1] != 0 {
+                    let Some(b) = self.buffers.get(&self.bound_buffer_id[1]).copied() else {
+                        self.set_error(GL_INVALID_OPERATION);
+                        return Ok(0);
+                    };
+                    if index_ptr.checked_add(span).map_or(true, |end| end > b.size) {
+                        self.set_error(GL_INVALID_VALUE);
+                        return Ok(0);
+                    }
+                }
                 let indices = if self.bound_buffer[1] != 0 {
                     self.bound_buffer[1] + index_ptr
                 } else {
                     index_ptr
                 };
-                let span = count.checked_mul(2);
-                if span.is_none() || indices.checked_add(span.unwrap()).is_none() {
-                    self.set_error(GL_INVALID_VALUE);
-                    return Ok(0);
-                }
                 let mut verts = Vec::with_capacity(count as usize);
                 for i in 0..count {
                     let at = if ty == GL_UNSIGNED_BYTE {
@@ -2298,7 +2655,10 @@ impl Gles {
                     };
                     verts.extend(self.read_arrays(idx, 1, mem)?);
                 }
-                self.submit(&verts, mode, egl, mem)?;
+                self.arm_probe(egl, "DrawElements", mode, verts.len());
+                let drawn = self.submit(&verts, mode, egl, mem);
+                self.finish_probe(egl);
+                drawn?;
                 Ok(0)
             }
 
@@ -2314,16 +2674,40 @@ impl Gles {
             }
             "TexEnviv" => {
                 let (pname, ptr) = (a(1), a(2));
-                if ptr != 0 {
-                    let v = mem.read_u32(ptr)?;
-                    let unit = self.active_texture;
-                    match pname {
-                        GL_TEXTURE_ENV_MODE => self.tex_env_mode[unit] = v,
-                        GL_COMBINE_RGB => self.combine_rgb[unit] = v,
-                        GL_COMBINE_ALPHA => self.combine_alpha[unit] = v,
-                        GL_RGB_SCALE => self.rgb_scale[unit] = v as f32,
-                        GL_ALPHA_SCALE => self.alpha_scale[unit] = v as f32,
-                        _ => {}
+                if ptr == 0 {
+                    return Ok(0);
+                }
+                let v = mem.read_u32(ptr)?;
+                if pname == GL_TEXTURE_ENV_MODE && !is_tex_env_mode(v) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                if is_tex_env_source(pname) && !tex_env_source_accepted(&self.caps, v) {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                }
+                let unit = self.active_texture;
+                match pname {
+                    GL_TEXTURE_ENV_MODE => self.tex_env_mode[unit] = v,
+                    GL_COMBINE_RGB => self.combine_rgb[unit] = v,
+                    GL_COMBINE_ALPHA => self.combine_alpha[unit] = v,
+                    GL_RGB_SCALE => self.rgb_scale[unit] = v as f32,
+                    GL_ALPHA_SCALE => self.alpha_scale[unit] = v as f32,
+                    GL_SRC0_RGB => self.src_rgb[unit][0] = v,
+                    GL_SRC1_RGB => self.src_rgb[unit][1] = v,
+                    GL_SRC2_RGB => self.src_rgb[unit][2] = v,
+                    GL_SRC0_ALPHA => self.src_alpha[unit][0] = v,
+                    GL_SRC1_ALPHA => self.src_alpha[unit][1] = v,
+                    GL_SRC2_ALPHA => self.src_alpha[unit][2] = v,
+                    GL_OPERAND0_RGB => self.operand_rgb[unit][0] = v,
+                    GL_OPERAND1_RGB => self.operand_rgb[unit][1] = v,
+                    GL_OPERAND2_RGB => self.operand_rgb[unit][2] = v,
+                    GL_OPERAND0_ALPHA => self.operand_alpha[unit][0] = v,
+                    GL_OPERAND1_ALPHA => self.operand_alpha[unit][1] = v,
+                    GL_OPERAND2_ALPHA => self.operand_alpha[unit][2] = v,
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
                     }
                 }
                 Ok(0)
@@ -2358,7 +2742,7 @@ impl Gles {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
-                let ty = if name.contains('x') {
+                let ty = if is_fixed(name) {
                     GL_FIXED
                 } else {
                     GL_FLOAT
@@ -2380,7 +2764,7 @@ impl Gles {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
-                let fixed = name.ends_with('x');
+                let fixed = is_fixed(name);
                 for i in 0..4 {
                     let v = self.clip_planes[plane][i];
                     let word = if fixed {
@@ -2431,13 +2815,18 @@ impl Gles {
                 let slot = match target {
                     GL_ARRAY_BUFFER => 0,
                     GL_ELEMENT_ARRAY_BUFFER => 1,
-                    _ => return Ok(0),
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
+                    }
                 };
                 let id = self.bound_buffer_id[slot];
                 let Some(b) = self.buffers.get(&id).copied() else {
+                    self.set_error(GL_INVALID_OPERATION);
                     return Ok(0);
                 };
                 if data == 0 || offset.checked_add(size).map_or(true, |end| end > b.size) {
+                    self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
                 let bytes = mem.read_bytes(data, size as usize)?;
@@ -2506,7 +2895,11 @@ impl Gles {
             // ---- IGLES11Ext slots ----
             "CurrentPaletteMatrixOES" => {
                 let index = a(0);
-                if index >= 32 {
+                let max = self
+                    .caps
+                    .max_palette_matrices
+                    .min(self.palette_matrices.len() as u32);
+                if index >= max {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -2523,7 +2916,8 @@ impl Gles {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
-                if !(1..=4).contains(&size) {
+                let max = self.caps.max_vertex_units.min(4) as i32;
+                if size < 1 || size > max {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -2541,7 +2935,8 @@ impl Gles {
                     self.set_error(GL_INVALID_ENUM);
                     return Ok(0);
                 }
-                if !(1..=4).contains(&size) {
+                let max = self.caps.max_vertex_units.min(4) as i32;
+                if size < 1 || size > max {
                     self.set_error(GL_INVALID_VALUE);
                     return Ok(0);
                 }
@@ -2647,15 +3042,25 @@ impl Gles {
 
             "TexGenf" | "TexGeni" | "TexGenx" => {
                 let (coord, pname, param) = (a(0), a(1), a(2));
-                let coord = (coord.wrapping_sub(GL_TEXTURE_GEN_S) as usize).min(3);
-                if pname == GL_TEXTURE_GEN_MODE {
-                    self.tex_gen_mode[coord] = param;
+                let Some(coord) = tex_gen_coord(coord) else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                };
+                if pname != GL_TEXTURE_GEN_MODE
+                    || !matches!(param, GL_OBJECT_LINEAR | GL_EYE_LINEAR | GL_SPHERE_MAP)
+                {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
                 }
+                self.tex_gen_mode[coord] = param;
                 Ok(0)
             }
             "TexGenfv" | "TexGeniv" | "TexGenxv" => {
                 let (coord, pname, ptr) = (a(0), a(1), a(2));
-                let coord = (coord.wrapping_sub(GL_TEXTURE_GEN_S) as usize).min(3);
+                let Some(coord) = tex_gen_coord(coord) else {
+                    self.set_error(GL_INVALID_ENUM);
+                    return Ok(0);
+                };
                 let ty = match name {
                     "TexGenfv" => GL_FLOAT,
                     "TexGenxv" => GL_FIXED,
@@ -2664,7 +3069,10 @@ impl Gles {
                 let slot = match pname {
                     GL_OBJECT_PLANE => 0,
                     GL_EYE_PLANE => 1,
-                    _ => return Ok(0),
+                    _ => {
+                        self.set_error(GL_INVALID_ENUM);
+                        return Ok(0);
+                    }
                 };
                 for i in 0..4 {
                     self.tex_gen_plane[coord][slot][i] =
@@ -3043,31 +3451,32 @@ impl Gles {
                 let Some(fb) = self.framebuffers.get(&self.bound_framebuffer) else {
                     return Ok(0);
                 };
-                let (object_type, object_name, level) = match attachment {
+                let (object_type, object_name, level, target) = match attachment {
                     GL_COLOR_ATTACHMENT0_OES => {
                         let is_texture = fb.color != 0;
                         (
                             if is_texture { GL_TEXTURE } else { 0 },
                             fb.color,
                             fb.color_level,
+                            fb.color_target,
                         )
                     }
                     GL_DEPTH_ATTACHMENT_OES => {
                         if let Some((texture, level)) = fb.depth_texture {
-                            (GL_TEXTURE, texture, level)
+                            (GL_TEXTURE, texture, level, fb.depth_target)
                         } else if let Some(rb) = fb.depth {
-                            (GL_RENDERBUFFER_OES, rb, 0)
+                            (GL_RENDERBUFFER_OES, rb, 0, 0)
                         } else {
-                            (0, 0, 0)
+                            (0, 0, 0, 0)
                         }
                     }
                     GL_STENCIL_ATTACHMENT_OES => {
                         if let Some((texture, level)) = fb.stencil_texture {
-                            (GL_TEXTURE, texture, level)
+                            (GL_TEXTURE, texture, level, fb.stencil_target)
                         } else if let Some(rb) = fb.stencil {
-                            (GL_RENDERBUFFER_OES, rb, 0)
+                            (GL_RENDERBUFFER_OES, rb, 0, 0)
                         } else {
-                            (0, 0, 0)
+                            (0, 0, 0, 0)
                         }
                     }
                     _ => return Ok(0),
@@ -3078,10 +3487,16 @@ impl Gles {
                     GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL_OES if object_type == GL_TEXTURE => {
                         level
                     }
+                    // The face exists only when the attachment is a cube map face; a 2D
+                    // attachment answers zero, which is what the enum means rather than "unknown".
                     GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE_OES
                         if object_type == GL_TEXTURE =>
                     {
-                        0
+                        if cube_face(target).is_some() {
+                            target
+                        } else {
+                            0
+                        }
                     }
                     _ => return Ok(0),
                 };
@@ -3163,5 +3578,118 @@ impl Gles {
             // ---- things not implemented yet, answered by name ----
             _ => Ok(crate::abi::generated::AEE_EUNSUPPORTED),
         }
+    }
+}
+
+/// The state slot a `glHint` target names, or `None` for a name the enum does not contain.
+///
+/// The five slots are the whole set the profile accepts: a target outside it is a name error rather
+/// than a quiet no-op, because a pack that asked for something unsupported has to learn that from
+/// `glGetError` instead of from a picture that never changes.
+fn hint_slot(target: u32) -> Option<usize> {
+    match target {
+        GL_PERSPECTIVE_CORRECTION_HINT => Some(0),
+        GL_POINT_SMOOTH_HINT => Some(1),
+        GL_LINE_SMOOTH_HINT => Some(2),
+        GL_FOG_HINT => Some(3),
+        GL_GENERATE_MIPMAP_HINT => Some(4),
+        _ => None,
+    }
+}
+
+/// Which texture coordinate a `glTexGen*` call names.
+///
+/// The four enumerants are contiguous, but clamping anything else into range — which is what a
+/// subtraction and a `min` did here before — turns a name error into a silent write to Q.
+fn tex_gen_coord(coord: u32) -> Option<usize> {
+    match coord {
+        GL_TEXTURE_GEN_S => Some(0),
+        GL_TEXTURE_GEN_T => Some(1),
+        GL_TEXTURE_GEN_R => Some(2),
+        GL_TEXTURE_GEN_Q => Some(3),
+        _ => None,
+    }
+}
+
+/// The modes `GL_TEXTURE_ENV_MODE` accepts, shared by the scalar and integer setters.
+///
+/// Keeping it in one place is what stops the two entry points from disagreeing about whether a
+/// number is a mode at all — which is exactly how a pack ends up with a texture function the
+/// pipeline never applies.
+fn is_tex_env_mode(mode: u32) -> bool {
+    matches!(
+        mode,
+        GL_MODULATE | GL_DECAL | GL_BLEND | GL_REPLACE | GL_COMBINE | GL_ADD
+    )
+}
+
+/// Whether the profile's blend equations reach this one.
+///
+/// `GL_MIN` and `GL_MAX` arrive with `GL_EXT_blend_minmax`. A pack reads `GL_EXTENSIONS` to decide
+/// what it may call, so a profile that does not advertise the extension has to reject them; the
+/// rasteriser already knows how to apply both once they are accepted, which is why the only
+/// question here is whether the string says so.
+fn blend_equation_accepted(caps: &crate::device::GlCaps, equation: u32) -> bool {
+    match equation {
+        GL_FUNC_ADD | GL_FUNC_SUBTRACT | GL_FUNC_REVERSE_SUBTRACT => true,
+        GL_MIN | GL_MAX => caps
+            .extensions
+            .split_ascii_whitespace()
+            .any(|name| name == "GL_EXT_blend_minmax"),
+        _ => false,
+    }
+}
+
+/// Clamp a point size or line width to the range the profile reports.
+///
+/// ES 1.1 makes a size outside the supported range a clamp rather than an error. A device file that
+/// leaves both ends at zero is describing a machine without this GL face at all, so a zero maximum
+/// means "not stated" and the value is kept instead of being squashed to zero.
+fn clamp_to_size_range(value: f32, min: u32, max: u32) -> f32 {
+    if max == 0 {
+        return value;
+    }
+    value.clamp(min as f32, max as f32)
+}
+
+/// Whether a method name is the 16.16 fixed-point form of its float pair.
+///
+/// The pairs end in `f`/`x` or `fv`/`xv`, so the test belongs on the tail. Matching the letter
+/// anywhere looked equivalent until a name like `MultiTexCoord4f` was read as fixed-point because
+/// of the `x` inside `Tex`, which decoded a float's bits as a 16.16 number.
+fn is_fixed(name: &str) -> bool {
+    name.ends_with('x') || name.ends_with("xv")
+}
+
+/// Whether a texture-environment pname is one that names a source.
+fn is_tex_env_source(pname: u32) -> bool {
+    matches!(
+        pname,
+        GL_SRC0_RGB
+            | GL_SRC1_RGB
+            | GL_SRC2_RGB
+            | GL_SRC0_ALPHA
+            | GL_SRC1_ALPHA
+            | GL_SRC2_ALPHA
+    )
+}
+
+/// Whether a `GL_SRCn_*` value names a source this profile accepts.
+///
+/// A numbered source is the crossbar: it reaches another unit's texture, so it needs the extension
+/// in the string and a unit the profile actually has. `GL_PREVIOUS`, `GL_CONSTANT` and the primary
+/// colour are ordinary parts of the combine stage.
+fn tex_env_source_accepted(caps: &crate::device::GlCaps, source: u32) -> bool {
+    match source {
+        GL_TEXTURE | GL_CONSTANT | GL_PRIMARY_COLOR | GL_PREVIOUS => true,
+        GL_TEXTURE0 | GL_TEXTURE1 | GL_TEXTURE2 | GL_TEXTURE3 => {
+            let index = (source - GL_TEXTURE0) as usize;
+            index < caps.max_texture_units as usize
+                && caps
+                    .extensions
+                    .split_ascii_whitespace()
+                    .any(|name| name == "GL_ARB_texture_env_crossbar")
+        }
+        _ => false,
     }
 }

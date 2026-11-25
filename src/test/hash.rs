@@ -111,12 +111,7 @@ fn restart_puts_the_object_back_to_where_it_started() {
 #[test]
 fn only_the_md5_class_builds_an_object() {
     assert!(Hash::born(g::AEECLSID_MD5).is_some());
-    for cls in [
-        g::AEECLSID_SHA1,
-        g::AEECLSID_HMAC_MD5,
-        g::AEECLSID_GL,
-        0,
-    ] {
+    for cls in [g::AEECLSID_SHA1, g::AEECLSID_HMAC_MD5, g::AEECLSID_GL, 0] {
         assert!(
             Hash::born(cls).is_none(),
             "{cls:#010x} is not an MD5 object, and answering it with one would be a wrong answer"

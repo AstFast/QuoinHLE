@@ -40,7 +40,13 @@ impl Runtime {
     /// `IFileMgr::CheckPathAccess` speaks `AEEFP_*`; and `Stat`'s `dwMode` is `FS_S_IF*` where
     /// `AEEFileInfo::attrib` is `FA_*`. Each arm below says which one it is translating, because
     /// getting either wrong hands a pack a value from the wrong table that still looks like a mode.
-    pub(crate) fn ifilesystem(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ifilesystem(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -177,7 +183,13 @@ impl Runtime {
     /// address space. 1024 units is far past any description a handset's UI shows.
     pub(crate) const MAX_DESCRIPTION_UNITS: usize = 1024;
 
-    pub(crate) fn ifilemgr(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ifilemgr(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -389,7 +401,7 @@ impl Runtime {
                 // CFileMgr_GetFreeSpaceEx` scans 235 members and finds 0 definitions and 0 references
                 // (positive controls in the same run: `aee_splitpath` defined 1 / referenced 7,
                 // `AEEFile_IsMIF` defined 1). So the shape below is the header's and this host's, not
-                // something read off an object: free and total in the two parameters, and the path
+                // something taken from an object: free and total in the two parameters, and the path
                 // deciding only whether the question is about something this volume has at all.
                 let [f, total, free] = self.args()?;
                 let asked = self.cstring(f)?;
@@ -582,7 +594,13 @@ impl Runtime {
     ///
     /// `IFILE_Release` is what closes a file, so the record goes with the object in the `Release`
     /// arm; a handle the app never released simply dies with the run.
-    pub(crate) fn ifile(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ifile(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -723,7 +741,7 @@ impl Runtime {
                 // here is the wrong shape of answer even when its value happens to read the same:
                 // `AEE_SUCCESS` is 0 and `AEE_EFAILED` is 1, but the reason this store refused is
                 // `AEE_EREADONLY` = 49, which is neither FALSE nor TRUE. [`file::Volume::truncate`]
-                // keeps that reason where the shipped body keeps its own and answers the boolean.
+                // keeps that reason where the documented behaviour keeps its own and answers the boolean.
                 // (`IFileSystem::Truncate`, which takes a path, is a different slot with a different
                 // answer and is not this one.)
                 let Some(open) = self.files.get_mut(&this) else {
@@ -743,7 +761,7 @@ impl Runtime {
                     return Ok(g::TRUE);
                 }
                 // The three facts come from the handle's own view of the file: `FillConstInfo` for a
-                // shipped entry (`FA_READONLY|FA_CONST`, and the view's own size), the file system for a
+                // reference entry (`FA_READONLY|FA_CONST`, and the view's own size), the file system for a
                 // written one. A name that has left the volume is the body's `CFile_ReOpen(a1, 1) != 0` —
                 // TRUE, **nothing written**, and the error cell still holding somebody else's reason.
                 let Some(name) = self.files.get(&this).map(|open| open.name.clone()) else {
@@ -761,7 +779,7 @@ impl Runtime {
                 // What the guest is being told about the file it just opened, at the offsets
                 // `put_file_info` writes them. A pack that reads this struct through a different layout is
                 // what a wrong answer here would look like from the outside, and the two container formats
-                // in the corpus are the ones whose sizes a run can check against the disk.
+                // in the sample set are the ones whose sizes a run can check against the disk.
                 //
                 // Folded into the notes rather than printed as it happens: a pack that asks for the same
                 // container picture thirty-odd times in one screen buries everything else the run has to say.
@@ -845,7 +863,7 @@ impl Runtime {
                     return Ok(0);
                 }
                 if flags & (g::AEE_FMAP_FIXED | g::AEE_FMAP_PRIVATE) != 0 {
-                    // The shipped gate is one mask, not two: `if ((a5 & 5) != 0) return 0` — `5` is
+                    // The reference gate is one mask, not two: `if ((a5 & 5) != 0) return 0` — `5` is
                     // `AEE_FMAP_FIXED | AEE_FMAP_PRIVATE`, so either bit on its own and both together
                     // are refused the same way, and a note that named `FIXED` for a caller who asked
                     // for `PRIVATE` (the values are `1` and `4`) would be pointing at a bit that was
@@ -874,7 +892,7 @@ impl Runtime {
                 }
                 // There is no fifth gate. `CFile_Map` tests protections once — `if (a4 & 4) return 0`
                 // — so a caller that asks for `0`, for `AEE_FMAP_PROT_NONE` or for execute alone is
-                // answered like one that asked for read: the shipped member has no opinion about which
+                // answered like one that asked for read: the reference member has no opinion about which
                 // of the non-writing bits are set, only that the writing one is not.
                 if flags & g::AEE_FMAP_SHARED == 0 {
                     self.display.note(format!(
@@ -927,7 +945,13 @@ impl Runtime {
     /// that ended on the first stream it could not inflate would report the
     /// class instead of the stream; the reason goes to [`Unzip::problem`] and to the screen's notes,
     /// which is where the file that did not inflate can be read by name.
-    pub(crate) fn iunzipastream(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn iunzipastream(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         if !self.unzip.contains_key(&this) {
             // Not an object this host handed out, so not one whose stream is knowable.
             return Err(HleError::NotAnObject { addr: this });
@@ -940,69 +964,47 @@ impl Runtime {
         let retval = match name {
             "SetStream" => {
                 let [stream] = self.args()?;
-                let mut unzip = self.unzip[&this].clone();
-                unzip.stream = stream;
-                unzip.pos = 0;
-                unzip.bytes.clear();
-                unzip.problem = None;
                 if stream == 0 {
                     // `CUnzipStream_SetStream` wraps its whole body in `if (a2 != nullptr)`: a null
                     // source is ignored rather than unbound, so the stream keeps reading what it
                     // already holds.
                     return Ok(0);
                 }
-                // The stream is named once and read many times, so the inflation happens here
-                // rather than inside `Read`: the caller's first read is already the whole answer,
-                // and a second `SetStream` is what re-points it.
-                match self.files.get(&stream).cloned() {
-                    Some(open) => {
-                        // Everything left in the file from the position its own handle is at, which
-                        // is what pointing an unzip stream at it means.
-                        let left = self
-                            .volume
-                            .info(&open.name)
-                            .map(|i| i.size.saturating_sub(open.pos))
-                            .unwrap_or(0);
-                        let compressed = self.volume.read(&open, left);
-                        match inflate(&compressed) {
-                            Ok(bytes) => unzip.bytes = bytes,
-                            Err(e) => unzip.problem = Some(format!("{}: {e}", open.name)),
-                        }
-                    }
-                    None => {
-                        // Not one of our own `IFile` handles — which is not the same as not being a
-                        // stream. On a handset this slot takes *any* `IStream`, and a pack may hand
-                        // it an `IMemAStream` it built out of a resource it had already loaded. Read
-                        // it through its own vtable, the way `IImage::SetStream` reads one: a host
-                        // that understands only its own file handles answers that pack with zero
-                        // bytes, and said so in a note that blamed the caller's object.
-                        match self.drain_stream(stream) {
-                            Err(e) => unzip.problem = Some(format!("{stream:#010x}: {e}")),
-                            Ok(bytes) => match inflate(&bytes) {
-                                Ok(out) => unzip.bytes = out,
-                                Err(e) => unzip.problem = Some(format!("{stream:#010x}: {e}")),
-                            },
-                        }
-                    }
+                let mut unzip = self.unzip.remove(&this).unwrap_or_default();
+                if unzip.stream == stream && !unzip.inflate.finished {
+                    // The same source object, refilled. A caller that feeds a window at a time does
+                    // this between reads — it puts the next window in the same stream and names it
+                    // again — so the inflater continues where it stopped rather than starting over.
+                    // Once the compressed stream has ended, naming it again is a restart instead,
+                    // which is what a caller reading the same source twice means.
+                    unzip.inflate.source_ended = false;
+                } else {
+                    unzip = Unzip {
+                        stream,
+                        ..Default::default()
+                    };
                 }
-                let problem = unzip.problem.clone();
                 self.unzip.insert(this, unzip);
-                if let Some(problem) = problem {
-                    // The note is the only place the failing stream is named: the object the caller
-                    // reads it through carries no name of its own.
-                    self.display.note(format!("{label}: {problem}"));
-                }
                 0
             }
             "Read" => {
                 let [dst, want] = self.args()?;
-                let unzip = &self.unzip[&this];
-                let start = (unzip.pos as usize).min(unzip.bytes.len());
-                let stop = start.saturating_add(want as usize).min(unzip.bytes.len());
-                let bytes = unzip.bytes[start..stop].to_vec();
-                if dst == 0 || bytes.is_empty() {
+                if dst == 0 || want == 0 {
                     // `IASTREAM_Read` answers a count, and a stream at its end answers zero — the
                     // same answer a failed read gets, exactly as `IFile` does it.
+                    return Ok(0);
+                }
+                self.unzip_pump(this, want as usize)?;
+                let (bytes, first) = match self.unzip.get_mut(&this) {
+                    Some(unzip) => {
+                        let n = unzip.bytes.len().min(want as usize);
+                        let first = unzip.delivered == 0;
+                        unzip.delivered += n;
+                        (unzip.bytes.drain(..n).collect::<Vec<u8>>(), first)
+                    }
+                    None => return Ok(0),
+                };
+                if bytes.is_empty() {
                     return Ok(0);
                 }
                 self.cpu.mem.write_bytes(dst, &bytes)?;
@@ -1010,45 +1012,64 @@ impl Runtime {
                 // module behind this host's back. Its reference area and writable range are facts
                 // the host can report without pretending to relocate it: the pack's entry point
                 // still owns the decision, but a run that never applies the fixup now says so.
-                if start == 0 && bytes.len() >= 0x2c && bytes.get(8..12) == Some(&b"BREW"[..]) {
+                if first && bytes.len() >= 0x2c && bytes.get(8..12) == Some(&b"BREW"[..]) {
                     if let Some(r) = crate::loader::relocation(&bytes) {
                         let refdata = dst.wrapping_add(r.image).wrapping_add(r.ref_off);
                         let writable = refdata.wrapping_add(r.fixup_off);
                         self.display.note(format!(
-                            "{label}: inflated BREW image at {dst:#010x}: refdata {refdata:#010x}, \
-                             fixup_off {:#x}, ref_size {:#x}, writable {writable:#010x}..{:#010x}",
+                            "{label}: inflated BREW image at {dst:#010x}: refdata {refdata:#010x}, fixup_off {:#x}, ref_size {:#x}, writable {writable:#010x}..{:#010x}",
                             r.fixup_off,
                             r.ref_size,
                             writable.wrapping_add(r.ref_size)
                         ));
                     }
                 }
-                let Some(unzip) = self.unzip.get_mut(&this) else {
-                    return Ok(0);
-                };
-                unzip.pos += bytes.len() as u32;
                 bytes.len() as u32
             }
             // `CUnzipStream_Readable` stores the pair and registers it with the source's own
-            // registrar (`+52`, slot 36). This host inflates everything before the first `Read`,
-            // so there is no source left to register with and nothing that could ever fire; the
-            // pair is kept so the call survives.
+            // registrar (`+52`, slot 36). The slot is `void`, so a caller that registers is a
+            // caller that has run out of bytes and has nothing to do until it hears back — and a
+            // source this host already holds is readable the moment it is asked, so the answer is
+            // raised on the next turn instead of never. One guest pack inflates its whole data
+            // set this way: it names a memory stream, registers here, and re-registers every frame
+            // while it waits, so a registration that is never answered leaves it polling a clock
+            // forever with nothing drawn.
+            //
+            // Re-registering replaces the pending notification rather than adding to it: the pair
+            // *is* the registration, and a caller that asks again before the turn that would have
+            // fired it is asking once. That also keeps a pack's per-frame re-registration from
+            // growing the queue without bound.
             "Readable" => {
                 let [pfn, user] = self.args()?;
-                let mut unzip = self.unzip[&this].clone();
-                unzip.notify = pfn;
-                unzip.notify_user = user;
-                self.unzip.insert(this, unzip);
+                let mut raise = false;
+                if let Some(unzip) = self.unzip.get_mut(&this) {
+                    unzip.notify = pfn;
+                    unzip.notify_user = user;
+                    // Nothing left to inflate and nothing buffered means there is nothing to be
+                    // readable *for*; a stream at its end answers a `Read` with zero and has no
+                    // notification to raise, which is how a caller learns it is done.
+                    raise = pfn != 0 && (!unzip.inflate.finished || !unzip.bytes.is_empty());
+                }
+                if raise {
+                    self.dequeue_notify(pfn, user);
+                    self.queue.push_back(Job::Notify { pfn, user });
+                }
                 0
             }
             // `CUnzipStream_Cancel` clears the same pair, then calls the stream's own cancel
             // callback (`+32`). This host has none to call, and clearing is the whole effect the
-            // caller can observe — a `void` slot that used to end the run instead.
+            // caller can observe — a `void` slot that used to end the run instead. A notification
+            // already queued for that pair goes with it, because the caller has just said it is no
+            // longer waiting.
             "Cancel" => {
-                let mut unzip = self.unzip[&this].clone();
-                unzip.notify = 0;
-                unzip.notify_user = 0;
-                self.unzip.insert(this, unzip);
+                if let Some(unzip) = self.unzip.get_mut(&this) {
+                    let (pfn, user) = (unzip.notify, unzip.notify_user);
+                    unzip.notify = 0;
+                    unzip.notify_user = 0;
+                    if pfn != 0 {
+                        self.dequeue_notify(pfn, user);
+                    }
+                }
                 0
             }
             _ => return Err(unimplemented().into()),
@@ -1056,18 +1077,168 @@ impl Runtime {
         Ok(retval)
     }
 
+    /// Drop a `Readable` notification that has not been delivered yet, so a pair can be registered
+    /// once rather than piling up a queue entry per re-registration.
+    ///
+    /// The pair is the registration — `PFNNOTIFY` and its context are the whole of what the caller
+    /// named — so two entries for one pair would be one callback run twice.
+    fn dequeue_notify(&mut self, pfn: u32, user: u32) {
+        self.queue.retain(|job| {
+            !matches!(job, Job::Notify { pfn: p, user: u } if *p == pfn && *u == user)
+        });
+    }
+
+    /// Inflate until there is something to hand out, pulling the source as it goes.
+    ///
+    /// A caller that feeds a window at a time refills the source between reads, so "the source
+    /// answered zero" ends this *attempt* and not the stream: the next `SetStream` on the same
+    /// object clears [`Inflate::source_ended`] and this resumes with the inflater's own state, its
+    /// window and its bit position, still in place.
+    fn unzip_pump(&mut self, this: u32, want: usize) -> HResult<()> {
+        /// How much one pull asks the source for.
+        const CHUNK: u32 = 16 * 1024;
+        loop {
+            self.unzip_step(this)?;
+            let Some(unzip) = self.unzip.get(&this) else {
+                return Ok(());
+            };
+            let (have, finished, ended, stream) = (
+                unzip.bytes.len(),
+                unzip.inflate.finished,
+                unzip.inflate.source_ended,
+                unzip.stream,
+            );
+            if have >= want || finished || ended {
+                let note = match (unzip.problem.clone(), unzip.noted) {
+                    (Some(problem), false) => Some(problem),
+                    _ => None,
+                };
+                if let Some(problem) = note {
+                    if let Some(unzip) = self.unzip.get_mut(&this) {
+                        unzip.noted = true;
+                    }
+                    // The note is the only place a failing stream is named: the object the caller
+                    // reads it through carries no name of its own.
+                    self.display.note(format!("IUnzipAStream: {problem}"));
+                }
+                return Ok(());
+            }
+            let chunk = self.read_stream_chunk(stream, CHUNK)?;
+            let Some(unzip) = self.unzip.get_mut(&this) else {
+                return Ok(());
+            };
+            if chunk.is_empty() {
+                unzip.inflate.source_ended = true;
+            } else if unzip.inflate.dec.is_none() {
+                // Still deciding the wrapper: a gzip header can be longer than one window.
+                unzip.inflate.head.extend_from_slice(&chunk);
+            } else {
+                unzip.inflate.input.extend_from_slice(&chunk);
+            }
+        }
+    }
+
+    /// One step of the inflater: build it once the wrapper is finally known, then run it over the
+    /// input on hand.
+    fn unzip_step(&mut self, this: u32) -> HResult<()> {
+        let Some(unzip) = self.unzip.get_mut(&this) else {
+            return Ok(());
+        };
+        let Unzip {
+            bytes,
+            inflate,
+            problem,
+            ..
+        } = unzip;
+        let Inflate {
+            dec,
+            wrap,
+            input,
+            input_pos,
+            head,
+            finished,
+            retried,
+            produced,
+            ..
+        } = inflate;
+        if *finished {
+            return Ok(());
+        }
+        if dec.is_none() {
+            let Some((kind, skip)) = wrapping(head) else {
+                return Ok(());
+            };
+            *wrap = kind;
+            *input = head.split_off(skip);
+            *input_pos = 0;
+            *dec = Some(Box::new(flate2::Decompress::new(kind == Wrap::Zlib)));
+        }
+        let dec = dec.as_mut().expect("built above when there was none");
+        let mut out = vec![0u8; 64 * 1024];
+        loop {
+            let before_in = dec.total_in();
+            let before_out = dec.total_out();
+            let status = dec.decompress(
+                &input[*input_pos..],
+                &mut out,
+                flate2::FlushDecompress::None,
+            );
+            let used = (dec.total_in() - before_in) as usize;
+            let made = (dec.total_out() - before_out) as usize;
+            *input_pos += used;
+            if made > 0 {
+                *produced += made;
+                bytes.extend_from_slice(&out[..made]);
+            }
+            match status {
+                Ok(flate2::Status::StreamEnd) => {
+                    *finished = true;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    if used == 0 && made == 0 {
+                        // The input on hand is spent; whoever called this pulls more.
+                        return Ok(());
+                    }
+                    if *produced >= INFLATE_CAP {
+                        *problem = Some(format!(
+                            "the stream inflates to {INFLATE_CAP} bytes or more"
+                        ));
+                        *finished = true;
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // A raw deflate stream that happens to begin with a zlib header is the one case
+                    // this decides wrongly, and the alternative gets its turn once — the same
+                    // fallback the one-shot reader this replaced had.
+                    if !*retried && *wrap == Wrap::Zlib && bytes.is_empty() {
+                        *retried = true;
+                        *wrap = Wrap::Raw;
+                        *input_pos = 0;
+                        *dec = Box::new(flate2::Decompress::new(false));
+                        continue;
+                    }
+                    *problem = Some(format!("not a deflate stream: {e}"));
+                    *finished = true;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     /// `AEESoundPlayer_IntSetInfo`'s `SDT_FILE` branch: refuse a blank name, and store an owned copy
     /// of any other.
     ///
-    /// The shipped branch is three statements — `if ( STRCMP((char *)pInfo->pData, "") == 0 ) return
+    /// The reference branch is three statements — `if ( STRCMP((char *)pInfo->pData, "") == 0 ) return
     /// EBADPARM; pme->m_spInfo.pData = STRDUP((char *)pInfo->pData); pme->m_spInfo.dwSize = 0;` —
-    /// and the blank-name operand is the empty string, which the shipped source spells out even
+    /// and the blank-name operand is the empty string, which the published description spells out even
     /// though the delivered object's literal pool could not be read for it. `false` is that
     /// `EBADPARM`, and the copy the record then holds is what `GetInfo` reports and what
     /// `FreeData` frees.
     pub(crate) fn install_file_name(&mut self, player: &mut Player, data: u32) -> HResult<bool> {
         let Ok(name) = self.cstring(data) else {
-            // A name this host cannot read is no name at all; the shipped `STRCMP` would walk off
+            // A name this host cannot read is no name at all; the reference `STRCMP` would walk off
             // the same edge, and there is no answer it could give that a pack could use.
             return Ok(false);
         };
@@ -1092,6 +1263,11 @@ impl Runtime {
         let Some(units) = self.resources.string(file, id) else {
             return Ok(0);
         };
+        // The store's text is Unicode; the control reads it out of guest memory as `AECHAR`, so it
+        // has to be in the device's units like every other string the pack hands it.
+        let units = self
+            .text_encoding()
+            .string_to_units(&TextEncoding::Unicode.units_to_string(&units));
         let room = (units.len() as u32 + 1) * 2;
         let at = self.heap_alloc(room)?;
         if at == 0 {
@@ -1167,7 +1343,7 @@ impl Runtime {
             // `clsid == 0` it "is not provided and is set to 0", so a zero there was the right answer
             // and is not evidence about why any pack quit.
             //
-            // Witnesses, counted rather than remembered: a pack can print `[mod] report: maxmem 0` /
+            // Records, counted rather than remembered: a pack can print `[mod] report: maxmem 0` /
             // `curmem 0` and close its own applet; the pack that asks the accounting slots most has
             // hundreds of `IHeap::GetMemStats` entries on one route and none on another, so the figure
             // belongs to a route and a run, not to the pack.
@@ -1202,7 +1378,7 @@ impl Runtime {
     /// `Mem::heap_high` is how far the heap has ever grown and `Mem::heap_spare` is the sum of its
     /// free nodes, which is where the handed-back space sits. Subtracting one from the other is the
     /// honest "in use now", and both numbers already drive the report line
-    /// (`heap: N KiB in use of the 240 MiB arena`), so this is not a figure invented for an answer.
+    /// (`heap: N KiB in use of the 8 MiB arena`), so this is not a figure invented for an answer.
     /// The heap itself never grows here — its whole span is one free node from `set_heap` — so the
     /// high-water is the span end and this figure counts what is *charged*, headers included.
     ///
@@ -1241,8 +1417,8 @@ impl Runtime {
             let allowance = if cls == 0 {
                 0
             } else {
-                // The whole span this host lets the heap grow into, not what it has grown to:
-                // the run's own `heap_limit` (240 MiB by default) of lazily-paged guest space.
+                // The whole span this host lets the heap grow into, not what it has grown to: the
+                // run's own ceiling (`--heap-mb`, 8 MiB by default) of lazily-paged guest space.
                 self.cpu.mem.heap_limit().saturating_sub(layout::HEAP_BASE)
             };
             self.cpu.mem.write_u32(pmax, allowance)?;
@@ -1260,7 +1436,13 @@ impl Runtime {
     /// is also why this arm returns the runtime's own error type rather than an `HleError`: a
     /// downcall can fail as a guest fault or as a stop the run was asked for, and neither of those is
     /// a gap in the host.
-    pub(crate) fn irscpool(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn irscpool(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1362,6 +1544,13 @@ impl Runtime {
     }
 
     pub(crate) fn resource_ctl_died(&mut self, addr: u32) -> Result<(), Error> {
+        // An OEM controller keeps its state beside the object rather than in `res_ctl`; the last
+        // release is where that entry goes, or a rebuilt controller of the same class would find the
+        // previous one's status waiting for it.
+        if let Some(idx) = self.oem_res_ctl.iter().position(|(obj, _)| *obj == addr) {
+            self.oem_res_ctl.remove(idx);
+            return Ok(());
+        }
         if self.resource_ctl == 0 || addr != self.resource_ctl {
             return Ok(());
         }
@@ -1389,7 +1578,13 @@ impl Runtime {
         true
     }
 
-    pub(crate) fn iapphistory(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn iapphistory(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1586,7 +1781,7 @@ impl Runtime {
                     if key.len() + bytes.len() > HISTORY_MAX_BYTES {
                         return Ok(g::AEE_EBADPARM);
                     }
-                    // Newest first: the shipped body links the fresh node at the head and `GetData`
+                    // Newest first: the documented behaviour links the fresh node at the head and `GetData`
                     // walks from there.
                     entry.data.insert(0, (key, bytes));
                 }
@@ -1674,7 +1869,7 @@ impl Runtime {
                     ));
                     return Ok(g::AEE_SUCCESS);
                 }
-                // Out of the chain, but the record stays: the shipped node lives while its applet
+                // Out of the chain, but the record stays: the reference node lives while its applet
                 // does, which is why a cursor left on one answers 42 and `-1` rather than falling
                 // into the "there is no such entry" path. `AHistory_Unlink` then wakes every model
                 // listener, and its last act is to `App_Close` the applet if no other entry names
@@ -1752,7 +1947,7 @@ impl Runtime {
                 self.history.entries = rest;
                 if at == 0 || n == 0 {
                     self.display.note(format!(
-                        "{label}::Move: moving the head entry ends the shipped body with \
+                        "{label}::Move: moving the head entry ends the platform routine with \
                          AEE_SuspendApps and a resume of every listener; this host has no \
                          suspension to run, so it reordered the chain and wakes the listeners here"
                     ));
@@ -1810,7 +2005,7 @@ impl Runtime {
     }
 
     /// `IFIFO` — the named byte pipe, `AEECLSID_FIFO` (`0x01001046`), thirteen slots read out of
-    /// the delivered body. Both halves of the shipped object are in that one member: the `_IFIFO_*` proxy
+    /// the delivered body. Both halves of the reference object are in that one member: the `_IFIFO_*` proxy
     /// *and* the service it hands its call to (`unpackbridle_AEEFIFO_Read`/`_Write`, `AEEFIFO_Close`), so
     /// the ring, its counts and its wake conditions are measured, not guessed. The bridge hop between
     /// them moved data inside the box; here it does not need to be crossed.
@@ -1821,7 +2016,13 @@ impl Runtime {
     /// grows the ring (shrinking is `AEE_EBADPARM`); and the ring — its bytes included — lives until the
     /// last reader *and* the last writer have closed, because the counts are on the pipe, not on the
     /// handle.
-    pub(crate) fn ififo(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ififo(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1855,7 +2056,7 @@ impl Runtime {
                 };
                 Ok(record.last_error)
             }
-            // `IFIFO_Open` is a URL. The shipped body gets an `IWebUtil` from the shell
+            // `IFIFO_Open` is a URL. The documented behaviour gets an `IWebUtil` from the shell
             // (`QueryInterface(AEECLSID_WEBUTIL)`), calls its `ParseUrl`, and releases it again; this host
             // reaches the same parser directly, because making and dropping an object it already owns
             // would be a detour with no answer at the end of it. What is copied is the rule: the search
@@ -2033,7 +2234,7 @@ impl Runtime {
                 let hold = self.fifo_holds(&pipe_name, read);
                 if hold {
                     // Park it: the wake comes from the other side's `Read`/`Write`, or from the last
-                    // writer going away. The shipped cancel pointer (`IFIFO_CancelReadable`) is a
+                    // writer going away. The reference cancel pointer (`IFIFO_CancelReadable`) is a
                     // function of the runtime's own, which this host has no address space to hand a
                     // pack — so a `CALLBACK_Cancel` here cannot unlink the node.
                     self.fifo_park(&pipe_name, this, read);
@@ -2171,7 +2372,7 @@ impl Runtime {
         let resolved = format!("fs:/{rest}");
         // The permission block: the group test, then the app's own module directory, then the owning
         // module's ACL, then a default ACL literal. Only the second of those is decidable here, and the
-        // host keeps no ACL record to consult — see the note and the entry. The shipped block can answer
+        // host keeps no ACL record to consult — see the note and the entry. The reference block can answer
         // "no bits at all", which would refuse every open with `AEE_EPRIVLEVEL`; this host grants both
         // directions and says so, because a refusal it can only reach through a record it does not have
         // is not a fact about FIFOs.
@@ -2211,7 +2412,7 @@ impl Runtime {
         g::AEE_SUCCESS
     }
 
-    /// Which mode bit the shipped service side tests for the direction asked: read wants `[+0] & 1`,
+    /// Which mode bit the reference service side tests for the direction asked: read wants `[+0] & 1`,
     /// write wants `[+0] & 2`, and a handle opened the other way gets `AEE_EPRIVLEVEL` and `-1`.
     pub(crate) fn fifo_mode(&self, record: &FifoObject, write: bool) -> Result<(), ()> {
         let bit = if write {
@@ -2228,7 +2429,11 @@ impl Runtime {
     /// `unpackbridle_AEEFIFO_Read`, copy included: the bytes taken, whether the pipe was exactly full
     /// beforehand — the body's own test for handing the waiting writers another chance — and whether it
     /// was empty beforehand, which is the only case in which its `-2`/`0` pair is the answer at all.
-    pub(crate) fn fifo_take(&mut self, pipe: &str, want: usize) -> Result<(Vec<u8>, bool, bool), Error> {
+    pub(crate) fn fifo_take(
+        &mut self,
+        pipe: &str,
+        want: usize,
+    ) -> Result<(Vec<u8>, bool, bool), Error> {
         let Some(one) = self.fifos.get_mut(pipe) else {
             return Ok((Vec::new(), false, true));
         };
@@ -2359,7 +2564,11 @@ impl Runtime {
     /// woken — they have nothing left to wait for, and their next read answers `0` instead of `-2`.
     /// The parked nodes are dropped rather than resumed, which is the proxy's own `while (this[+48])
     /// CALLBACK_Cancel` done on this side of the call.
-    pub(crate) fn fifo_shutdown(&mut self, object: u32, record: &mut FifoObject) -> Result<(), Error> {
+    pub(crate) fn fifo_shutdown(
+        &mut self,
+        object: u32,
+        record: &mut FifoObject,
+    ) -> Result<(), Error> {
         let Some(pipe) = record.pipe.clone() else {
             return Ok(());
         };
@@ -2480,5 +2689,62 @@ impl Runtime {
             Err(other) => Err(HleError::Mem(other)),
         }
     }
+}
 
+/// Which wrapper the first bytes name, and how many of them belong to the wrapper rather than to
+/// the deflate stream inside it.
+///
+/// `None` means the bytes on hand are not yet enough to tell — a gzip header can be longer than the
+/// first window a caller hands over — so the pump pulls another window and asks again.
+fn wrapping(head: &[u8]) -> Option<(Wrap, usize)> {
+    if head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+        return gzip_head_len(head).map(|n| (Wrap::Gzip, n));
+    }
+    if head.len() < 2 {
+        return None;
+    }
+    // A zlib header: CMF's low nibble is the compression method (8 = deflate), and the two bytes
+    // together are a multiple of 31.
+    if head[0] & 0x0f == 8 && (u16::from(head[0]) << 8 | u16::from(head[1])) % 31 == 0 {
+        return Some((Wrap::Zlib, 0));
+    }
+    Some((Wrap::Raw, 0))
+}
+
+/// The length of an RFC 1952 gzip header, or `None` while the bytes on hand do not yet cover it.
+///
+/// Parsed here rather than handed to a `GzDecoder` because the deflate that follows goes to a raw
+/// inflater: a decoder that owns the header cannot be stopped mid-stream and handed a second window.
+fn gzip_head_len(b: &[u8]) -> Option<usize> {
+    const FEXTRA: u8 = 0x04;
+    const FNAME: u8 = 0x08;
+    const FCOMMENT: u8 = 0x10;
+    const FHCRC: u8 = 0x02;
+    if b.len() < 10 || b[2] != 8 {
+        return None;
+    }
+    let flags = b[3];
+    let mut at = 10usize;
+    if flags & FEXTRA != 0 {
+        if b.len() < at + 2 {
+            return None;
+        }
+        let xlen = usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+        at += 2 + xlen;
+    }
+    for bit in [FNAME, FCOMMENT] {
+        if flags & bit != 0 {
+            while at < b.len() && b[at] != 0 {
+                at += 1;
+            }
+            if at >= b.len() {
+                return None;
+            }
+            at += 1;
+        }
+    }
+    if flags & FHCRC != 0 {
+        at += 2;
+    }
+    (b.len() >= at).then_some(at)
 }

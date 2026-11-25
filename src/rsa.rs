@@ -25,7 +25,7 @@ pub const PAD_DATA_TOO_LONG: u32 = 109;
 pub const PAD_ROLLBACK: u32 = 115;
 
 /// A magnitude: base-2^32 limbs, least significant first, no leading zero limb. An empty vector is
-/// zero — which is how the shipped code represents it too, since `BIGINT_Create` starts with one zero
+/// zero — which is how the platform code represents it too, since `BIGINT_Create` starts with one zero
 /// word and `BIGINT_RemoveLeadZeroes` trims after every set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Big(Vec<u32>);
@@ -115,7 +115,7 @@ impl Big {
             .is_some_and(|w| w & (1u32 << (index % 32)) != 0)
     }
 
-    /// `BIGINT_Multiply`, sized at `used(a) + used(b)` words like the shipped `BIGINT_Create` call.
+    /// `BIGINT_Multiply`, sized at `used(a) + used(b)` words like the reference `BIGINT_Create` call.
     /// One limb of the multiplier is walked at a time, with the carry pushed along the row: two
     /// 32-bit words multiply into just under 2^64, so the products fit a `u64` — but *accumulating*
     /// them there would not, which is why each row carries as it goes instead of summing first.
@@ -149,9 +149,9 @@ impl Big {
         Self(out)
     }
 
-    /// `BIGINT_Divide`, as restoring long division one bit at a time. The shipped version reaches the
+    /// `BIGINT_Divide`, as restoring long division one bit at a time. The reference version reaches the
     /// same quotient through Montgomery multiplication; the difference is speed, not answer, and this
-    /// host never has to cancel halfway through. `None` is a division by zero, which the shipped body
+    /// host never has to cancel halfway through. `None` is a division by zero, which the documented behaviour
     /// reaches only through `IBN::Div` — not through anything on this interface.
     pub fn divmod(&self, divisor: &Self) -> Option<(Self, Self)> {
         if divisor.is_zero() {
@@ -205,7 +205,7 @@ impl Big {
     }
 
     /// `BIGINT_ModExp` / `BIGINT_ModExpEx`: "square, and multiply by the base where the exponent has a
-    /// bit", walked from the exponent's top bit down, every step reduced. Two shipped details carry
+    /// bit", walked from the exponent's top bit down, every step reduced. Two reference details carry
     /// over: an exponent with **no bits at all** skips the loop and answers the accumulator, so
     /// `x^0 mod m` is `1 mod m` (which is `0` when `m` is `1`); and `BIGINT_ModExp` refuses an even
     /// modulus with `AEE_EBADPARM` before it starts, a rule the only caller on this path has already
@@ -237,7 +237,7 @@ fn room(block_len: usize, data_len: usize) -> bool {
 }
 
 /// `AEE_RSA_padding_add_PKCS1_type_1`: `00 01 <ff…> 00 <data>` across a block of `to.len()` bytes.
-/// Answers `(succeeded, status)`; the shipped return value is 1/0 and every caller here reads the
+/// Answers `(succeeded, status)`; the reference return value is 1/0 and every caller here reads the
 /// status word instead.
 pub fn add_pkcs1_type_1(to: &mut [u8], from: &[u8]) -> (bool, u32) {
     if !room(to.len(), from.len()) {
@@ -283,7 +283,7 @@ pub fn add_pkcs1_type_2(
 /// `block - 11 - data` bytes starting at index 2 — and then the body `memset`s **the same eight bytes
 /// it just randomised** to `03`, puts the zero separator at index 10 and the data at index 11. So on
 /// this runtime the random filler survives only where the run reaches past those eight bytes, which is
-/// what the shipped code does and not what OpenSSL's version does (it writes the `03` run at the end
+/// what the platform code does and not what OpenSSL's version does (it writes the `03` run at the end
 /// of the padding instead).
 pub fn add_sslv23(to: &mut [u8], from: &[u8], random: &mut dyn FnMut(&mut [u8])) -> (bool, u32) {
     if !room(to.len(), from.len()) {
@@ -307,7 +307,7 @@ pub fn add_sslv23(to: &mut [u8], from: &[u8], random: &mut dyn FnMut(&mut [u8]))
 }
 
 /// `AEE_RSA_padding_check_PKCS1_type_1`. `from` is the block **as a number** — the leading `00` of the
-/// padded block is not part of it — so the shipped first gate is `from.len() + 1 == capacity`, and
+/// padded block is not part of it — so the reference first gate is `from.len() + 1 == capacity`, and
 /// `from[0]` is the block-type byte. `to.len()` is the caller's output capacity, which is what the
 /// body tests the data length against (`v10 <= a2`).
 pub fn check_pkcs1_type_1(to: &mut [u8], from: &[u8], capacity: usize) -> (i32, u32) {
@@ -397,7 +397,7 @@ pub fn check_sslv23(to: &mut [u8], from: &[u8], capacity: usize) -> (i32, u32) {
 }
 
 /// `AEE_RSA_padding_check_none`: left-pad the shorter value to the full block with zeros and answer
-/// the block length — the shipped return is `cbTo`, not the length that went in.
+/// the block length — the reference return is `cbTo`, not the length that went in.
 pub fn check_none(to: &mut [u8], from: &[u8]) -> (i32, u32) {
     if from.len() > to.len() {
         return (-1, PAD_DATA_TOO_LONG);
@@ -408,7 +408,7 @@ pub fn check_none(to: &mut [u8], from: &[u8]) -> (i32, u32) {
     (to.len() as i32, 0)
 }
 
-/// `RemovePadding`'s dispatch and its answer rewriting. The shipped body passes `*pcbOut` as the
+/// `RemovePadding`'s dispatch and its answer rewriting. The documented behaviour passes `*pcbOut` as the
 /// output capacity and writes the plaintext length back through that same word, and its own return is
 /// the status word after two rewrites: 115 becomes `AEE_CRYPT_ROLLBACKATTACK`, any other nonzero
 /// becomes `AEE_CRYPT_PAD_ERROR`, and an unknown pad type answers `AEE_CRYPT_INVALID_PADTYPE` without
@@ -442,7 +442,7 @@ pub fn remove_padding(
 /// length byte plus one — the tag and the body up to its last byte), and answer the family's base id
 /// plus that last byte. A miss answers 0.
 ///
-/// The shipped body reads `p[prefix.len()]` unconditionally once a prefix matches, so it takes the
+/// The documented behaviour reads `p[prefix.len()]` unconditionally once a prefix matches, so it takes the
 /// *following* byte from wherever the block continues, not from inside the length the caller named.
 /// This takes it the same way out of the slice it is handed — the caller passes the rest of the block,
 /// which is what the handset was reading — and answers 0 for the one case where the block stops at the
@@ -531,7 +531,7 @@ pub fn sig_type_accepts(sig: u32, id: u32) -> bool {
 
 /// The DigestInfo walk `AEERSA_Done` runs after the padding has been stripped into the same block. The
 /// block is `30 <outer> 30 <inner> 06 <oidlen> <oid…> [05 00] 04 <diglen> <digest…>`, so the byte at
-/// `[3]` is the **inner `AlgorithmIdentifier`'s own length**, and the shipped arithmetic falls out of
+/// `[3]` is the **inner `AlgorithmIdentifier`'s own length**, and the reference arithmetic falls out of
 /// that: the `04 <diglen>` pair sits at `inner + 5` and the digest at `inner + 6`, whether or not a
 /// `NULL` parameter is present (the two shapes differ by exactly those two bytes). Then the caller's
 /// digest has to match, length and bytes.
@@ -563,9 +563,9 @@ pub fn digest_matches(block: &[u8], digest: &[u8]) -> bool {
     digest.len() == dlen as usize && block[at..end] == *digest
 }
 
-/// What one `IRSA` object holds between calls, in the shipped object's words: `[+16]` the modulus,
+/// What one `IRSA` object holds between calls, in the reference object's words: `[+16]` the modulus,
 /// `[+12]` the exponent, `[+92]` the block the operations write into, `[+96]` how big that block is.
-/// The rest of the shipped hundred bytes is either a scratch object that lives and dies inside one
+/// The rest of the reference hundred bytes is either a scratch object that lives and dies inside one
 /// call, or the plumbing of an operation the host does not defer.
 #[derive(Clone, Default)]
 pub struct Rsa {
@@ -583,7 +583,7 @@ pub struct Rsa {
 /// `GetRand`; **nothing on this interface reads those bytes**, because the only rule the check side
 /// applies to them is "the run ends at the first zero, and the part before it is at least eight bytes".
 /// So this host supplies its own, from a counter, and the property the paddings need is what the tests
-/// hold it to. The counter advances on every call, which is also what keeps the shipped
+/// hold it to. The counter advances on every call, which is also what keeps the reference
 /// "ask again for this one zero byte" loop from ever spinning.
 pub fn rand_bytes(out: &mut [u8]) {
     for b in out.iter_mut() {

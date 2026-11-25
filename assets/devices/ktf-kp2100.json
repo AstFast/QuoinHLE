@@ -1,0 +1,108 @@
+{
+  "_note": "KTF BREW 1.2.3 places DIB pixels at object+0x2B; the 3.1.2 default is 0x6B.",
+  "version": "1.0",
+  "screen": {
+    "width": 128,
+    "height": 128,
+    "color_depth": 16,
+    "frame_bpp": 16
+  },
+  "text": {
+    "encoding": 254,
+    "text_bytes": true,
+    "font_normal": 16,
+    "font_large": 32
+  },
+  "loader": {
+    "stack_reserve": 4096,
+    "module_base": 32768
+  },
+  "abi": {
+    "device_info_size": 60,
+    "platform_id": 0,
+    "ktf": true,
+    "dib_pixel_offset": 43,
+    "dib_depth": 32,
+    "graphics_canvas_offset": 20
+  },
+  "input": {
+    "softkey_count": 1
+  },
+  "identity": {
+    "chip_id": "MSM5000",
+    "model_name": "LG-KP2100",
+    "manufacturer": "LG",
+    "friendly_name": "KTF MultiPack",
+    "firmware_version": "BREW/1.2.3",
+    "carrier_id": 0,
+    "subscriber_number": "01000000000"
+  },
+  "system": {
+    "ram": 262144,
+    "object_premap": 1048576,
+    "lang": 538996587,
+    "fs_case_insensitive": true
+  },
+  "capabilities": {
+    "flags": {
+      "alt_display": false,
+      "flip": false,
+      "vibrator": true,
+      "ext_speaker": true,
+      "voice_recognition": false,
+      "position_location": false,
+      "midi": true,
+      "cmx": false,
+      "pen": false
+    },
+    "overlay": {
+      "present": false,
+      "max_overlay": 0,
+      "max_underlay": 0,
+      "max_surface_per_layer": 0,
+      "max_total_surfaces": 0,
+      "pbuffer": false,
+      "pixmap": false
+    },
+    "gl": {
+      "igl": false,
+      "qegl": false,
+      "gles10": false,
+      "gles11": false,
+      "gles10_ext": false,
+      "gles11_ext": false,
+      "gles11_ext_pak": false,
+      "imageon_ext": false,
+      "imageon_ext_v1": false,
+      "vendor": "",
+      "renderer": "",
+      "version": "",
+      "extensions": "",
+      "max_texture_size": 0,
+      "max_texture_max_anisotropy": 0,
+      "max_lights": 0,
+      "max_texture_units": 0,
+      "max_palette_matrices": 0,
+      "max_vertex_units": 0,
+      "max_modelview_stack_depth": 0,
+      "max_projection_stack_depth": 0,
+      "max_texture_stack_depth": 0,
+      "point_size_min": 0,
+      "point_size_max": 0,
+      "line_width_min": 0,
+      "line_width_max": 0,
+      "compressed_texture_formats": [],
+      "subpixel_bits": 0,
+      "red_bits": 0,
+      "green_bits": 0,
+      "blue_bits": 0,
+      "alpha_bits": 0,
+      "depth_bits": 0,
+      "stencil_bits": 0,
+      "max_elements_vertices": 0,
+      "max_elements_indices": 0,
+      "read_format": 0,
+      "read_type": 0
+    }
+  }
+}

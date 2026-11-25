@@ -137,7 +137,7 @@ pub fn load_at(
 
     cpu.mem
         .map(layout::STACK_TOP - layout::STACK_SIZE, layout::STACK_SIZE);
-    cpu.r[13] = layout::STACK_TOP - 8;
+    cpu.r[13] = layout::STACK_TOP - layout::STACK_RESERVE;
     cpu.r[14] = layout::HALT;
     cpu.set_thumb(entry_thumb);
     cpu.pc = base;
@@ -225,7 +225,7 @@ pub fn relocation_describes(r: &Relocation, len: usize) -> bool {
 /// non-zero in the file) — so clearing from `refdata` hands its inflate a
 /// zeroed code-length table, and the app spent a whole start-up deciding its language file was
 /// corrupt. The stream starts at `refdata + FIXUPOFF` and runs for `REFSIZE`, and the end of that
-/// range is the fixup routine itself: on all 14 `BREW`-headered modules in the corpus plus the store
+/// range is the fixup routine itself: on all 14 `BREW`-headered modules in the sample set plus the store
 /// sample, the eight bytes at `refdata + FIXUPOFF + REFSIZE` open with the same instruction word
 /// (`0xe92d00f0`, the `push` that starts the fixup routine), which is what makes the range a fact about
 /// the format rather than a fitted constant.

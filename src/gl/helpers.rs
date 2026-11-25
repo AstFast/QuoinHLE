@@ -93,6 +93,12 @@ pub(crate) fn mix_clip(a: &ClipVertex, b: &ClipVertex, t: f32) -> ClipVertex {
             mix(a.color[2], b.color[2]),
             mix(a.color[3], b.color[3]),
         ],
+        back_color: [
+            mix(a.back_color[0], b.back_color[0]),
+            mix(a.back_color[1], b.back_color[1]),
+            mix(a.back_color[2], b.back_color[2]),
+            mix(a.back_color[3], b.back_color[3]),
+        ],
         tex: [
             [mix(a.tex[0][0], b.tex[0][0]), mix(a.tex[0][1], b.tex[0][1])],
             [mix(a.tex[1][0], b.tex[1][0]), mix(a.tex[1][1], b.tex[1][1])],
@@ -104,6 +110,12 @@ pub(crate) fn mix_clip(a: &ClipVertex, b: &ClipVertex, t: f32) -> ClipVertex {
             mix(a.tex_r[1], b.tex_r[1]),
             mix(a.tex_r[2], b.tex_r[2]),
             mix(a.tex_r[3], b.tex_r[3]),
+        ],
+        tex_q: [
+            mix(a.tex_q[0], b.tex_q[0]),
+            mix(a.tex_q[1], b.tex_q[1]),
+            mix(a.tex_q[2], b.tex_q[2]),
+            mix(a.tex_q[3], b.tex_q[3]),
         ],
         fog: mix(a.fog, b.fog),
         point_size: mix(a.point_size, b.point_size),
@@ -131,6 +143,10 @@ pub(crate) fn stencil_op(value: u8, op: u32, reference: u32, mask: u32) -> u8 {
         GL_REPLACE => reference as u8,
         GL_INCR => value.saturating_add(1),
         GL_DECR => value.saturating_sub(1),
+        // The wrap variants are what GL_EXT_stencil_wrap adds: the counter rolls over instead of
+        // stopping at the end of the range.
+        GL_INCR_WRAP => value.wrapping_add(1),
+        GL_DECR_WRAP => value.wrapping_sub(1),
         GL_INVERT => !value,
         _ => value,
     };
@@ -443,11 +459,17 @@ pub(crate) fn is_compare_func(value: u32) -> bool {
     (GL_NEVER..=GL_ALWAYS).contains(&value)
 }
 
-pub(crate) fn is_stencil_op(value: u32) -> bool {
-    matches!(
-        value,
-        GL_KEEP | GL_ZERO | GL_REPLACE | GL_INCR | GL_DECR | GL_INVERT
-    )
+pub(crate) fn is_stencil_op(value: u32, caps: &crate::device::GlCaps) -> bool {
+    match value {
+        GL_KEEP | GL_ZERO | GL_REPLACE | GL_INCR | GL_DECR | GL_INVERT => true,
+        // The two wrap ops arrive with the extension, and a profile that does not advertise it
+        // must refuse them: the pack reads the string to decide what it may call.
+        GL_INCR_WRAP | GL_DECR_WRAP => caps
+            .extensions
+            .split_ascii_whitespace()
+            .any(|name| name == "GL_EXT_stencil_wrap"),
+        _ => false,
+    }
 }
 
 /// The `(format, type)` pairs `unpack_pixels` can turn into RGBA bytes.

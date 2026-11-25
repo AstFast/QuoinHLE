@@ -1,6 +1,7 @@
 //! EGL display/config/context state and the two EGL faces.
 
 use super::*;
+use crate::device::{GlCaps, OverlayCaps};
 
 pub(crate) struct Config {
     id: u32,
@@ -13,6 +14,30 @@ pub(crate) struct Config {
     /// The surface kinds this config can bind, and the client API it serves.
     surface_type: u32,
     renderable_type: u32,
+    /// The largest pbuffer edge, which follows the profile's texture limit rather than a constant.
+    max_pbuffer: u32,
+}
+
+impl Config {
+    /// The one config this display offers, quoting the bits the device profile reports.
+    ///
+    /// These numbers used to be written by hand here while the GL caps carried a second set, so a
+    /// pack could be told `GL_STENCIL_BITS` was 8 and `EGL_STENCIL_SIZE` was 0 in the same run.
+    /// Deriving both from the profile removes the second answer.
+    fn from_caps(caps: &GlCaps) -> Self {
+        Config {
+            id: 1,
+            red: caps.red_bits,
+            green: caps.green_bits,
+            blue: caps.blue_bits,
+            alpha: caps.alpha_bits,
+            depth: caps.depth_bits,
+            stencil: caps.stencil_bits,
+            surface_type: EGL_WINDOW_BIT | EGL_PIXMAP_BIT | EGL_PBUFFER_BIT,
+            renderable_type: EGL_OPENGL_ES_BIT,
+            max_pbuffer: caps.max_texture_size,
+        }
+    }
 }
 
 fn egl_read_attribs(mem: &Mem, ptr: u32) -> HResult<Vec<(u32, u32)>> {
@@ -66,8 +91,8 @@ fn egl_config_attrib(config: &Config, attr: u32) -> Option<u32> {
         EGL_CONFIG_CAVEAT => EGL_NONE,
         EGL_CONFIG_ID => config.id,
         EGL_LEVEL => 0,
-        EGL_MAX_PBUFFER_PIXELS => 2048 * 2048,
-        EGL_MAX_PBUFFER_WIDTH | EGL_MAX_PBUFFER_HEIGHT => 2048,
+        EGL_MAX_PBUFFER_PIXELS => config.max_pbuffer * config.max_pbuffer,
+        EGL_MAX_PBUFFER_WIDTH | EGL_MAX_PBUFFER_HEIGHT => config.max_pbuffer,
         EGL_NATIVE_RENDERABLE => EGL_FALSE,
         EGL_SAMPLES | EGL_SAMPLE_BUFFERS => 0,
         EGL_SURFACE_TYPE => config.surface_type,
@@ -141,6 +166,81 @@ pub(crate) const PROC_NAMES: &[&str] = &[
     "glBlendFuncSeparateEXT",
 ];
 
+/// The `IEGLSurfaceManip*`, `IEGLOESSwapInterval` and `IEGLGetPowerLevel` state.
+///
+/// These are presentation-side properties of one drawable, not GL state: they survive a context
+/// switch the way the surface does. `blit` reads the rotate/scale/colour-key/transparency fields
+/// when it presents the surface; the overlay bindings are kept for the query calls.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SurfaceManip {
+    scale: bool,
+    scale_src: [i32; 4],
+    scale_dst: [i32; 4],
+    rotate: bool,
+    rot90: bool,
+    hmirror: bool,
+    vmirror: bool,
+    transparency: bool,
+    alpha: i32,
+    alpha_surface: u32,
+    color_key: bool,
+    key: (i32, i32, i32),
+    /// Whether `SurfaceOverlayEnable` turned this surface on at all.
+    overlay: bool,
+}
+
+/// One layer of a composite surface. Negative indices are underlays (drawn before the composite's
+/// own pixels), non-negative ones overlays (drawn after); within each side the smaller index is
+/// nearer the composite's own pixels, so overlays draw in ascending order and underlays in
+/// descending order.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Layer {
+    pub(crate) enabled: bool,
+    /// Draw order within the layer: later bindings cover earlier ones.
+    pub(crate) surfaces: Vec<u32>,
+}
+
+/// The binding a surface has in a composite. A surface has at most one (composite, layer) pair;
+/// `GetSurfaceOverlayBinding` reads it back for the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayerBinding {
+    pub(crate) layer: i32,
+}
+
+/// A composite surface created by `CreateCompositeSurface`: the window it presents into and the
+/// overlay/underlay layers bound to it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Composite {
+    pub(crate) window: u32,
+    pub(crate) layers: HashMap<i32, Layer>,
+    pub(crate) bindings: HashMap<u32, LayerBinding>,
+}
+
+// Layer 0 is the composite's base layer; overlay layers are 1..=max_overlay and underlay
+// layers -1..=-max_underlay. The limits come from [`crate::device::OverlayCaps`] because they
+// are display-controller capabilities, not GLES constants: One handset reports 1/1/16/33, while the
+// W64S firmware does not expose the extension at all.
+
+fn read_rect(mem: &Mem, at: u32) -> HResult<[i32; 4]> {
+    if at == 0 {
+        return Ok([0; 4]);
+    }
+    let mut rect = [0i32; 4];
+    for (i, value) in rect.iter_mut().enumerate() {
+        *value = mem.read_u32(at + 4 * i as u32)? as i32;
+    }
+    Ok(rect)
+}
+
+fn put_rect(mem: &mut Mem, at: u32, rect: [i32; 4]) -> HResult<()> {
+    if at != 0 {
+        for (i, value) in rect.iter().enumerate() {
+            mem.write_u32(at + 4 * i as u32, *value as u32)?;
+        }
+    }
+    Ok(())
+}
+
 /// EGL display/config/context state.
 ///
 /// `method` and `method10` are ABI adapters; the operations they share live in the helpers
@@ -169,6 +269,16 @@ pub struct Egl {
     /// context before the first resumes.
     thread_current: HashMap<u32, (Option<u32>, Option<u32>, Option<u32>)>,
     current_thread: u32,
+    /// Presentation-side state for the EGL extension interfaces, keyed by surface.
+    manip: HashMap<u32, SurfaceManip>,
+    /// Composite surfaces, keyed by the surface `CreateCompositeSurface` returned.
+    composites: HashMap<u32, Composite>,
+    /// Overlay/underlay capabilities from the device profile.
+    pub(crate) overlay: OverlayCaps,
+    /// `--gl-log`'s rows. It lives here rather than in [`Gles`] because a GL context switch
+    /// replaces that whole struct ([`crate::runtime::Runtime::sync_gl_context`]) while the EGL
+    /// state, like the run, is one.
+    pub(crate) gl_log: Option<diag::GlDrawLog>,
 }
 
 impl Default for Egl {
@@ -178,19 +288,19 @@ impl Default for Egl {
 }
 
 impl Egl {
+    /// A display for the software backend's own profile.
     pub fn new() -> Self {
+        Self::with_caps(&GlCaps::all())
+    }
+
+    /// A display whose config quotes `caps`.
+    pub fn with_caps(caps: &GlCaps) -> Self {
+        Self::with_caps_and_overlay(caps, OverlayCaps::default())
+    }
+
+    pub fn with_caps_and_overlay(caps: &GlCaps, overlay: OverlayCaps) -> Self {
         Egl {
-            configs: vec![Config {
-                id: 1,
-                red: 5,
-                green: 6,
-                blue: 5,
-                alpha: 0,
-                depth: 16,
-                stencil: 0,
-                surface_type: EGL_WINDOW_BIT | EGL_PIXMAP_BIT | EGL_PBUFFER_BIT,
-                renderable_type: EGL_OPENGL_ES_BIT,
-            }],
+            configs: vec![Config::from_caps(caps)],
             surfaces: HashMap::new(),
             contexts: HashMap::new(),
             next: 0x5000,
@@ -205,9 +315,14 @@ impl Egl {
             next_share_group: 1,
             thread_current: HashMap::new(),
             current_thread: 0,
+            manip: HashMap::new(),
+            composites: HashMap::new(),
+            overlay,
+            gl_log: None,
         }
     }
 
+    /// Build the EGL state with the overlay capabilities a device profile names.
     /// Switch the EGL current state to a guest thread, saving the state the previous thread
     /// had installed. The runtime calls this around every `run_thread` slice.
     pub(crate) fn select_thread(&mut self, thread: u32) {
@@ -247,6 +362,12 @@ impl Egl {
     pub fn read_surface(&self) -> Option<&Surface> {
         let id = self.current?;
         self.surfaces.get(&id)
+    }
+
+    fn layer_in_range(&self, layer: i32) -> bool {
+        self.overlay.present
+            && layer >= -(self.overlay.max_underlay as i32)
+            && layer <= self.overlay.max_overlay as i32
     }
 
     fn fail(&mut self, code: u32) -> HResult<u32> {
@@ -363,7 +484,7 @@ impl Egl {
         }
     }
 
-    /// The two Qualcomm color-buffer faces. Window/pixmap surfaces return the guest DIB; a
+    /// The two vendor color-buffer faces. Window/pixmap surfaces return the guest DIB; a
     /// pbuffer lazily gets a guest allocation populated from its RGBA plane.
     pub fn color_buffer(&mut self, name: &str, args: &[u32], mem: &mut Mem) -> HResult<u32> {
         let a = |n: usize| args.get(n).copied().unwrap_or(0);
@@ -459,21 +580,40 @@ impl Egl {
     fn create_surface(
         &mut self,
         kind: SurfaceKind,
+        config: u32,
         native: u32,
         attribs: u32,
         mem: &Mem,
         display: &Display,
     ) -> HResult<Option<u32>> {
+        let Some(max_pbuffer) = self
+            .configs
+            .iter()
+            .find(|c| c.id == config)
+            .map(|c| c.max_pbuffer)
+        else {
+            self.error = EGL_BAD_CONFIG;
+            return Ok(None);
+        };
         let (width, height, target) = match kind {
             SurfaceKind::Pbuffer => {
                 let mut width = 64;
                 let mut height = 64;
+                let mut largest = false;
                 for (key, value) in egl_read_attribs(mem, attribs)? {
                     match key {
                         EGL_WIDTH => width = value.max(1),
                         EGL_HEIGHT => height = value.max(1),
+                        EGL_LARGEST_PBUFFER => largest = value != EGL_FALSE,
                         _ => {}
                     }
+                }
+                if largest {
+                    width = width.min(max_pbuffer);
+                    height = height.min(max_pbuffer);
+                } else if width > max_pbuffer || height > max_pbuffer {
+                    self.error = EGL_BAD_ATTRIBUTE;
+                    return Ok(None);
                 }
                 (width, height, None)
             }
@@ -508,6 +648,30 @@ impl Egl {
         if self.read == Some(surface) {
             self.read = None;
         }
+        self.manip.remove(&surface);
+        // A destroyed surface loses its binding in every composite.
+        for c in self.composites.values_mut() {
+            if let Some(binding) = c.bindings.remove(&surface) {
+                if let Some(layer) = c.layers.get_mut(&binding.layer) {
+                    layer.surfaces.retain(|s| *s != surface);
+                }
+            }
+        }
+        // A composite wrapping this window cannot present into it any more; it goes with the
+        // window, and so does its own drawable.
+        let wrapped: Vec<u32> = self
+            .composites
+            .iter()
+            .filter(|(_, c)| c.window == surface)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in wrapped {
+            self.composites.remove(&id);
+            self.surfaces.remove(&id);
+            self.manip.remove(&id);
+        }
+        // Destroying a composite drops its layer table; the bound surfaces stay alive.
+        self.composites.remove(&surface);
     }
 
     fn query_surface(&self, surface: u32, attr: u32) -> Result<u32, u32> {
@@ -713,6 +877,8 @@ impl Egl {
                 self.surfaces.clear();
                 self.contexts.clear();
                 self.share_groups.clear();
+                self.manip.clear();
+                self.composites.clear();
                 Ok(EGL_TRUE)
             }
             "eglGetConfigs" => {
@@ -754,14 +920,16 @@ impl Egl {
                 }
             }
             "eglCreateWindowSurface" | "eglCreatePixmapSurface" => {
-                let Some(id) = self.create_surface(SurfaceKind::Window, a(2), 0, mem, display)?
+                let Some(id) =
+                    self.create_surface(SurfaceKind::Window, a(1), a(2), a(3), mem, display)?
                 else {
                     return Ok(EGL_NO_SURFACE);
                 };
                 Ok(id)
             }
             "eglCreatePbufferSurface" => {
-                let Some(id) = self.create_surface(SurfaceKind::Pbuffer, 0, a(2), mem, display)?
+                let Some(id) =
+                    self.create_surface(SurfaceKind::Pbuffer, a(1), 0, a(2), mem, display)?
                 else {
                     return Ok(EGL_NO_SURFACE);
                 };
@@ -959,14 +1127,15 @@ impl Egl {
             }
             "CreateWindowSurface" | "CreatePixmapSurface" => {
                 let ret = a(4);
-                let created = self.create_surface(SurfaceKind::Window, a(2), 0, mem, display)?;
+                let created =
+                    self.create_surface(SurfaceKind::Window, a(1), a(2), a(3), mem, display)?;
                 put(mem, ret, created.unwrap_or(EGL_NO_SURFACE))?;
                 Ok(0)
             }
             "CreatePbufferSurface" => {
                 let (attribs, ret) = (a(2), a(3));
                 let created =
-                    self.create_surface(SurfaceKind::Pbuffer, 0, attribs, mem, display)?;
+                    self.create_surface(SurfaceKind::Pbuffer, a(1), 0, attribs, mem, display)?;
                 put(mem, ret, created.unwrap_or(EGL_NO_SURFACE))?;
                 Ok(0)
             }
@@ -1062,6 +1231,326 @@ impl Egl {
                 put(mem, ret, EGL_TRUE)?;
                 Ok(0)
             }
+
+            // ---- EGL extension interfaces ------------------------------------------------
+            // `IEGLGetPowerLevel`: the handset has no battery reading here; a fixed full level is
+            // the answer the Q3Dimension layer gives when the query is not backed by hardware.
+            "GetPowerLevel" => {
+                put(mem, a(0), 0)?;
+                Ok(0)
+            }
+            // `IEGLOESSwapInterval`: the interval is display state, not per-context state.
+            "SwapInterval" => {
+                self.swap_interval = a(1) as i32;
+                put(mem, a(2), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSwapInterval" => {
+                put(mem, a(1), self.swap_interval as u32)?;
+                Ok(0)
+            }
+            // `IEGLSurfaceManip_V1`: scale.
+            "SurfaceScaleEnable" => {
+                self.manip.entry(a(1)).or_default().scale = a(2) != 0;
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "SetSurfaceScale" => {
+                let src = read_rect(mem, a(2))?;
+                let dst = read_rect(mem, a(3))?;
+                let m = self.manip.entry(a(1)).or_default();
+                m.scale_src = src;
+                m.scale_dst = dst;
+                put(mem, a(4), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceScale" => {
+                let (enabled, src, dst) = self
+                    .manip
+                    .get(&a(1))
+                    .map(|m| (m.scale, m.scale_src, m.scale_dst))
+                    .unwrap_or_default();
+                put(mem, a(2), if enabled { EGL_TRUE } else { EGL_FALSE })?;
+                put_rect(mem, a(3), src)?;
+                put_rect(mem, a(4), dst)?;
+                put(mem, a(5), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceScaleCaps" => {
+                let param = a(2);
+                if param != 0 {
+                    // 1.0..4.0 in 16.16, 1..4096 pixels. The software blit has no smaller
+                    // hardware limit to report.
+                    let caps = [
+                        1 << 16,
+                        4 << 16,
+                        1 << 16,
+                        4 << 16,
+                        1,
+                        4096,
+                        1,
+                        4096,
+                        1,
+                        4096,
+                        1,
+                        4096u32,
+                    ];
+                    for (i, value) in caps.iter().enumerate() {
+                        mem.write_u32(param + 4 * i as u32, *value)?;
+                    }
+                }
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            // `IEGLSurfaceManip_V1`: rotate and mirror.
+            "SurfaceRotateEnable" => {
+                self.manip.entry(a(1)).or_default().rotate = a(2) != 0;
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "SetSurfaceRotate" => {
+                let m = self.manip.entry(a(1)).or_default();
+                m.rot90 = a(2) != 0;
+                m.hmirror = a(3) != 0;
+                m.vmirror = a(4) != 0;
+                put(mem, a(5), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceRotate" => {
+                let m = self.manip.get(&a(1)).cloned().unwrap_or_default();
+                put(mem, a(2), if m.rotate { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(3), if m.rot90 { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(4), if m.hmirror { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(5), if m.vmirror { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(6), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceRotateCaps" => {
+                put(mem, a(2), EGL_TRUE)?;
+                put(mem, a(3), EGL_TRUE)?;
+                put(mem, a(4), EGL_TRUE)?;
+                put(mem, a(5), EGL_TRUE)?;
+                Ok(0)
+            }
+            // `IEGLSurfaceManip_V1`: constant alpha and an alpha map.
+            "SurfaceTransparencyEnable" => {
+                self.manip.entry(a(1)).or_default().transparency = a(2) != 0;
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "SetSurfaceTransparency" => {
+                self.manip.entry(a(1)).or_default().alpha = a(2) as i32;
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceTransparency" => {
+                let m = self.manip.get(&a(1)).cloned().unwrap_or_default();
+                put(mem, a(2), if m.transparency { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(3), m.alpha as u32)?;
+                put(mem, a(4), EGL_TRUE)?;
+                Ok(0)
+            }
+            "SetSurfaceTransparencyMap" => {
+                self.manip.entry(a(1)).or_default().alpha_surface = a(2);
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceTransparencyMap" => {
+                let m = self.manip.get(&a(1)).cloned().unwrap_or_default();
+                put(
+                    mem,
+                    a(2),
+                    if m.alpha_surface != 0 {
+                        EGL_TRUE
+                    } else {
+                        EGL_FALSE
+                    },
+                )?;
+                put(mem, a(3), m.alpha_surface)?;
+                put(mem, a(4), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceTransparencyCaps" => {
+                put(mem, a(2), EGL_TRUE)?;
+                put(mem, a(3), EGL_TRUE)?;
+                put(mem, a(4), EGL_TRUE)?;
+                put(mem, a(5), EGL_TRUE)?;
+                Ok(0)
+            }
+            // `IEGLSurfaceManip`: colour key.
+            "SurfaceColorKeyEnable" => {
+                self.manip.entry(a(1)).or_default().color_key = a(2) != 0;
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+            "SetSurfaceColorKey" => {
+                let surf = a(1);
+                let (red, green, blue) = (a(2), a(3), a(4));
+                let ok =
+                    red <= 255 && green <= 255 && blue <= 255 && self.surfaces.contains_key(&surf);
+                if ok {
+                    self.manip.entry(surf).or_default().key =
+                        (red as i32, green as i32, blue as i32);
+                }
+                put(mem, a(5), if ok { EGL_TRUE } else { EGL_FALSE })?;
+                Ok(0)
+            }
+            "GetSurfaceColorKey" => {
+                let m = self.manip.get(&a(1)).cloned().unwrap_or_default();
+                put(mem, a(2), if m.color_key { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(3), m.key.0 as u32)?;
+                put(mem, a(4), m.key.1 as u32)?;
+                put(mem, a(5), m.key.2 as u32)?;
+                put(mem, a(6), EGL_TRUE)?;
+                Ok(0)
+            }
+            // `IEGLSurfaceManip`: a composite surface is a pbuffer with the window's dimensions;
+            // overlays are recorded as bindings and reported by the query calls.
+            "CreateCompositeSurface" => {
+                let win = a(1);
+                let (width, height, target) = self
+                    .surfaces
+                    .get(&win)
+                    .map(|s| (s.width, s.height, s.target))
+                    .unwrap_or((64, 64, None));
+                let id = self.alloc();
+                let mut surface = Surface::new(width, height, SurfaceKind::Window);
+                surface.target = target;
+                self.surfaces.insert(id, surface);
+                self.composites.insert(
+                    id,
+                    Composite {
+                        window: win,
+                        layers: HashMap::new(),
+                        bindings: HashMap::new(),
+                    },
+                );
+                put(mem, a(3), id)?;
+                Ok(0)
+            }
+            "SurfaceOverlayEnable" => {
+                let surf = a(1);
+                let enable = a(2);
+                let ok = enable <= 1 && self.surfaces.contains_key(&surf);
+                if ok {
+                    self.manip.entry(surf).or_default().overlay = enable != 0;
+                }
+                put(mem, a(3), if ok { EGL_TRUE } else { EGL_FALSE })?;
+                Ok(0)
+            }
+            "SurfaceOverlayLayerEnable" => {
+                let comp = a(1);
+                let layer = a(2) as i32;
+                let enable = a(3);
+                let ok = enable <= 1
+                    && self.layer_in_range(layer)
+                    && self
+                        .composites
+                        .get_mut(&comp)
+                        .map(|c| {
+                            c.layers.entry(layer).or_default().enabled = enable != 0;
+                            true
+                        })
+                        .unwrap_or(false);
+                put(mem, a(4), if ok { EGL_TRUE } else { EGL_FALSE })?;
+                Ok(0)
+            }
+            "SurfaceOverlayBind" => {
+                let comp = a(1);
+                let surf = a(2);
+                let layer = a(3) as i32;
+                let enable_value = a(4);
+                let enable = enable_value != 0;
+                let mut ok = false;
+                if enable_value <= 1
+                    && self.layer_in_range(layer)
+                    && self.surfaces.contains_key(&surf)
+                {
+                    // A surface has one binding; moving it first detaches the old layer.
+                    for c in self.composites.values_mut() {
+                        if let Some(old) = c.bindings.remove(&surf) {
+                            if let Some(l) = c.layers.get_mut(&old.layer) {
+                                l.surfaces.retain(|s| *s != surf);
+                            }
+                        }
+                    }
+                    if !enable {
+                        ok = true;
+                    } else {
+                        let total: usize = self.composites.values().map(|c| c.bindings.len()).sum();
+                        let on_layer = self
+                            .composites
+                            .get(&comp)
+                            .and_then(|c| c.layers.get(&layer))
+                            .map(|l| l.surfaces.len())
+                            .unwrap_or(0);
+                        if on_layer < self.overlay.max_surface_per_layer as usize
+                            && total < self.overlay.max_total_surfaces as usize
+                        {
+                            if let Some(c) = self.composites.get_mut(&comp) {
+                                c.layers.entry(layer).or_default().surfaces.push(surf);
+                                c.bindings.insert(surf, LayerBinding { layer });
+                                ok = true;
+                            }
+                        }
+                    }
+                }
+                put(mem, a(5), if ok { EGL_TRUE } else { EGL_FALSE })?;
+                Ok(0)
+            }
+            "GetSurfaceOverlayBinding" => {
+                let surf = a(1);
+                let (comp, layer) = self
+                    .composites
+                    .iter()
+                    .find_map(|(comp, c)| c.bindings.get(&surf).map(|b| (*comp, b.layer)))
+                    .unwrap_or((0, 0));
+                put(mem, a(2), comp)?;
+                put(mem, a(3), layer as u32)?;
+                put(mem, a(4), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceOverlay" => {
+                let surf = a(1);
+                let found = self
+                    .composites
+                    .iter()
+                    .find_map(|(comp, c)| c.bindings.get(&surf).map(|b| (*comp, b.layer)));
+                let (layer_enable, surf_enable) = match found {
+                    Some((comp, layer)) => (
+                        self.composites
+                            .get(&comp)
+                            .and_then(|c| c.layers.get(&layer))
+                            .map(|l| l.enabled)
+                            .unwrap_or(false),
+                        self.manip.get(&surf).map(|m| m.overlay).unwrap_or(false),
+                    ),
+                    None => (false, false),
+                };
+                put(mem, a(2), if layer_enable { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(3), if surf_enable { EGL_TRUE } else { EGL_FALSE })?;
+                put(mem, a(4), EGL_TRUE)?;
+                Ok(0)
+            }
+            "GetSurfaceOverlayCaps" => {
+                let param = a(2);
+                if param != 0 {
+                    let caps = [
+                        u32::from(self.overlay.max_overlay),
+                        u32::from(self.overlay.max_underlay),
+                        u32::from(self.overlay.max_surface_per_layer),
+                        u32::from(self.overlay.max_total_surfaces),
+                        self.overlay.pbuffer as u32,
+                        self.overlay.pixmap as u32,
+                    ];
+                    for (i, value) in caps.iter().enumerate() {
+                        mem.write_u32(param + 4 * i as u32, *value)?;
+                    }
+                }
+                put(mem, a(3), EGL_TRUE)?;
+                Ok(0)
+            }
+
             _ => Ok(crate::abi::generated::AEE_EUNSUPPORTED),
         }
     }
@@ -1106,32 +1595,214 @@ impl Egl {
         mem: &mut Mem,
         display: &mut Display,
     ) -> HResult<()> {
+        // A composite presents its own pixels; a window presents its pixels plus every composite
+        // that wraps it. A window can have more than one, so the composite id is the tie-breaker
+        // inside a layer; otherwise the HashMap order would decide what an app sees.
+        let composites: Vec<Composite> = if self.composites.contains_key(&surface) {
+            self.composites.get(&surface).cloned().into_iter().collect()
+        } else {
+            let mut ids: Vec<u32> = self
+                .composites
+                .iter()
+                .filter(|(_, c)| c.window == surface)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort();
+            ids.into_iter()
+                .filter_map(|id| self.composites.get(&id).cloned())
+                .collect()
+        };
+        if composites.is_empty() {
+            return self.draw_surface(surface, target, mem, display);
+        }
+        for layer in -(self.overlay.max_underlay as i32)..=-1 {
+            for composite in &composites {
+                self.draw_layer(composite, layer, target, mem, display)?;
+            }
+        }
+        // Layer 0 is the base layer on the handset: when a surface is bound there it replaces
+        // the composite/window pixels for that presentation. Without one, the composite itself
+        // is the base.
+        let has_base = composites.iter().any(|composite| {
+            composite
+                .layers
+                .get(&0)
+                .map(|layer| {
+                    layer.enabled
+                        && layer.surfaces.iter().any(|surface| {
+                            self.manip.get(surface).map(|m| m.overlay).unwrap_or(false)
+                        })
+                })
+                .unwrap_or(false)
+        });
+        if has_base {
+            for composite in &composites {
+                self.draw_layer(composite, 0, target, mem, display)?;
+            }
+        } else {
+            self.draw_surface(surface, target, mem, display)?;
+        }
+        for layer in 1..=self.overlay.max_overlay as i32 {
+            for composite in &composites {
+                self.draw_layer(composite, layer, target, mem, display)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_layer(
+        &mut self,
+        composite: &Composite,
+        layer: i32,
+        target: u32,
+        mem: &mut Mem,
+        display: &mut Display,
+    ) -> HResult<()> {
+        let Some(layer) = composite.layers.get(&layer) else {
+            return Ok(());
+        };
+        if !layer.enabled {
+            return Ok(());
+        }
+        for surface in &layer.surfaces {
+            if self.manip.get(surface).map(|m| m.overlay).unwrap_or(false) {
+                self.draw_surface(*surface, target, mem, display)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_surface(
+        &mut self,
+        surface: u32,
+        target: u32,
+        mem: &mut Mem,
+        display: &mut Display,
+    ) -> HResult<()> {
         self.flush_color_buffer(surface, mem);
         let Some(s) = self.surfaces.get(&surface) else {
             self.error = EGL_BAD_SURFACE;
             return Ok(());
         };
+        if s.width == 0 || s.height == 0 {
+            return Ok(());
+        }
         let Some(b) = display.bitmap(target) else {
             self.error = EGL_BAD_SURFACE;
             return Ok(());
         };
-        let w = (s.width as u16).min(b.width);
-        let h = (s.height as u16).min(b.height);
+        let m = self.manip.get(&surface).cloned().unwrap_or_default();
+        let (src_x, src_y, sw, sh) = if m.scale {
+            (
+                m.scale_src[0],
+                m.scale_src[1],
+                m.scale_src[2].max(1),
+                m.scale_src[3].max(1),
+            )
+        } else {
+            (0, 0, s.width as i32, s.height as i32)
+        };
+        let (mut dw, mut dh) = if m.scale && m.scale_dst[2] > 0 && m.scale_dst[3] > 0 {
+            (m.scale_dst[2], m.scale_dst[3])
+        } else {
+            (s.width as i32, s.height as i32)
+        };
+        if m.rotate && m.rot90 {
+            std::mem::swap(&mut dw, &mut dh);
+        }
+        let dw = dw.min(b.width as i32).max(0) as u32;
+        let dh = dh.min(b.height as i32).max(0) as u32;
         let bytes = if b.depth >= 32 { 4 } else { 2 };
-        for y in 0..h as u32 {
-            let src_y = s.height - 1 - y;
-            for x in 0..w as u32 {
-                let i = ((src_y * s.width + x) * 4) as usize;
-                let (cr, cg, cb) = (s.rgba[i], s.rgba[i + 1], s.rgba[i + 2]);
-                let addr = (b.px as i64 + y as i64 * b.pitch as i64 + x as i64 * bytes) as u32;
-                if bytes == 4 {
-                    // `IDIB_COLORSCHEME_888` words are `0x00RRGGBB`.
-                    mem.write_u32(addr, ((cr as u32) << 16) | ((cg as u32) << 8) | cb as u32)?;
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let mut lu = if dw > 0 {
+                    dx as i32 * sw / dw as i32
                 } else {
-                    mem.write_u16(addr, pack565(cr, cg, cb) as u32)?;
+                    0
+                };
+                let mut lv = if dh > 0 {
+                    dy as i32 * sh / dh as i32
+                } else {
+                    0
+                };
+                if m.rotate {
+                    if m.rot90 {
+                        let t = lu;
+                        lu = lv;
+                        lv = sh - 1 - t;
+                    }
+                    if m.hmirror {
+                        lu = sw - 1 - lu;
+                    }
+                    if m.vmirror {
+                        lv = sh - 1 - lv;
+                    }
+                }
+                let sx = (src_x + lu).clamp(0, s.width as i32 - 1) as u32;
+                let sy = (src_y + lv).clamp(0, s.height as i32 - 1) as u32;
+                let i = (((s.height - 1 - sy) * s.width + sx) * 4) as usize;
+                let (cr, cg, cb) = (s.rgba[i], s.rgba[i + 1], s.rgba[i + 2]);
+                if m.color_key && (cr as i32, cg as i32, cb as i32) == m.key {
+                    continue;
+                }
+                // The pixel's own alpha is the default source alpha; the explicit transparency
+                // state replaces it, and the alpha map multiplies either one. This is what lets a
+                // layer surface be blended without every layer caller also setting a constant.
+                let mut alpha = if m.transparency {
+                    m.alpha.clamp(0, 255) as u32
+                } else {
+                    s.rgba[i + 3] as u32
+                };
+                if m.alpha_surface != 0 {
+                    if let Some(a) = self.surfaces.get(&m.alpha_surface) {
+                        if a.width > 0 && a.height > 0 {
+                            let ax = sx.min(a.width - 1);
+                            let ay = sy.min(a.height - 1);
+                            let ai = (((a.height - 1 - ay) * a.width + ax) * 4) as usize;
+                            let map = a.rgba.get(ai + 3).copied().unwrap_or(255) as u32;
+                            alpha = alpha * map / 255;
+                        }
+                    }
+                }
+                if alpha == 0 {
+                    continue;
+                }
+                let addr = (b.px as i64 + dy as i64 * b.pitch as i64 + dx as i64 * bytes) as u32;
+                if bytes == 4 {
+                    let (r, g, bl) = if alpha == 255 {
+                        (cr as u32, cg as u32, cb as u32)
+                    } else {
+                        let dst = mem.read_u32(addr)?;
+                        let dr = (dst >> 16) & 0xff;
+                        let dg = (dst >> 8) & 0xff;
+                        let db = dst & 0xff;
+                        (
+                            (cr as u32 * alpha + dr * (255 - alpha)) / 255,
+                            (cg as u32 * alpha + dg * (255 - alpha)) / 255,
+                            (cb as u32 * alpha + db * (255 - alpha)) / 255,
+                        )
+                    };
+                    // `IDIB_COLORSCHEME_888` words are `0x00RRGGBB`.
+                    mem.write_u32(addr, (r << 16) | (g << 8) | bl)?;
+                } else {
+                    let (r, g, bl) = if alpha == 255 {
+                        (cr, cg, cb)
+                    } else {
+                        let dst = mem.read_u16(addr)?;
+                        let dr = ((dst >> 11) & 0x1f) as u32 * 255 / 31;
+                        let dg = ((dst >> 5) & 0x3f) as u32 * 255 / 63;
+                        let db = (dst & 0x1f) as u32 * 255 / 31;
+                        (
+                            ((cr as u32 * alpha + dr * (255 - alpha)) / 255) as u8,
+                            ((cg as u32 * alpha + dg * (255 - alpha)) / 255) as u8,
+                            ((cb as u32 * alpha + db * (255 - alpha)) / 255) as u8,
+                        )
+                    };
+                    mem.write_u16(addr, pack565(r, g, bl) as u32)?;
                 }
             }
         }
+
         Ok(())
     }
 }

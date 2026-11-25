@@ -2,7 +2,7 @@
 //!
 //! The header (`AddRef`, `Release`) and then `Update`/`GetResult`/`Restart`/`SetKey` — and says the class id
 //! handed to `ISHELL_CreateInstance` is what picks the algorithm. This host serves exactly one of
-//! those ids, MD5, because it is the one the corpus asks for: the S7 platform layer behind Sprint
+//! those ids, MD5, because it is the one the sample set asks for: the S7 platform layer behind Sprint
 //! Mail and Mobile Email creates an `AEECLSID_MD5` while it is building its context and treats the
 //! refusal as fatal, so the pack stops on its own "Not enough memory" page with no memory missing.
 //!

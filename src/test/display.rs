@@ -112,9 +112,9 @@ fn a_display_backs_every_depth_its_pixels_are_packed_at() {
 
 #[test]
 fn a_zero_depth_dib_is_an_empty_bitmap_not_a_refusal() {
-    // `IDISPLAY_CreateDIBitmap(..., 0, ...)` is legal on a handset: the shipped 3.1.2
+    // `IDISPLAY_CreateDIBitmap(..., 0, ...)` is legal on a handset: the reference 3.1.2
     // `DIB_NewEx` rejects only a negative nPixelSize and hands back a DIB with nDepth = 0,
-    // nPitch = 0 and no pixels. Six shipped packs in BREW_Collect/BREW ask for exactly that,
+    // nPitch = 0 and no pixels. Six guest packs in the local sample set ask for exactly that,
     // and refusing it stopped each one at its first off-screen bitmap.
     let mut mem = Mem::new();
     mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
@@ -122,7 +122,10 @@ fn a_zero_depth_dib_is_an_empty_bitmap_not_a_refusal() {
     let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
     let obj = d.new_bitmap(&mut mem, &mut hle, 8, 4, 0).unwrap();
     let b = d.bitmap(obj).unwrap();
-    assert_eq!(b.depth, 0, "the object keeps the depth the caller asked for");
+    assert_eq!(
+        b.depth, 0,
+        "the object keeps the depth the caller asked for"
+    );
     assert_eq!(b.pitch, 0, "and there is no row of pixels to stride over");
     let at = |field: &str| abi::offset_of("IDIB", field).expect("IDIB is in the tables");
     assert_eq!(mem.read_u32(obj + at("nDepth")).unwrap() & 0xff, 0);
@@ -139,7 +142,7 @@ fn a_zero_depth_dib_is_an_empty_bitmap_not_a_refusal() {
 
 #[test]
 fn a_bitmap_says_where_its_pixels_are_at_the_published_offset() {
-    // The struct is private to the handset, but its *prefix* is not: a shipped game takes the
+    // The struct is private to the handset, but its *prefix* is not: a guest game takes the
     // pointer `CONVERTBMP` hands back, reads the word at +8 and writes pixels straight through
     // it. An object that ends at the refcount gives that read the next object's first word, and
     // the game then stores into `NULL[40217]`, which is what a null without this reads as.
@@ -302,6 +305,35 @@ fn an_update_made_while_a_dib_is_the_destination_takes_no_screen() {
     );
 }
 
+/// Carrier packs read the firmware's private screen-info record instead of calling
+/// `IDisplay_GetDeviceBitmap`: `IDisplay+0x70` points at a block whose `+4` is width, `+6` is
+/// height and `+0xc` is the framebuffer. ds2brew dereferenced an eight-byte handle there and
+/// faulted at `0x4`; the record has to exist and follow the destination.
+#[test]
+fn a_pack_can_read_the_displays_private_screen_info() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+
+    let info = mem.read_u32(disp + 0x70).unwrap();
+    assert_eq!(info, disp + 0x74, "the firmware's +0x70 word names the record");
+    let wh = mem.read_u32(info + 4).unwrap();
+    assert_eq!(wh & 0xffff, 8, "width");
+    assert_eq!(wh >> 16, 4, "height");
+    assert_eq!(mem.read_u32(info + 0xc).unwrap(), d.device.px);
+
+    // Rebinding the destination moves the framebuffer word with it; a pack that cached the
+    // record reads the surface the display actually draws into.
+    let dib = d.new_bitmap(&mut mem, &mut hle, 4, 2, 16).unwrap();
+    d.set_destination(&mut mem, &mut hle, disp, dib).unwrap();
+    assert_eq!(
+        mem.read_u32(info + 0xc).unwrap(),
+        d.bitmap(dib).unwrap().px
+    );
+}
+
 #[test]
 fn an_app_that_restates_the_dib_owns_what_the_host_draws_with() {
     // The header publishes the geometry as data, and a pack takes that licence: it points `pBmp` at
@@ -439,7 +471,7 @@ fn a_four_bit_byte_carries_its_left_pixel_in_the_high_nibble() {
 #[test]
 fn a_palette_word_names_its_colour_the_way_the_header_does() {
     // Which of the two three-byte rotations `IDIB::pRGB` is written in is the difference between
-    // a pack's screen and its mirror image, so it is pinned against bytes a shipped pack really
+    // a pack's screen and its mirror image, so it is pinned against bytes a guest pack really
     // puts in memory. Dragon's HUD sheet holds `f1 d2 a1 00` at one index — the word
     // `0x00a1d2f1`. Read as `0x00RRGGBB` that is `(161,210,241)`, and the handset at those 94
     // pixels shows `(164,210,238)`; read as the bytes `R,G,B` it is the warm `(241,210,161)` that
@@ -517,7 +549,7 @@ fn a_colour_asked_of_a_palettized_bitmap_is_answered_in_its_own_table() {
         "a near-black asked of a table that holds black lands on black, not on the ramp"
     );
     // A bitmap that never got its own colours keeps the default mapping, which is every other pack
-    // in the corpus. Asserted as the round trip rather than the index, because what the host owes
+    // in the sample set. Asserted as the round trip rather than the index, because what the host owes
     // the caller is the entry that *means* the colour asked for.
     let plain = d.new_bitmap(&mut mem, &mut hle, 4, 4, 8).unwrap();
     let answered = d
@@ -829,7 +861,7 @@ fn scale_2_doubles_the_rectangle_about_its_own_centre() {
 #[test]
 fn scale_half_takes_every_other_source_pixel() {
     // The shrink is the same pair of rules read backwards: half the destination, and the source
-    // cursor stepping two pixels per destination pixel instead of holding. Melange advances its
+    // cursor stepping two pixels per destination pixel instead of holding. a reference front end advances its
     // source pointer by `den` and never looks at the pixels it skipped, so a downscale drops the
     // odd columns rather than averaging them away.
     let mut mem = Mem::new();
@@ -938,7 +970,7 @@ fn a_shrink_to_nothing_says_so() {
 
 /// A coverage map is sampled only while it still matches the picture it was made for.
 ///
-/// `Display::sync_bitmap` re-reads `cx`/`cy` from guest memory before every blit, because shipped
+/// `Display::sync_bitmap` re-reads `cx`/`cy` from guest memory before every blit, because reference
 /// packs do restate their own `IDIB` headers. A map indexed by the width it was built for would then
 /// put row `y` of one picture on row `y` of another, and the pixels that lost coverage would be the
 /// ones nothing painted — the unreadable kind of wrong. Dropping the map is the answer that cannot
@@ -1250,7 +1282,12 @@ fn a_one_bit_screenshot_reads_eight_pixels_a_byte_from_the_top() {
     mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
     let mut hle = Hle::new();
     let mut d = Display::new(&mut mem, &mut hle, 8, 1, 1).unwrap();
-    with_palette(&mut d, &mut mem, &[(0, 0, 0), (255, 255, 255)], &[0b1000_0001]);
+    with_palette(
+        &mut d,
+        &mut mem,
+        &[(0, 0, 0), (255, 255, 255)],
+        &[0b1000_0001],
+    );
 
     let mut want = vec![0u8; 8 * 3];
     want[..3].copy_from_slice(&[255, 255, 255]);
@@ -1353,7 +1390,10 @@ fn a_colour_drawn_into_a_palettized_bitmap_lands_on_the_entry_that_names_it() {
         .unwrap();
 
     let bytes: Vec<u8> = (0..8).map(|i| mem.read_u8(b.px + i).unwrap()).collect();
-    assert_eq!(bytes, [1u8; 8], "the entry that names green, not the ramp's");
+    assert_eq!(
+        bytes, [1u8; 8],
+        "the entry that names green, not the ramp's"
+    );
     assert_ne!(
         native_to_index8(green),
         1,
@@ -1362,7 +1402,7 @@ fn a_colour_drawn_into_a_palettized_bitmap_lands_on_the_entry_that_names_it() {
 }
 
 /// `IBITMAP_Invalidate` is `FillRect(po, prc, 0, AEE_RO_TRANSPARENT)`, and
-/// the shipped OEM bitmap's `FillRect` answers `case AEE_RO_TRANSPARENT: return SUCCESS;` — nothing
+/// the reference OEM bitmap's `FillRect` answers `case AEE_RO_TRANSPARENT: return SUCCESS;` — nothing
 /// drawn (the inline `FillRect`, which `OEMBitmap_FillRect`
 /// ends by calling). That is what makes an invalidate a way to widen a
 /// dirty rectangle rather than a way to paint the rectangle black.
@@ -1414,7 +1454,7 @@ fn an_invalidate_paints_nothing_and_never_resolves_the_colour() {
 }
 
 /// The four `IBitmap` slots that take a colour do not agree about `AEE_RO_TRANSPARENT`, and the
-/// shipped source is the witness: `FillRect`, `DrawPixel` and `DrawHScanline` answer `SUCCESS` and
+/// published description is the record: `FillRect`, `DrawPixel` and `DrawHScanline` answer `SUCCESS` and
 /// paint nothing (the last by delegating to
 /// `FillRect`), while `SetPixels` has no arm for it and falls into `default: return EUNSUPPORTED;`.
 /// Answering `SUCCESS` there would tell a pack the points were laid down.
@@ -1536,8 +1576,14 @@ fn a_colour_the_table_does_not_hold_takes_the_nearest_entry() {
     with_palette(&mut d, &mut mem, &[(255, 0, 0), (0, 0, 255)], &[0, 0]);
 
     let b = d.device;
-    d.fill(&mut mem, &b, Rect::new(0, 0, 2, 1), rgb_to_native(make_rgb(200, 20, 30)), g::AEE_RO_COPY)
-        .unwrap();
+    d.fill(
+        &mut mem,
+        &b,
+        Rect::new(0, 0, 2, 1),
+        rgb_to_native(make_rgb(200, 20, 30)),
+        g::AEE_RO_COPY,
+    )
+    .unwrap();
     assert_eq!(
         [mem.read_u8(b.px).unwrap(), mem.read_u8(b.px + 1).unwrap()],
         [0, 0],
@@ -1574,7 +1620,8 @@ fn a_drawn_index_survives_a_read_back() {
             "the table names this colour at {i}"
         );
         let (x, y) = ((i % 4) as i32, (i / 4) as i32);
-        d.put(&mut mem, &b, x, y, native, g::AEE_RO_COPY, None).unwrap();
+        d.put(&mut mem, &b, x, y, native, g::AEE_RO_COPY, None)
+            .unwrap();
         assert_eq!(
             mem.read_u8(b.at(x as u32, y as u32)).unwrap(),
             i as u8,
@@ -1600,13 +1647,18 @@ fn a_four_bpp_bitmap_keeps_the_index_inside_its_nibble() {
     with_palette(&mut d, &mut mem, &colours, &[0; 2]);
 
     let b = d.device;
-    d.fill(&mut mem, &b, Rect::new(1, 0, 1, 1), rgb_to_native(make_rgb(colours[12].0, colours[12].1, colours[12].2)), g::AEE_RO_COPY)
-        .unwrap();
+    d.fill(
+        &mut mem,
+        &b,
+        Rect::new(1, 0, 1, 1),
+        rgb_to_native(make_rgb(colours[12].0, colours[12].1, colours[12].2)),
+        g::AEE_RO_COPY,
+    )
+    .unwrap();
     let byte = mem.read_u8(b.px).unwrap();
     assert_eq!(byte >> 4, 0, "the pixel at x = 0 is untouched");
     assert_eq!(byte & 0x0f, 12, "and the odd pixel holds index 12");
 }
-
 
 #[test]
 fn an_inverted_palettized_rectangle_lands_on_the_entry_nearest_its_complement() {
@@ -1652,14 +1704,19 @@ fn a_pixel_read_through_the_bitmap_slot_is_the_value_that_was_written() {
     d.bitmaps.insert(dst, d.device);
 
     // `IBitmap::DrawPixel(po, 1, 0, 3, AEE_RO_COPY)`: index 3, which is yellow here.
-    d.draw_pixel(&mut mem, dst, 1, 0, 3, g::AEE_RO_COPY).unwrap();
+    d.draw_pixel(&mut mem, dst, 1, 0, 3, g::AEE_RO_COPY)
+        .unwrap();
     let out = mem.alloc(4, 4).unwrap();
     assert_eq!(
         d.get_pixel(&mut mem, dst, 1, 0, out).unwrap(),
         g::AEE_SUCCESS
     );
     let b = d.bitmap(dst).unwrap();
-    assert_eq!(mem.read_u32(out).unwrap(), 3, "the index, not the colour it names");
+    assert_eq!(
+        mem.read_u32(out).unwrap(),
+        3,
+        "the index, not the colour it names"
+    );
     assert_eq!(
         read_pixel(&mem, &b, 1, 0).unwrap().unwrap(),
         rgb_to_native(make_rgb(255, 255, 0)),
@@ -1684,10 +1741,7 @@ fn the_transparency_key_a_pack_writes_is_the_number_it_reads_back() {
     // are never two calls in a row on this record — there is a re-read from the header between them.
     let made = d.new_bitmap(&mut mem, &mut hle, 2, 1, 8).unwrap();
 
-    assert_eq!(
-        d.transparency(&mut mem, made, 2).unwrap(),
-        g::AEE_SUCCESS
-    );
+    assert_eq!(d.transparency(&mut mem, made, 2).unwrap(), g::AEE_SUCCESS);
     d.sync_bitmap(&mem, made).unwrap();
     let out = mem.alloc(4, 4).unwrap();
     d.get_transparency(&mut mem, made, out).unwrap();
@@ -1744,18 +1798,25 @@ fn a_one_bit_pixel_complements_inside_its_own_bit() {
     mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
     let mut hle = Hle::new();
     let mut d = Display::new(&mut mem, &mut hle, 8, 1, 1).unwrap();
-    with_palette(&mut d, &mut mem, &[(0, 0, 0), (255, 255, 255)], &[0b1010_0000]);
+    with_palette(
+        &mut d,
+        &mut mem,
+        &[(0, 0, 0), (255, 255, 255)],
+        &[0b1010_0000],
+    );
     let b = d.device;
 
     let white = rgb_to_native(make_rgb(255, 255, 255));
-    d.put(&mut mem, &b, 0, 0, white, g::AEE_RO_NOT, None).unwrap();
+    d.put(&mut mem, &b, 0, 0, white, g::AEE_RO_NOT, None)
+        .unwrap();
     assert_eq!(
         mem.read_u8(b.px).unwrap(),
         0b0010_0000,
         "the pixel that was set is cleared, and the others are not touched"
     );
     let black = rgb_to_native(make_rgb(0, 0, 0));
-    d.put(&mut mem, &b, 0, 0, black, g::AEE_RO_NOT, None).unwrap();
+    d.put(&mut mem, &b, 0, 0, black, g::AEE_RO_NOT, None)
+        .unwrap();
     assert_eq!(
         mem.read_u8(b.px).unwrap(),
         0b1010_0000,
@@ -1779,14 +1840,22 @@ fn a_depth_neither_packed_nor_the_screens_is_not_read_through_the_palette() {
     let mut b = d.device;
 
     let red = rgb_to_native(make_rgb(255, 0, 0));
-    assert_eq!(b.stored(&mem, red).unwrap(), red, "the screen keeps the word");
+    assert_eq!(
+        b.stored(&mem, red).unwrap(),
+        red,
+        "the screen keeps the word"
+    );
     b.depth = 12;
     assert_eq!(
         b.stored(&mem, red).unwrap(),
         red,
         "and so does a depth the guest restated"
     );
-    assert_eq!(b.colour_of_pixel(&mem, red).unwrap(), red, "in both directions");
+    assert_eq!(
+        b.colour_of_pixel(&mem, red).unwrap(),
+        red,
+        "in both directions"
+    );
     b.depth = 8;
     assert_eq!(
         b.stored(&mem, red).unwrap(),
@@ -1883,7 +1952,10 @@ fn a_blit_keys_on_the_index_not_on_the_colour_it_names() {
     )
     .unwrap();
     assert_eq!(
-        [mem.read_u8(dst.px).unwrap(), mem.read_u8(dst.px + 1).unwrap()],
+        [
+            mem.read_u8(dst.px).unwrap(),
+            mem.read_u8(dst.px + 1).unwrap()
+        ],
         [1, 0],
         "now 3 is the key and 0 is not"
     );
@@ -2356,7 +2428,6 @@ fn a_point_list_off_the_bitmap_never_reads_the_palette() {
     );
 }
 
-
 #[test]
 fn ibitmap_slots_that_paint_nothing_never_read_the_palette() {
     // `fill_rect` gets this from `Rect::clipped`; the two slots here have no rectangle to clip, so
@@ -2489,7 +2560,7 @@ fn a_transparent_blit_never_filters_on_the_destinations_key() {
 fn a_transformed_transparent_blit_still_keys_on_the_source() {
     // §7.3d/§7.3f say the transform paths do the same two things as `copy`: keep the caller's op
     // for `source_pixel` (which asks the source's key) and hand the write a plain COPY. No
-    // `transform_in` test used `AEE_RO_TRANSPARENT` before this one, so those claims had no witness.
+    // `transform_in` test used `AEE_RO_TRANSPARENT` before this one, so those claims had no record.
     let mut mem = Mem::new();
     mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
     let mut hle = Hle::new();
@@ -2792,9 +2863,7 @@ fn a_draw_rect_reads_the_live_display_colour_table() {
 
     // And an unknown display is still refused, even for a flag combination that draws nothing:
     // the state lookup deliberately happens before the early returns.
-    assert!(d
-        .draw_rect(&mut mem, 0xdead_beef, 0, 0, 0, 0)
-        .is_err());
+    assert!(d.draw_rect(&mut mem, 0xdead_beef, 0, 0, 0, 0).is_err());
 }
 
 /// The display hot path resolves `AEERect` / `IDIB` field offsets once instead of walking the
@@ -3002,4 +3071,596 @@ fn a_blit_larger_than_its_source_paints_only_the_intersection() {
     };
     run(g::AEE_RO_COPY, 0xffff_ffff);
     run(g::AEE_RO_TRANSPARENT, 0x1001); // the second source pixel is the colour key
+}
+
+/// The units a pack passes to `DrawText` are in the handset's encoding, not Unicode. The same
+/// buffer is two different strings depending on what the device advertised, and the report and the
+/// glyph lookup both follow that answer.
+#[test]
+fn a_shift_jis_unit_run_is_decoded_before_it_is_measured_and_drawn() {
+    use crate::makebbf::Cell;
+
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 64, 32, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+
+    // A face keyed by the handset's own units: the in-memory word for は is 0xcd82 (its bytes are
+    // `82 cd`), with one pixel of ink in the middle.
+    let side = 16usize;
+    let mut ink = vec![false; side * side];
+    ink[8 * side + 8] = true;
+    let blank = vec![false; side * side];
+    let cells = vec![
+        Cell {
+            ch: 0x20,
+            width: 16,
+            ink: blank.clone(),
+        },
+        Cell {
+            ch: 0x41,
+            width: 16,
+            ink: blank,
+        },
+        Cell {
+            ch: 0xcd82,
+            width: 16,
+            ink,
+        },
+    ];
+    let bytes = crate::makebbf::encode(&cells, 16, 4, 0x80);
+    let face = crate::font::Face::Bbf(std::sync::Arc::new(
+        crate::bbf::Bbf::parse(&bytes)
+            .expect("the encoder's own output")
+            .with_key_space(crate::bbf::KeySpace::Device),
+    ));
+    d.install_face(g::AEE_FONT_NORMAL, face);
+
+    let at = mem.alloc(4, 2).unwrap();
+    mem.write_u16(at, 0xcd82).unwrap();
+    mem.write_u16(at + 2, 0).unwrap();
+
+    d.set_encoding(crate::encoding::TextEncoding::Sjis);
+    d.draw_text(
+        &mut mem,
+        disp,
+        g::AEE_FONT_NORMAL,
+        at,
+        -1,
+        0,
+        0,
+        0,
+        g::IDF_ALIGN_TOP,
+    )
+    .unwrap();
+    let run = d.runs.last().expect("the run was recorded");
+    assert_eq!(
+        run.text, "は",
+        "the report names the character, not the unit"
+    );
+    assert_eq!(run.width, 16, "one cell, stepped by the face's own advance");
+
+    // The same word on a device that says its units are Unicode is the code point 0xcd82.
+    d.set_encoding(crate::encoding::TextEncoding::Unicode);
+    d.draw_text(
+        &mut mem,
+        disp,
+        g::AEE_FONT_NORMAL,
+        at,
+        -1,
+        0,
+        0,
+        0,
+        g::IDF_ALIGN_TOP,
+    )
+    .unwrap();
+    assert_eq!(
+        d.runs.last().unwrap().text,
+        "\u{cd82}",
+        "the unit is read as what the device said it was"
+    );
+}
+
+/// A BREW 1.x `IDisplay::DrawText` carries the device's own 8-bit string in `pcText`; a 4.0.x
+/// one carries `AECHAR` units. Reading the old slot as units turns `"V1.0.0"` into three
+/// replacement characters, which is what the Carrier packs showed.
+#[test]
+fn a_brew_1_2_narrow_draw_text_is_read_as_the_devices_bytes() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 64, 32, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    d.set_encoding(crate::encoding::TextEncoding::EucKr);
+    d.set_text_bytes(true);
+
+    let at = mem.alloc(8, 1).unwrap();
+    mem.write_bytes(at, b"V1.0.0\0").unwrap();
+    d.draw_text(
+        &mut mem,
+        disp,
+        g::AEE_FONT_NORMAL,
+        at,
+        -1,
+        0,
+        0,
+        0,
+        g::IDF_ALIGN_TOP,
+    )
+    .unwrap();
+    assert_eq!(d.runs.last().unwrap().text, "V1.0.0");
+
+    // A KSC5601 word is decoded from its two bytes, not read as one 16-bit unit.
+    mem.write_bytes(at, b"\xb0\xa1\0").unwrap();
+    d.draw_text(
+        &mut mem,
+        disp,
+        g::AEE_FONT_NORMAL,
+        at,
+        -1,
+        0,
+        0,
+        0,
+        g::IDF_ALIGN_TOP,
+    )
+    .unwrap();
+    assert_eq!(d.runs.last().unwrap().text, "가");
+}
+
+/// An italic designator uses the CJK face installed under the upright designator, not the built-in
+/// 5x8 grid: the fallback happens inside [`Faces::face`], so measure and paint see the same face.
+#[test]
+fn an_italic_designator_falls_back_to_the_installed_upright_face() {
+    use crate::makebbf::Cell;
+
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 64, 32, 16).unwrap();
+
+    let side = 8usize;
+    let cells = vec![Cell {
+        ch: 0x41,
+        width: 8,
+        ink: vec![false; side * side],
+    }];
+    let bytes = crate::makebbf::encode(&cells, 8, 2, 0x80);
+    let face = crate::font::Face::Bbf(std::sync::Arc::new(
+        crate::bbf::Bbf::parse(&bytes).expect("the encoder's own output"),
+    ));
+    d.install_face(g::AEE_FONT_NORMAL, face);
+
+    let italic = d.face(g::AEE_FONT_ITALIC).expect("italic falls back");
+    assert!(
+        matches!(italic, crate::font::Face::Bbf(_)),
+        "the installed CJK face, not the built-in grid"
+    );
+    assert_eq!(
+        italic.advance_of_char('A', crate::encoding::TextEncoding::Unicode),
+        4,
+        "a half-width cell from the installed face"
+    );
+}
+
+/// A 32-bpp bitmap is a real surface: four bytes a pixel, `0x00RRGGBB` words, and
+/// `IDIB_COLORSCHEME_888` in the header. The canonical 565 colour is the boundary drawing code
+/// speaks; the stored word is what the guest reads with `GetPixel`.
+#[test]
+fn a_32_bpp_bitmap_is_a_whole_colour_word() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let d = Display::new_with_layout(&mut mem, &mut hle, 2, 2, 32, 32, 128).unwrap();
+    let b = d.device;
+    assert_eq!(b.depth, 32);
+    assert_eq!(b.pitch, 8, "two pixels at four bytes each");
+    let at = |field: &str| abi::offset_of("IDIB", field).expect("IDIB is in the tables");
+    assert_eq!(
+        mem.read_u32(b.obj + at("pBmp")).unwrap(),
+        b.obj + 128,
+        "the profile's DIB pixel offset is where pBmp points"
+    );
+    let depth = mem.read_u32(b.obj + at("nDepth")).unwrap();
+    assert_eq!(depth & 0xff, 32);
+    assert_eq!(
+        depth >> 8,
+        g::IDIB_COLORSCHEME_888,
+        "the scheme a pack reads with the depth"
+    );
+
+    // A stored pixel and its canonical colour are different questions, and both are answered.
+    write_pixel(&mut mem, &b, 1, 1, 0x0012_3456).unwrap();
+    assert_eq!(read_stored(&mem, &b, 1, 1).unwrap(), Some(0x0012_3456));
+    assert_eq!(
+        read_pixel(&mem, &b, 1, 1).unwrap(),
+        Some(pack565(0x12, 0x34, 0x56) as u32)
+    );
+    let red = pack565(255, 0, 0) as u32;
+    assert_eq!(
+        b.stored(&mem, red).unwrap(),
+        0x00ff_0000,
+        "a canonical red becomes the whole 888 word"
+    );
+    assert_eq!(
+        d.pixel_value(&mem, b.obj, make_rgb(0x12, 0x34, 0x56))
+            .unwrap(),
+        0x0012_3456
+    );
+    assert_eq!(
+        d.pixel_rgb(&mem, b.obj, 0x0012_3456).unwrap(),
+        make_rgb(0x12, 0x34, 0x56)
+    );
+}
+
+/// The DIB ceiling is a profile fact: the built-in handset refuses 32, the Carrier profile backs it.
+#[test]
+fn a_32_bpp_dib_needs_a_profile_that_backs_it() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut narrow = Display::new(&mut mem, &mut hle, 4, 4, 16).unwrap();
+    let err = narrow.new_bitmap(&mut mem, &mut hle, 2, 2, 32).unwrap_err();
+    assert!(format!("{err}").contains("32 bpp"), "{err}");
+
+    let mut wide = Display::new_with_layout(&mut mem, &mut hle, 4, 4, 16, 32, 107).unwrap();
+    let obj = wide.new_bitmap(&mut mem, &mut hle, 2, 2, 32).unwrap();
+    let b = wide.bitmap(obj).unwrap();
+    assert_eq!(b.depth, 32);
+    assert_eq!(b.pitch, 8);
+    assert_eq!(b.px, obj + 107);
+    write_pixel(&mut mem, &b, 0, 0, 0x00ab_cdef).unwrap();
+    assert_eq!(
+        mem.read_u32(b.at(0, 0)).unwrap(),
+        0x00ab_cdef,
+        "the guest reaches the same bytes pBmp names"
+    );
+}
+
+/// A fill and a capture see the same 32-bpp screen, and a 16-bpp source blitted into it is
+/// unpacked to the frame's own format rather than laid down as two-byte words.
+#[test]
+fn a_32_bpp_frame_is_filled_captured_and_blitted_into() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new_with_layout(&mut mem, &mut hle, 2, 2, 32, 32, 128).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    let screen = d.device;
+    d.fill(
+        &mut mem,
+        &screen,
+        Rect::new(0, 0, 2, 2),
+        rgb_to_native(RGB_WHITE),
+        g::AEE_RO_COPY,
+    )
+    .unwrap();
+    assert_eq!(
+        read_stored(&mem, &d.device, 1, 1).unwrap(),
+        Some(0x00ff_ffff)
+    );
+    let shot = d.screenshot(&mem).unwrap();
+    assert_eq!(shot, vec![255; 2 * 2 * 3]);
+
+    // A 16-bpp sprite: one red pixel. The blit converts it to a 32-bpp stored word.
+    let src = d.new_bitmap(&mut mem, &mut hle, 1, 1, 16).unwrap();
+    let sb = d.bitmap(src).unwrap();
+    mem.write_u16(sb.at(0, 0), pack565(255, 0, 0) as u32)
+        .unwrap();
+    assert_eq!(
+        read_stored(&mem, &sb, 0, 0).unwrap(),
+        Some(pack565(255, 0, 0) as u32),
+        "the source pixel is there before the blit"
+    );
+    d.bit_blt(&mut mem, disp, 0, 0, 1, 1, src, 0, 0, g::AEE_RO_COPY)
+        .unwrap();
+    assert_eq!(
+        read_stored(&mem, &d.device, 0, 0).unwrap(),
+        Some(0x00ff_0000)
+    );
+    assert_eq!(
+        read_stored(&mem, &d.device, 1, 0).unwrap(),
+        Some(0x00ff_ffff),
+        "the untouched neighbour"
+    );
+}
+
+/// A 32→32 copy keeps all eight bits of each channel: it is a raw row copy, not a trip through the
+/// 5-6-5 colour space. A transparent source word is compared against the full stored word too.
+#[test]
+fn a_32_bpp_to_32_bpp_blit_does_not_round_through_565() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new_with_layout(&mut mem, &mut hle, 2, 1, 32, 32, 128).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    let src = d.new_bitmap(&mut mem, &mut hle, 2, 1, 32).unwrap();
+    let sb = d.bitmap(src).unwrap();
+    mem.write_u32(sb.at(0, 0), 0x0012_3456).unwrap();
+    mem.write_u32(sb.at(1, 0), 0x00ab_cdef).unwrap();
+    d.bit_blt(&mut mem, disp, 0, 0, 2, 1, src, 0, 0, g::AEE_RO_COPY)
+        .unwrap();
+    assert_eq!(
+        read_stored(&mem, &d.device, 0, 0).unwrap(),
+        Some(0x0012_3456)
+    );
+    assert_eq!(
+        read_stored(&mem, &d.device, 1, 0).unwrap(),
+        Some(0x00ab_cdef)
+    );
+
+    // The source's first word is the key: only the second lands.
+    d.transparency(&mut mem, src, 0x0012_3456).unwrap();
+    let screen = d.device;
+    d.fill(
+        &mut mem,
+        &screen,
+        Rect::new(0, 0, 2, 1),
+        rgb_to_native(RGB_BLACK),
+        g::AEE_RO_COPY,
+    )
+    .unwrap();
+    d.bit_blt(&mut mem, disp, 0, 0, 2, 1, src, 0, 0, g::AEE_RO_TRANSPARENT)
+        .unwrap();
+    assert_eq!(
+        read_stored(&mem, &d.device, 0, 0).unwrap(),
+        Some(0),
+        "keyed out"
+    );
+    assert_eq!(
+        read_stored(&mem, &d.device, 1, 0).unwrap(),
+        Some(0x00ab_cdef)
+    );
+}
+
+/// `IDisplay::BitBlt` takes any `IBitmap*`, and the bitmap declarations publishes the header so a pack can
+/// build one itself. chtycoon copies the device header into its own heap block, repoints `pBmp`
+/// at the screen framebuffer and blits that; requiring an object-table entry faulted it.
+#[test]
+fn a_bit_blt_reads_a_dib_the_pack_built_itself() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 2, 1, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+
+    let at = |field: &str| abi::offset_of("IDIB", field).unwrap();
+    let hdr = mem.alloc(0x2b, 4).unwrap();
+    let px = mem.alloc(2, 2).unwrap();
+    mem.write_u16(px, pack565(255, 0, 0) as u32).unwrap();
+    mem.write_u32(hdr + at("pBmp"), px).unwrap();
+    mem.write_u32(hdr + at("cx"), 1 | (1 << 16)).unwrap();
+    mem.write_u32(hdr + at("nPitch"), 2).unwrap();
+    mem.write_u32(hdr + at("nDepth"), 16).unwrap();
+
+    d.bit_blt(&mut mem, disp, 0, 0, 1, 1, hdr, 0, 0, g::AEE_RO_COPY)
+        .unwrap();
+    assert_eq!(
+        read_stored(&mem, &d.device, 0, 0).unwrap(),
+        Some(pack565(255, 0, 0) as u32)
+    );
+    assert!(
+        d.bitmap(hdr).is_none(),
+        "the pack's header is not one of our objects"
+    );
+}
+
+/// A pack that restates `pBmp` to an address it never decoded must get the same answer a null
+/// source gets: the display blit paints nothing, and the bitmap blits answer a parameter error.
+/// jump restated a source to `0x31e731e7` on its tenth frame and the host faulted on the read.
+#[test]
+fn a_restated_pixel_buffer_outside_guest_memory_is_refused() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 2, 1, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    let screen = d.device;
+    d.fill(
+        &mut mem,
+        &screen,
+        Rect::new(0, 0, 2, 1),
+        rgb_to_native(RGB_WHITE),
+        g::AEE_RO_COPY,
+    )
+    .unwrap();
+
+    let src = d.new_bitmap(&mut mem, &mut hle, 2, 1, 16).unwrap();
+    let pbmp = abi::offset_of("IDIB", "pBmp").unwrap();
+    mem.write_u32(src + pbmp, 0x31e7_31e7).unwrap();
+
+    d.bit_blt(&mut mem, disp, 0, 0, 2, 1, src, 0, 0, g::AEE_RO_COPY)
+        .expect("a void display blit paints nothing");
+    assert_eq!(
+        read_stored(&mem, &d.device, 0, 0).unwrap(),
+        Some(0xffff),
+        "the unreadable source changed no pixel"
+    );
+
+    let dst = d.new_bitmap(&mut mem, &mut hle, 2, 1, 16).unwrap();
+    assert_eq!(
+        d.blt_in(&mut mem, dst, 0, 0, 2, 1, src, 0, 0, g::AEE_RO_COPY)
+            .unwrap(),
+        g::AEE_EBADPARM
+    );
+}
+
+/// A null source is a caller mistake with a defined answer, not a reason to end the run. The
+/// `void` display blit paints nothing; `IBitmap::BltIn/BltOut` return a parameter error. A pack that
+/// stores a failed image load as `NULL` then keeps drawing is exactly the shape this covers.
+#[test]
+fn a_null_blit_source_is_refused_without_ending_the_run() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 4, 4, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    d.bit_blt(&mut mem, disp, 0, 0, 4, 4, 0, 0, 0, g::AEE_RO_COPY)
+        .expect("a void display blit paints nothing");
+    d.bit_blt(&mut mem, disp, 0, 0, 4, 4, u32::MAX, 0, 0, g::AEE_RO_COPY)
+        .expect("BREW's poison pointer is the same empty source");
+    let dst = d.new_bitmap(&mut mem, &mut hle, 4, 4, 16).unwrap();
+    assert_eq!(
+        d.blt_in(&mut mem, dst, 0, 0, 4, 4, u32::MAX, 0, 0, g::AEE_RO_COPY)
+            .unwrap(),
+        g::AEE_EBADPARM
+    );
+    assert_eq!(
+        d.blt_in(&mut mem, dst, 0, 0, 4, 4, 0, 0, 0, g::AEE_RO_COPY)
+            .unwrap(),
+        g::AEE_EBADPARM
+    );
+    assert_eq!(
+        d.blt_out(&mut mem, 0, 0, 0, 4, 4, dst, 0, 0, g::AEE_RO_COPY)
+            .unwrap(),
+        g::AEE_EBADPARM
+    );
+}
+
+/// `IDisplay::SetPrefs("h:N")` really resizes the screen, which is what a pack that clears the
+/// frame it asked for then depends on.
+///
+/// The record is a guest pack whose layout is for a taller panel: it asks for the height, does
+/// not look at the answer, and clears `width * height * 2` bytes at `pBmp`. Serving the slot with
+/// the old geometry and a success is the failure shape this pins against — the clear would leave
+/// the buffer the host allocated.
+#[test]
+fn a_height_preference_makes_a_screen_that_holds_the_rows_it_asked_for() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    let old = d.device_bitmap();
+
+    assert_eq!(d.set_prefs(&mut mem, &mut hle, "h:6").unwrap(), g::AEE_SUCCESS);
+
+    let device = d.device_bitmap();
+    let b = d.bitmap(device).expect("the screen is a bitmap this host knows");
+    assert_eq!((b.width, b.height, b.pitch), (8, 6, 16), "eight by six, sixteen bytes a row");
+    assert_ne!(device, old, "a size is a new object: the pixels live inside it");
+    // The clear the pack does next: every byte of the rows it asked for, at the `pBmp` the host
+    // published. This is the write that used to land past the screen and end the run.
+    mem.fill(b.px, 8 * 6 * 2, 0)
+        .expect("the rows the pack sized its frame for are inside the screen");
+    // And the display is drawing into it, on the reference the header's rebind rule owes.
+    let state = d.state(disp).unwrap();
+    assert_eq!(state.dest, device);
+    assert_eq!(state.clip, Rect::whole(8, 6), "a clip that was the whole screen follows it");
+    assert!(d.bitmap(old).is_none(), "the old screen went with its last reference");
+    assert_eq!(d.screenshot(&mem).unwrap().len(), 8 * 6 * 3, "and a capture is the new frame");
+}
+
+#[test]
+fn a_width_preference_resizes_the_other_axis_the_same_way() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
+    d.create_display(&mut mem, &mut hle).unwrap();
+    assert_eq!(d.set_prefs(&mut mem, &mut hle, "w:6").unwrap(), g::AEE_SUCCESS);
+    let b = d.bitmap(d.device_bitmap()).unwrap();
+    assert_eq!((b.width, b.height, b.pitch), (6, 4, 12));
+}
+
+/// The settings this host cannot honour are answered, not accepted and dropped.
+///
+/// the bitmap-device declarations warns the display "may not be able to accommodate all values", and the
+/// answer that keeps a caller honest is the failure: a success would tell it its screen changed.
+#[test]
+fn a_setting_this_host_cannot_honour_leaves_the_screen_alone() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
+    let disp = d.create_display(&mut mem, &mut hle).unwrap();
+    let device = d.device_bitmap();
+    for (text, want) in [
+        // `<empty>` and `*` name the firmware's own default and maximum, which this host keeps no
+        // record of; guessing "the panel" would be a number it cannot support.
+        ("h:", g::AEE_EUNSUPPORTED),
+        ("h:*", g::AEE_EUNSUPPORTED),
+        // Not a size at all.
+        ("h:0", g::AEE_EBADPARM),
+        // No separator, so not a `name:value` pair.
+        ("h6", g::AEE_EBADPARM),
+        // A name the header does not publish, and one it does but this host has no state for.
+        ("q:1", g::AEE_EUNSUPPORTED),
+        ("a:1", g::AEE_EUNSUPPORTED),
+        // The frame has one depth: naming it is a no-op, naming another is a screen we cannot make.
+        ("c:888", g::AEE_EUNSUPPORTED),
+        // Past the ceiling, so answered rather than attempted.
+        ("h:65535,w:65535", g::AEE_EUNSUPPORTED),
+    ] {
+        assert_eq!(d.set_prefs(&mut mem, &mut hle, text).unwrap(), want, "{text}");
+    }
+    // A list is applied whole or not at all: the good pair ahead of the bad one must not have
+    // taken effect, or the caller would believe a screen it never got.
+    assert_eq!(
+        d.set_prefs(&mut mem, &mut hle, "h:6,a:1").unwrap(),
+        g::AEE_EUNSUPPORTED
+    );
+    assert_eq!(d.device_bitmap(), device, "no call in that list resized the screen");
+    assert_eq!(d.bitmap(device).unwrap().height, 4);
+    let scheme = format!("c:{}", g::IDIB_COLORSCHEME_565);
+    assert_eq!(d.set_prefs(&mut mem, &mut hle, &scheme).unwrap(), g::AEE_SUCCESS);
+    assert_eq!(d.device_bitmap(), device, "the scheme the frame already has is a no-op");
+    // A trailing separator is how a caller that appends one per setting builds the list.
+    assert_eq!(d.set_prefs(&mut mem, &mut hle, "h:4,").unwrap(), g::AEE_SUCCESS);
+    assert_eq!(d.device_bitmap(), device, "asking for the size it already has is a no-op");
+    assert_eq!(d.state(disp).unwrap().dest, device);
+}
+
+/// The screen's block is a reservation of whole pages, so a pack that walks a row or two past the
+/// last row it can see still lands.
+///
+/// A panel's framebuffer is handed out page-granular by a firmware's own allocator, and reference
+/// packs do read past `pBmp + nPitch * cy` — one copy loop takes its bound from the image it
+/// decoded rather than from the screen it writes into. Packing the block to the byte leaves whatever
+/// slack the block's last page happens to have, and on a 403-row screen that was 273 bytes against a
+/// 478-byte overrun: the page after the block is the end of the run.
+#[test]
+fn the_screen_is_reserved_whole_pages_so_a_row_past_the_last_one_still_lands() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 6, 16).unwrap();
+    let device = d.device_bitmap();
+    let b = d.bitmap(device).unwrap();
+    let page = crate::mem::PAGE_SIZE as u32;
+    let block = hle.object(device).expect("the screen is an object this host made").len;
+    assert_eq!(block % page, 0, "the reservation ends on a page, not where the pixels do");
+    // The pixels are still the whole picture, and everything past them is inside the reservation.
+    let past = b.px + u32::from(b.height) * b.pitch as u32;
+    assert!(past < device + block, "one row past the last one is still the screen's");
+    assert_eq!(mem.read_u16(past).unwrap(), 0, "and it is black, not the block's last occupant");
+    // A page further is outside it: this is slack for the row a pack miscounts, not a hole punched
+    // in every fault this host reports.
+    assert!(mem.read_u16(device + block).is_err(), "the reservation's end is still a fault");
+}
+
+/// `IBitmapDev::Update` is the face a pack presents through when it draws into the device bitmap
+/// itself: "This function copies the bitmap to its associated display synchronously." Answering
+/// SUCCESS without taking the screen left every such frame unrecorded — `a guest module` presents 5539
+/// times through this call and this host counted none of them, which reads as "0 screens" for a
+/// pack that was drawing the whole time.
+///
+/// The call takes one screen each time it is made: the copy is synchronous, and there is no
+/// `bUpdate` flag on this slot to defer with, so two calls are two frames rather than one
+/// coalesced one.
+#[test]
+fn updating_the_device_bitmap_takes_a_screen() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut d = Display::new(&mut mem, &mut hle, 8, 4, 16).unwrap();
+
+    assert_eq!(d.presentations, 0, "nothing has been presented yet");
+    d.present_device_bitmap();
+    assert_eq!(d.presentations, 1, "the call takes a screen");
+    d.present_device_bitmap();
+    assert_eq!(
+        d.presentations, 2,
+        "two calls are two frames: this slot has no defer flag to coalesce them"
+    );
 }

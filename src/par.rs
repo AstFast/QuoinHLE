@@ -1,11 +1,11 @@
-//! The container the other half of the corpus arrives in: `"PAR "`.
+//! The container the other half of the sample set arrives in: `"PAR "`.
 //!
 //! A pack's art is not always a `.bar`: some packs ship `.par` files and no `.bar` at all, and a run
 //! that only knows [`crate::resource`]'s `0x11` signature mounts none of them and answers the app's
 //! first `ISHELL_LoadResString` with nothing. The two formats are unrelated: this one opens with four
 //! ASCII bytes instead of a binary signature, and its payloads are deflated rather than stored.
 //!
-//! Layout, read off the `.par` files in the corpus and self-checking on every one of them:
+//! Layout, derived from the `.par` files in the sample set and self-checking on every one of them:
 //!
 //! ```text
 //! 0x00  "PAR "          u32 file count    u32 offsets[count]
@@ -41,7 +41,7 @@ const GZIP: &[u8; 3] = b"\x1f\x8b\x08";
 
 /// How many headers [`walk`] will nest before it stops looking.
 ///
-/// The corpus nests twice: `ui.par` is a header holding an indexed payload holding a header. Sixteen
+/// The sample set nests twice: `ui.par` is a header holding an indexed payload holding a header. Sixteen
 /// is therefore nowhere near the shape of a real file, and a file that keeps answering "header"
 /// past that is either constructed or misread.
 const MAX_NEST: u8 = 16;
@@ -321,7 +321,7 @@ fn walk(
     seen: &mut usize,
     depth: u8,
 ) {
-    // A bound on the work, not on depth: the corpus nests twice, and anything that keeps finding
+    // A bound on the work, not on depth: the sample set nests twice, and anything that keeps finding
     // headers is a misread of the offsets rather than a real pack. Count sub-files rather than
     // `out.len()`, because an unnamed leaf may or may not be kept and must not change how much
     // work the named ones get.
@@ -344,7 +344,7 @@ fn walk(
             count.unreadable += 1;
             continue;
         }
-        // A sub-file that is itself a header. The corpus always reaches one through an index, but a
+        // A sub-file that is itself a header. The sample set always reaches one through an index, but a
         // bare one is still worth following, and it carries no labels of its own.
         if bytes[s..].starts_with(SIGNATURE) {
             // Depth is bounded separately from the work above, because that bound cannot see this
@@ -420,7 +420,7 @@ fn walk(
             }
         } else if emit(body, &idx.ids, out) {
             // A top-level payload with its own table serves every id it names, not just the first:
-            // `table.par` is the corpus's shape for this and a lookup for the other ids must land.
+            // `table.par` is the sample set's shape for this and a lookup for the other ids must land.
             count.emitted += idx.ids.len();
         } else {
             count.unreadable += 1;
@@ -446,16 +446,16 @@ fn emit(body: &[u8], ids: &[u32], out: &mut Vec<Leaf>) -> bool {
 /// The ceiling on what one leaf may inflate to, in bytes.
 ///
 /// The same number and the same reasoning as the resource inflater: large enough for the biggest
-/// payload in the corpus, small enough that reaching it says something about the stream rather than
+/// payload in the sample set, small enough that reaching it says something about the stream rather than
 /// about the machine. Without it a leaf of a few kilobytes can ask for gigabytes — deflate tops out
 /// around a thousand to one — and `read_to_end` will happily grow a `Vec` until the process dies.
 const INFLATE_CAP: u64 = 64 << 20;
 
-/// Every leaf in the corpus is a gzip member. A stream that does not decompress is skipped by the
+/// Every leaf in the sample set is a gzip member. A stream that does not decompress is skipped by the
 /// caller rather than reported: the file as a whole is still readable.
 fn inflate(body: &[u8]) -> R<Vec<u8>> {
     if !body.starts_with(GZIP) {
-        // Not deflated: the corpus has none of these, but a payload that is already plain is
+        // Not deflated: the sample set has none of these, but a payload that is already plain is
         // strictly more useful than a hole, so it is passed through.
         return Ok(body.to_vec());
     }

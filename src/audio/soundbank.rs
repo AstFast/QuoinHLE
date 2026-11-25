@@ -9,7 +9,7 @@
 //! came from something inside the machine. The evidence, and the three ways I mis-measured it,
 //! are summarised in the module notes below.
 //!
-//! ⚠ What that witness does **not** establish is the stronger claim this file used to make in its own
+//! ⚠ What that record does **not** establish is the stronger claim this file used to make in its own
 //! voice — "there is no sampled instrument bank in the whole 32 MiB flash". That rests on `sfbk`/DLS
 //! magic being absent from a scan with **no positive control** (there is no real `.sf2` on this box to
 //! search for), and the entry that measured it labels the conclusion weak and says not to use it. The

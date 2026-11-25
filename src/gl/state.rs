@@ -56,9 +56,32 @@ impl Default for Gles {
 }
 
 impl Gles {
+    /// Build the software pipeline with the extension/version surface a profile advertises.
+    pub fn with_caps(caps: crate::device::GlCaps) -> Self {
+        let mut gl = Self::new();
+        gl.caps = caps;
+        gl.apply_caps_defaults();
+        gl
+    }
+
+    /// Seed the state whose default is a profile number rather than a constant.
+    ///
+    /// `GL_POINT_SIZE_MAX` is defined as the implementation's largest point, and the same profile
+    /// answers `GL_ALIASED_POINT_SIZE_RANGE` from its caps. Without this the two answers disagree
+    /// for every profile narrower than the built-in 64.
+    fn apply_caps_defaults(&mut self) {
+        if self.caps.point_size_max > 0 {
+            self.point_size_max = self.caps.point_size_max as f32;
+        }
+        if self.caps.point_size_min > 0 {
+            self.point_size_min = self.caps.point_size_min as f32;
+        }
+    }
+
     pub fn new() -> Self {
         Gles {
-            clear_color: [0.0, 0.0, 0.0, 1.0],
+            caps: crate::device::GlCaps::all(),
+            clear_color: [0.0, 0.0, 0.0, 0.0],
             clear_depth: 1.0,
             viewport: [0, 0, 0, 0],
             scissor: [0, 0, 0, 0],
@@ -132,7 +155,7 @@ impl Gles {
             local_viewer: false,
             matrix_palette: false,
             current_palette_matrix: 0,
-            palette_matrices: [Mat4::IDENTITY; 32],
+            palette_matrices: [Mat4::IDENTITY; 48],
             line_width: 1.0,
             polygon_offset_factor: 0.0,
             polygon_offset_units: 0.0,
@@ -143,6 +166,8 @@ impl Gles {
             tex_gen_plane: [[[0.0; 4]; 2]; 4],
             pack_alignment: 4,
             unpack_alignment: 4,
+            hints: [GL_DONT_CARE; 5],
+            string_cache: [0; 4],
             matrices: [MatrixStack::new(), MatrixStack::new(), MatrixStack::new()],
             mode: 0,
             current: Vertex {
@@ -151,6 +176,7 @@ impl Gles {
                 color: [1.0; 4],
                 tex: [[0.0; 2]; 4],
                 tex_r: [0.0; 4],
+                tex_q: [1.0; 4],
                 normal: Vec3::new(0.0, 0.0, 1.0),
                 point_size: 1.0,
                 matrix_indices: [0; 4],
@@ -191,6 +217,7 @@ impl Gles {
             bound_renderbuffer: 0,
             next_renderbuffer: 0x3000,
             error: GL_NO_ERROR,
+            probe: None,
         }
     }
 }

@@ -2,7 +2,7 @@
 //! dies by the shell's rules, and what it draws arrives as pixels.
 //!
 //! Skipped unless `BREW_TEST_MOD` names a readable image, because the module is linker output
-//! from the proprietary SDK samples and is not vendored here. Every address this test asserts on
+//! from the proprietary Sample builds and is not vendored here. Every address this test asserts on
 //! is read back out of guest memory instead of being hardcoded, so a host that builds an
 //! `_AEEApplet` the module cannot use fails here rather than at some later PC.
 

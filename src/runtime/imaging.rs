@@ -5,6 +5,23 @@
 
 use super::*;
 
+fn qegl_face_enabled(caps: &crate::device::GlCaps, face: crate::gl::qegl::Face) -> bool {
+    use crate::gl::qegl::Face;
+    if !caps.qegl {
+        return false;
+    }
+    match face {
+        Face::Gl => caps.gles10,
+        Face::Gl11 => caps.gles11,
+        Face::Gl10Ext => caps.gles10_ext,
+        Face::Gl11Ext => caps.gles11_ext,
+        Face::Gl11ExtPak => caps.gles11_ext_pak,
+        Face::ImageOn => caps.imageon_ext,
+        Face::ImageOnV1 => caps.imageon_ext_v1,
+        Face::Egl | Face::Egl11 | Face::ColorBuffer | Face::ColorBufferInfo => true,
+    }
+}
+
 impl Runtime {
     /// `QueryInterface` for any face of a QEGL family.
     ///
@@ -26,13 +43,22 @@ impl Runtime {
         let Some(face) = crate::gl::qegl::Face::of_iface(iface) else {
             return Ok(g::AEE_ECLASSNOTSUPPORT);
         };
+        if !qegl_face_enabled(&self.device.gl, face) {
+            self.cpu.mem.write_u32(ppv, 0)?;
+            return Ok(g::AEE_ECLASSNOTSUPPORT);
+        }
         let member = match self.hle.payload(this) {
             Some(crate::hle::Payload::Qegl(member)) if member.face == face => Some(*member),
             _ => None,
         };
         if let Some(member) = member {
-            // Every face is registered at creation, so an edge that exists always resolves.
+            // Every face is registered at creation, so an edge that exists always resolves —
+            // unless this profile's firmware never exposed the destination face.
             if let Some((to, _)) = crate::gl::qegl::answer(face, iid) {
+                if !qegl_face_enabled(&self.device.gl, to) {
+                    self.cpu.mem.write_u32(ppv, 0)?;
+                    return Ok(g::AEE_ECLASSNOTSUPPORT);
+                }
                 return Ok(self.return_object(member.faces.addr(to), ppv)?);
             }
         } else if crate::gl::qegl::answer(face, iid).map(|(_, miss)| miss)
@@ -178,7 +204,7 @@ impl Runtime {
         }
         // `pdwSize` is [in/out] with the out half promised **only on ENEEDMORE** ("*pdwSize contains
         // the required number of additional bytes"); on success the header says nothing, its own
-        // sample never reads the word again, and the one caller in the shipped pk source that does —
+        // sample never reads the word again, and the one caller in the reference pk source that does —
         // the ringer create, whose `&m_nBytes` must survive the call for its first write to mean
         // anything — depends on it holding the value it put in. So a successful detect leaves the
         // caller's word alone; writing 0 "additional" here used to clear exactly that.
@@ -303,11 +329,13 @@ impl Runtime {
     /// `AEE_SUCCESS` when the canvas has a surface to draw on, `AEE_EFAILED` when it does not —
     /// the two codes the header lists for `GetClipRect` and `SetClipRect`.
     pub(crate) fn canvas_has_bitmap(&self, canvas: u32) -> Result<u32, Error> {
-        Ok(if self.cpu.mem.read_u32(canvas + canvas::BITMAP_OFF)? == 0 {
-            g::AEE_EFAILED
-        } else {
-            g::AEE_SUCCESS
-        })
+        Ok(
+            if self.cpu.mem.read_u32(canvas + canvas::BITMAP_OFF)? == 0 {
+                g::AEE_EFAILED
+            } else {
+                g::AEE_SUCCESS
+            },
+        )
     }
 
     /// The clip a bitmap arrives with: all of it.
@@ -653,7 +681,7 @@ impl Runtime {
                     return Ok(g::AEE_EBADPARM);
                 }
                 if w > 0 && h > 0 {
-                    // And the disassembly says the rest outright: `movs r2, #4; bl drawRect` — the rect
+                    // And the inspection says the rest outright: `movs r2, #4; bl drawRect` — the rect
                     // pointer is the pack's own `r1`, never transformed. So `ClearRect` paints in
                     // **device** coordinates while `DrawRect` paints in the world system: the two differ
                     // by exactly the origin every other shape gets. Reproducing it is the point; "fixed"
@@ -999,7 +1027,7 @@ impl Runtime {
                     dst
                 };
                 let Some(bmp) = self.display.bitmap(target) else {
-                    // A pointer that is not a bitmap this host carries. The shipped body would call a
+                    // A pointer that is not a bitmap this host carries. The documented behaviour would call a
                     // vtable through it, which is a crash rather than an answer; this host refuses and
                     // says which pointer, and keeps the state exactly as it stood.
                     self.display.note(format!(
@@ -1044,7 +1072,7 @@ impl Runtime {
                 // host still presents the framebuffer as it is written.
                 out = flag;
                 self.display.note(format!(
-                    "IGraphics::EnableDoubleBuffer({flag}) echoed {flag}: the shipped body stores no \
+                    "IGraphics::EnableDoubleBuffer({flag}) echoed {flag}: the platform routine stores no \
                      double-buffer state and `IGraphics::Update` is a tail call to IDisplay::Update(TRUE)"
                 ));
             }
@@ -1069,7 +1097,32 @@ impl Runtime {
             }
         }
         self.graphics.set(this, st);
+        if name == "SetDestination" {
+            self.mirror_graphics_canvas(this)?;
+        }
         Ok(out)
+    }
+
+    /// Write the destination bitmap into the private `IGraphics` record at the offset the profile
+    /// names. A pack that walks the firmware's own record reads this word rather than calling
+    /// `GetDestination`; zero offset means this handset's layout is not mirrored.
+    pub(crate) fn mirror_graphics_canvas(&mut self, this: u32) -> HResult<()> {
+        let offset = self.graphics_canvas_offset;
+        if offset == 0 {
+            return Ok(());
+        }
+        // The caller has just installed the state, or is the constructor; a record that is not
+        // there is not one this host should be writing through.
+        let Some(st) = self.graphics.get(this) else {
+            return Ok(());
+        };
+        let target = if st.dest == 0 {
+            self.display.device_bitmap()
+        } else {
+            st.dest
+        };
+        self.cpu.mem.write_u32(this + offset, target)?;
+        Ok(())
     }
 
     /// The drawing context for one call: this host's three services, borrowed together, with the
@@ -1080,7 +1133,7 @@ impl Runtime {
 
     /// Register the JPEG decoder's face pair for one created object.
     ///
-    /// One stream, two `this` pointers: the shipped record is 40 bytes with the second face at `me + 8`
+    /// One stream, two `this` pointers: the reference record is 40 bytes with the second face at `me + 8`
     /// and `[+12]` pointing back at the base, so a `QueryInterface` through either lands in the same
     /// body. This host gives each face its own object, so the shared [`jpegdecoder::Feed`] is keyed by the
     /// decoder face and both addresses map to it.
@@ -1089,7 +1142,12 @@ impl Runtime {
     /// one of the frames `the_host_stack_one_downcall_level_costs_is_measured` walks 32 times, and the
     /// map inserts here cost the level 192 bytes when they are inlined into it.
     #[inline(never)]
-    pub(crate) fn jpeg_remember_faces(&mut self, cls: u32, addr: u32, faces: &[(&'static str, u32)]) {
+    pub(crate) fn jpeg_remember_faces(
+        &mut self,
+        cls: u32,
+        addr: u32,
+        faces: &[(&'static str, u32)],
+    ) {
         if cls != g::AEECLSID_JPEGDECODER {
             return;
         }
@@ -1128,7 +1186,14 @@ impl Runtime {
     }
 
     #[inline(never)]
-    pub(crate) fn jpeg_slot(&mut self, id: u32, this: u32, label: &str, name: &str, key: u32) -> HResult<u32> {
+    pub(crate) fn jpeg_slot(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+        key: u32,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1138,7 +1203,7 @@ impl Runtime {
             "QueryInterface" => {
                 let [iid, ppv] = self.args()?;
                 match jpegdecoder::Feed::face_of(iid) {
-                    // The decoder address, whatever face was called: the shipped body answers with the
+                    // The decoder address, whatever face was called: the documented behaviour answers with the
                     // record base it reached through `[+12]`.
                     jpegdecoder::Face::Same => self.return_object(key, ppv),
                     jpegdecoder::Face::Other => {
@@ -1251,7 +1316,13 @@ impl Runtime {
     /// BMP — `SetupNativeImage`
     /// and `LoadResObject` both go through `resource::bmp` — so this decoder is that decoder, behind two
     /// pointers instead of one.
-    pub(crate) fn iimagedecoder(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn iimagedecoder(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1313,7 +1384,13 @@ impl Runtime {
     }
 
     /// `IForceFeed` — the feeding half of the same object.
-    pub(crate) fn iforcefeed(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn iforcefeed(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -1350,6 +1427,38 @@ impl Runtime {
                 Ok(0)
             }
             _ => Err(unimplemented()),
+        }
+    }
+
+    /// Drop the raster(s) a previous `SetStream` installed on this image. An animated image owns a
+    /// frame list; a static image owns the single raster in `images`. Either way the old picture is
+    /// no longer reachable from this image, so its pixels and palettes go back here.
+    pub(crate) fn drop_image_raster(&mut self, image: u32) -> HResult<()> {
+        let still = self.images.remove(&image);
+        if let Some(frames) = self.image_frames.remove(&image) {
+            for raster in frames.rasters {
+                self.display
+                    .forget(&mut self.cpu.mem, &mut self.hle, raster)?;
+            }
+        } else if let Some(src) = still {
+            if src != 0 {
+                self.display.forget(&mut self.cpu.mem, &mut self.hle, src)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Report a decode that finished before `SetStream` returned, once, to the callback the pack
+    /// armed with `IImage_Notify`.
+    fn queue_image_notify(&mut self, image: u32) {
+        if let Some(parm) = self.image_parm.get(&image).copied() {
+            let (pfn, user) = parm.notify;
+            if pfn != 0 {
+                self.queue.push_back(Job::Image { image, pfn, user });
+                if let Some(parm) = self.image_parm.get_mut(&image) {
+                    parm.notify = (0, 0);
+                }
+            }
         }
     }
 
@@ -1398,7 +1507,11 @@ impl Runtime {
                     .display
                     .bitmap(src)
                     .ok_or(HleError::NotAnObject { addr: src })?;
-                let parm = self.image_parm.get(&this).copied().unwrap_or_default();
+                let mut parm = self.image_parm.get(&this).copied().unwrap_or_default();
+                if let Some(frames) = self.image_frames.get(&this) {
+                    parm.frames = Some(frames.rasters.len() as i32);
+                    parm.cx_frame = Some(i32::from(b.width));
+                }
                 // `cnt_rgb` is already "how many palette entries, or zero when the pixels are
                 // themselves colours", which is the same reading the converter path reports.
                 self.put_image_info(
@@ -1418,6 +1531,16 @@ impl Runtime {
             }
             "DrawFrame" => {
                 let [frame, x, y] = self.args()?;
+                if frame <= i32::MAX as u32 {
+                    let frame = frame as i32;
+                    if let Some(state) = self.image_frames.get_mut(&this) {
+                        state.current =
+                            (frame.max(0) as usize).min(state.rasters.len().saturating_sub(1));
+                        // An explicit frame is a caller-driven selection; the clock no longer
+                        // advances it.
+                        state.started_ms = None;
+                    }
+                }
                 self.blit_image(this, frame as i32, x as i32, y as i32)
             }
             // `AEEImage_Start(x, y)` stores the corner, zeroes its position word and calls its own
@@ -1427,20 +1550,39 @@ impl Runtime {
             "Start" => {
                 let [x, y] = self.args()?;
                 self.image_parm.entry(this).or_default().anim = Some((x as i16, y as i16));
+                if let Some(state) = self.image_frames.get_mut(&this) {
+                    state.started_ms = Some(self.clock_ms);
+                    state.current = 0;
+                }
                 Ok(0)
             }
             "Stop" => {
                 self.image_parm.entry(this).or_default().anim = None;
+                if let Some(state) = self.image_frames.get_mut(&this) {
+                    state.started_ms = None;
+                }
                 Ok(0)
             }
             "HandleEvent" => Ok(self.no_implementation_false("IImage", "HandleEvent")),
-            // `AEEImage_Notify(pfn, pUser)` stores the pair and registers it with the object's
-            // source (`+4`, slot 36). This host has no background decode: `SetStream` has the
-            // picture before it returns, so the pair is kept (the body's own state) and nothing
-            // ever fires it.
+            // `AEEImage_Notify(pfn, pUser)` — `PFNIMAGEINFO(pUser, pIImage, AEEImageInfo*, nErr)`,
+            // the report the header tells a pack to wait for before it draws. `SetStream` here has
+            // the picture before it returns, so an image that already carries one owes the callback
+            // immediately; it is *queued* rather than called, because the pack arms it in the same
+            // breath as it blocks, and a notify that ran inside this call would resume a thread that
+            // had not parked yet.
             "Notify" => {
                 let [pfn, user] = self.args()?;
                 self.image_parm.entry(this).or_default().notify = (pfn, user);
+                if pfn != 0 && self.images.get(&this).is_some_and(|src| *src != 0) {
+                    self.queue.push_back(Job::Image {
+                        image: this,
+                        pfn,
+                        user,
+                    });
+                    if let Some(parm) = self.image_parm.get_mut(&this) {
+                        parm.notify = (0, 0);
+                    }
+                }
                 Ok(0)
             }
             // `IImage_SetParm(nParm, p1, p2)` is one call carrying the whole `IPARM_*` protocol.
@@ -1485,6 +1627,9 @@ impl Runtime {
                         parm.rate = rate;
                         if p1 == 0 {
                             parm.anim = None;
+                            if let Some(state) = self.image_frames.get_mut(&this) {
+                                state.started_ms = None;
+                            }
                         }
                         self.image_parm.insert(this, parm);
                     }
@@ -1549,6 +1694,51 @@ impl Runtime {
             "SetStream" => {
                 let [stream] = self.args()?;
                 let bytes = self.drain_stream(stream)?;
+                // A stream can name several frames rather than one picture. Those frames are laid
+                // into rasters of their own; `DrawFrame` then selects one and `Draw` can advance
+                // through them on the clock. A single-frame format stays on the static path below,
+                // which keeps its indexed palette and sprite-sheet behaviour.
+                if let Some(Ok(animation)) = resource::animation(&[], &bytes) {
+                    if animation.frames.len() > 1 {
+                        let mut rasters = Vec::with_capacity(animation.frames.len());
+                        for frame in &animation.frames {
+                            rasters.push(self.raster(frame)?);
+                        }
+                        self.drop_image_raster(this)?;
+                        self.images.insert(this, rasters[0]);
+                        let parm = self.image_parm.entry(this).or_default();
+                        parm.rop = self.display.default_rop(rasters[0]);
+                        parm.frames = Some(animation.frames.len() as i32);
+                        parm.cx_frame = Some(animation.frames[0].width as i32);
+                        self.image_frames.insert(
+                            this,
+                            ImageFrames {
+                                rasters,
+                                delays: animation.delays,
+                                current: 0,
+                                started_ms: None,
+                            },
+                        );
+                        self.queue_image_notify(this);
+                        return Ok(0);
+                    }
+                    if animation.frames.len() == 1
+                        && (bytes.starts_with(resource::SAF_MAGIC)
+                            || bytes.starts_with(resource::SIS_MAGIC))
+                    {
+                        // A one-frame SIS is the common case and its frame is already decoded
+                        // here; reusing it keeps `SetStream` from inflating it a second time.
+                        if let Some(frame) = animation.frames.into_iter().next() {
+                            let src = self.raster(&frame)?;
+                            self.image_parm.entry(this).or_default().rop =
+                                self.display.default_rop(src);
+                            self.drop_image_raster(this)?;
+                            self.images.insert(this, src);
+                            self.queue_image_notify(this);
+                            return Ok(0);
+                        }
+                    }
+                }
                 // An empty property block, which is the case `resource::image` covers by letting the
                 // payload name its own format: a stream carries bytes, not a container's MIME field.
                 match resource::image(&[], &bytes) {
@@ -1560,12 +1750,14 @@ impl Runtime {
                         // already set (a portion of a sheet, a display) are kept.
                         self.image_parm.entry(this).or_default().rop =
                             self.display.default_rop(src);
+                        self.drop_image_raster(this)?;
                         self.images.insert(this, src);
+                        self.queue_image_notify(this);
                     }
-                    // The slot returns `void`, so there is no code to hand back and nothing to
-                    // notify: `SetStream` has the picture before it returns. Saying nothing would
-                    // make "no decoder" indistinguishable from "the pack loaded it fine", so the
-                    // refusal is recorded where the report shows it.
+                    // The slot returns `void`, so there is no code to hand back. A stream this host
+                    // cannot decode is said out loud: silence would make "no decoder" indistinguishable
+                    // from "the pack loaded it fine", so the refusal is recorded where the report
+                    // shows it.
                     Err(e) => self.display.note(format!(
                         "IImage stream of {} byte(s) is not a picture this host decodes: {e}",
                         bytes.len()
@@ -1578,5 +1770,4 @@ impl Runtime {
             _ => Err(gap()),
         }
     }
-
 }

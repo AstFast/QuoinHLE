@@ -25,8 +25,19 @@ impl DrawTarget {
             && (self.framebuffer == 0 || self.depth.is_some() || self.depth_texture.is_some())
     }
 
-    pub(super) fn stencil_tested(&self, stencil_test: bool) -> bool {
-        stencil_test
-            && (self.framebuffer == 0 || self.stencil.is_some() || self.stencil_texture.is_some())
+    /// Whether the stencil test runs for this target.
+    ///
+    /// A framebuffer tests the stencil only when it has a plane attached. The default surface
+    /// depends on the profile instead: a handset that reports no stencil bits has nothing to test
+    /// against, even though this host keeps a plane for it.
+    pub(super) fn stencil_tested(&self, stencil_test: bool, screen_has_stencil: bool) -> bool {
+        if !stencil_test {
+            return false;
+        }
+        if self.framebuffer == 0 {
+            screen_has_stencil
+        } else {
+            self.stencil.is_some() || self.stencil_texture.is_some()
+        }
     }
 }

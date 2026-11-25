@@ -8,8 +8,10 @@
 //!
 //! The face is one file, not a Latin grid with a wide table bolted on: `--font` already draws a
 //! run entirely from a BBF, and the machine's font covers Latin as well, so there is no second
-//! metrics rule to keep in step. `AEE_FONT_LARGE` gets its own rasterization at [`LARGE_SIZE`]
-//! because a BBF cell is already the size it was drawn at — the format has no scale.
+//! metrics rule to keep in step. `AEE_FONT_LARGE` gets its own rasterization at the profile's
+//! large size because a BBF cell is already the size it was drawn at — the format has no scale.
+//! The carrier's own family names a cell per class (the carrier font declarations); [`install`] rasterizes 12, 16,
+//! 24 and 32 and attaches each class to the face its name asks for.
 //!
 //! It is an approximation and says so: the shapes are Microsoft YaHei's or SimSun's or Noto's,
 //! not the handset's, and a real 16x16 OEM face is still the one thing a firmware dump would
@@ -27,12 +29,15 @@ use crate::runtime::Runtime;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Cell height the normal face is rasterized at, matching the 16-pixel OEM face the packs lay out
-/// against.
+/// The cell height a standard profile starts with for `AEE_FONT_NORMAL`.
+///
+/// [`DeviceProfile::font_normal`](crate::device::DeviceProfile::font_normal) carries the value a
+/// run actually uses; this is the default a standard handset names and what the sample set was laid
+/// out against.
 pub const SIZE: u16 = 16;
 
-/// Cell height for `AEE_FONT_LARGE`. The built-in grid magnifies, but a BBF cell cannot: the
-/// designator's face has to be drawn at its own size.
+/// The default cell height for `AEE_FONT_LARGE`, for the same reason. The built-in grid magnifies,
+/// but a BBF cell cannot: the designator's face has to be drawn at its own size.
 pub const LARGE_SIZE: u16 = 32;
 
 /// Bumped whenever the encoder changes what a cached face means. It is part of the cache key, so a
@@ -42,11 +47,20 @@ const CACHE_VERSION: u32 = 2;
 /// Install a face under every system designator the caller did not name itself.
 ///
 /// `keep` is the designators an explicit `--font`/`--font-bold`/`--font-large` already filled;
-/// those are the caller's choice and are left alone. A designator that stays [`Face::Builtin`]
-/// because no font could be read draws boxes for wide code units, and the run says so once rather
-/// than leaving a screenshot to explain it.
+/// those are the caller's choice and are left alone. The three italic designators are answered
+/// with the upright face they name, because this host has no slanted cut; the bold designator is
+/// the normal face thickened one column, or the person's own bold face when they named one. A
+/// designator that stays [`Face::Builtin`] because no font could be read draws boxes for wide code
+/// units, and the run says so once rather than leaving a screenshot to explain it.
 pub fn install(rt: &mut Runtime, keep: &[u32]) {
-    let wanted = [g::AEE_FONT_NORMAL, g::AEE_FONT_BOLD, g::AEE_FONT_LARGE];
+    let wanted = [
+        g::AEE_FONT_NORMAL,
+        g::AEE_FONT_BOLD,
+        g::AEE_FONT_LARGE,
+        g::AEE_FONT_ITALIC,
+        g::AEE_FONT_LARGE_ITALIC,
+        g::AEE_FONT_BOLD_ITALIC,
+    ];
     let missing: Vec<u32> = wanted
         .iter()
         .copied()
@@ -55,7 +69,22 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
     if missing.is_empty() {
         return;
     }
-    let wants_large = missing.contains(&g::AEE_FONT_LARGE);
+    // The italic designators are copies of the upright face and need no source font. When every
+    // base designator is already installed — a person's `--font`, `--font-bold`, `--font-large` —
+    // this is the whole job.
+    let needs_source = missing.iter().any(|id| {
+        matches!(
+            *id,
+            g::AEE_FONT_NORMAL | g::AEE_FONT_BOLD | g::AEE_FONT_LARGE
+        )
+    });
+    if !needs_source {
+        install_derived(rt, &missing);
+        return;
+    }
+    let wants_large = missing
+        .iter()
+        .any(|id| matches!(*id, g::AEE_FONT_LARGE | g::AEE_FONT_LARGE_ITALIC));
     let mut why = Vec::new();
     // A candidate that carries Latin only rasterizes into a perfectly readable face and then
     // answers every ideograph with the undefined glyph. That is the failure this module exists
@@ -79,7 +108,8 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
             first_latin_only.get_or_insert(path.clone());
             continue;
         }
-        let normal = match wide_face_from(&path, &data, SIZE) {
+        let normal_size = rt.device.font_normal;
+        let normal = match wide_face_from(&path, &data, normal_size) {
             Ok(face) => face,
             Err(error) => {
                 why.push(error);
@@ -90,16 +120,14 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
             why.push(format!("{path}: the rasterized face has no CJK glyph"));
             continue;
         }
-        // A 32-pixel cell is four times the pixels; a font that rasterizes at 16 and not at 32
-        // still gives a readable large face, so it is used and the run says what happened rather
-        // than leaving "large" the same size as "normal" without a word.
+        let large_size = rt.device.font_large;
         let large = if wants_large {
-            match wide_face_from(&path, &data, LARGE_SIZE) {
+            match wide_face_from(&path, &data, large_size) {
                 Ok(face) => face,
                 Err(error) => {
                     rt.display.note(format!(
-                        "no {LARGE_SIZE}-pixel large face ({error}); AEE_FONT_LARGE uses the \
-                         {SIZE}-pixel face"
+                        "no {large_size}-pixel large face ({error}); AEE_FONT_LARGE uses the \
+                         {normal_size}-pixel face"
                     ));
                     Arc::clone(&normal)
                 }
@@ -107,14 +135,60 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
         } else {
             Arc::clone(&normal)
         };
-        for id in &missing {
-            let face = if *id == g::AEE_FONT_LARGE {
-                Arc::clone(&large)
-            } else {
-                Arc::clone(&normal)
-            };
-            rt.display.install_face(*id, Face::Bbf(face));
+        if missing.contains(&g::AEE_FONT_NORMAL) {
+            rt.display
+                .install_face(g::AEE_FONT_NORMAL, Face::Bbf(Arc::clone(&normal)));
         }
+        if missing.contains(&g::AEE_FONT_LARGE) {
+            rt.display
+                .install_face(g::AEE_FONT_LARGE, Face::Bbf(Arc::clone(&large)));
+        }
+        // The installed normal face is the one an italic designator copies; the bold designator is
+        // the normal face one column wider unless the person supplied a bold face of their own.
+        if missing.contains(&g::AEE_FONT_BOLD) {
+            let base = rt
+                .display
+                .face(g::AEE_FONT_NORMAL)
+                .unwrap_or(Face::Bbf(Arc::clone(&normal)));
+            rt.display.install_face(g::AEE_FONT_BOLD, base.emboldened());
+        }
+        install_derived(rt, &missing);
+        // The carrier's family names a cell per class. A size the designator faces already have is
+        // reused; the rest are rasterized. A size the source cannot draw is left to the
+        // nearest-designator rows in `FONT_FACES`.
+        let sized_face = |size: u16| -> Option<Arc<bbf::Bbf>> {
+            if normal_size == size {
+                return Some(Arc::clone(&normal));
+            }
+            if wants_large && large_size == size {
+                return Some(Arc::clone(&large));
+            }
+            wide_face_from(&path, &data, size)
+                .ok()
+                .filter(|face| face_has_wide_scripts(face))
+        };
+        let face12 = sized_face(12);
+        let face16 = sized_face(16);
+        let face24 = sized_face(24);
+        let face32 = sized_face(32);
+        let bold_face = |face: &Arc<bbf::Bbf>| Face::Bbf(Arc::new(face.emboldened()));
+        let mut attach = |cls: u32, face: Option<&Arc<bbf::Bbf>>, bold: bool| {
+            if let Some(face) = face {
+                let face = if bold {
+                    bold_face(face)
+                } else {
+                    Face::Bbf(Arc::clone(face))
+                };
+                rt.font_class_faces.insert(cls, face);
+            }
+        };
+        attach(g::KDDI_FONT_FIXED12X12, face12.as_ref(), false);
+        attach(g::KDDI_FONT_FIXED12X12B, face12.as_ref(), true);
+        attach(g::KDDI_FONT_FIXED16X16, face16.as_ref(), false);
+        attach(g::KDDI_FONT_FIXED16X16B, face16.as_ref(), true);
+        attach(g::KDDI_FONT_FIXED24X24B, face24.as_ref(), true);
+        attach(g::KDDI_FONT_FIXED32X32, face32.as_ref(), false);
+        attach(g::KDDI_FONT_FIXED32X32B, face32.as_ref(), true);
         return;
     }
     if latin_only > 0 {
@@ -123,6 +197,9 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
             first_latin_only.as_deref().unwrap_or("?")
         ));
     }
+    // Whatever the person installed can still answer the italic copies even when no CJK source
+    // was found.
+    install_derived(rt, &missing);
     rt.display.note(format!(
         "no CJK face: {}; text outside the built-in 5x8 grid will draw as boxes",
         if why.is_empty() {
@@ -131,6 +208,24 @@ pub fn install(rt: &mut Runtime, keep: &[u32]) {
             why.join("; ")
         }
     ));
+}
+
+/// Fill the italic designators by copying the upright face they name.
+///
+/// A copy is the whole answer for a designator this host has no slanted cut for: the text keeps
+/// its face, weight and size, which is what a pack that asked for italic needs. A designator
+/// whose upright face is still missing is left alone.
+fn install_derived(rt: &mut Runtime, missing: &[u32]) {
+    let copy = |rt: &mut Runtime, from: u32, to: u32| {
+        if missing.contains(&to) {
+            if let Some(face) = rt.display.face(from) {
+                rt.display.install_face(to, face);
+            }
+        }
+    };
+    copy(rt, g::AEE_FONT_NORMAL, g::AEE_FONT_ITALIC);
+    copy(rt, g::AEE_FONT_LARGE, g::AEE_FONT_LARGE_ITALIC);
+    copy(rt, g::AEE_FONT_BOLD, g::AEE_FONT_BOLD_ITALIC);
 }
 
 /// Whether a source face can draw a script a CJK pack writes in.
@@ -171,7 +266,9 @@ fn wide_face_from(path: &str, data: &[u8], size: u16) -> Result<Arc<bbf::Bbf>, S
     let cache = cache_file(path, data, size);
     if let Some(file) = cache.as_deref() {
         if let Ok(bytes) = std::fs::read(file) {
-            if let Ok(face) = bbf::Bbf::parse(&bytes) {
+            if let Ok(face) =
+                bbf::Bbf::parse(&bytes).map(|face| face.with_key_space(bbf::KeySpace::Unicode))
+            {
                 return Ok(Arc::new(face));
             }
         }
@@ -196,7 +293,7 @@ fn wide_face_from(path: &str, data: &[u8], size: u16) -> Result<Arc<bbf::Bbf>, S
         let _ = std::fs::write(file, &bytes);
     }
     bbf::Bbf::parse(&bytes)
-        .map(Arc::new)
+        .map(|face| Arc::new(face.with_key_space(bbf::KeySpace::Unicode)))
         .map_err(|e| format!("{path}: {e}"))
 }
 

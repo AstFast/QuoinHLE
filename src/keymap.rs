@@ -1,7 +1,7 @@
 //! Which key a player pressed, in the handset's own vocabulary.
 //!
 //! Three things have to agree here: a physical keyboard, a virtual one drawn from data, and a
-//! `--key AVK_SOFT1` in a log line. So the table is written as **SDK names** and the numbers come
+//! `--key AVK_SOFT1` in a log line. So the table is written as **published names** and the numbers come
 //! out of the generated constants — a code cannot drift from what the ABI says, and a name that
 //! stops existing fails loudly instead of silently sending a different key.
 //!
@@ -35,7 +35,7 @@ const VK_X: usize = 0x58;
 /// A key the emulated handset has.
 #[derive(Clone, Copy, Debug)]
 pub struct Key {
-    /// Its `AVK_*` name in the SDK.
+    /// Its `AVK_*` name in the platform.
     pub name: &'static str,
     /// What to paint on it. `AVK_SOFT1` is not a label a player reads, and the glyphs stay ASCII
     /// because a UI font is not promised to carry anything else.
@@ -53,7 +53,7 @@ impl Key {
     }
 }
 
-/// Every key the shipped packs were seen to take, in reading order.
+/// Every key the guest packs were seen to take, in reading order.
 pub const KEYS: &[Key] = &[
     Key {
         name: "AVK_SOFT1",
@@ -137,7 +137,7 @@ pub const KEYS: &[Key] = &[
     },
 ];
 
-/// A handset key for a PC one, and only for the keys the shipped packs actually take.
+/// A handset key for a PC one, and only for the keys the guest packs actually take.
 ///
 /// The soft keys are the load-bearing part: a pack's own confirmation question answers `AVK_SOFT1`
 /// and declines `AVK_SELECT`, so a keyboard that cannot send a soft key cannot get past the first

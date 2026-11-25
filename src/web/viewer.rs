@@ -101,7 +101,7 @@ impl Runtime {
                 let text = self.cpu.mem.read_cstr(src, TEXT_CAP)?;
                 let (out, ok) = web::b64_decode(&text);
                 if dst != 0 {
-                    // Written first, whatever the answer is: the shipped member decodes as it walks
+                    // Written first, whatever the answer is: the reference member decodes as it walks
                     // and its `-1` has no rollback behind it (the delivered body precedes the checks
                     // at).
                     self.cpu.mem.write_bytes(dst, &out)?;
@@ -175,7 +175,7 @@ impl Runtime {
     /// A caller that wants a C string counts its own terminator into the size it passes, exactly as
     /// it must on a handset — and one that reserved the size this reports and got a byte written
     /// past it is the failure this host used to be able to cause by being one byte tidier than the
-    /// shipped member.
+    /// reference member.
     ///
     /// The two halves differ in counting mode: `UrlEncode` jumps to `done` at, past the
     /// write at, so a sizing call leaves `*pnInLen` exactly as the caller set it, while
@@ -256,15 +256,21 @@ impl Runtime {
                 // are deliberately NOT pushed onto this object's own list, because "overrides" is
                 // exactly the distinction that says a later `GetOpt` on the object must not find
                 // them — and on a handset it would not.
-                // No response object: this host has no network, so there is nothing to hand back.
+                // A failed request still hands back a response object, because the header's answer
+                // is a `WebRespInfo` and the callback's whole job is to read it: `nCode` carries
+                // either a protocol code or a *negative* `WEB_ERROR_*`, and `WEB_ERROR_MAP(nCode)`
+                // is the published way to tell them apart. A null response is the shape a pack
+                // cannot survive — iPremium's timer callback calls `GetInfo()` on the answer
+                // without testing the pointer first.
                 if ppresp != 0 {
-                    self.cpu.mem.write_u32(ppresp, 0)?;
+                    let response = self.build_failure_response(Self::WEB_ERROR_CONNECT)?;
+                    self.cpu.mem.write_u32(ppresp, response)?;
                 }
                 // "pcb: where to call when answer is ready". The answer, on a handset
                 // with no connection, is a failure — and it has to arrive *through this callback*,
-                // because the prototype's own return is `None`. A host that wrote the
-                // null response and never called back would leave a pack waiting for an answer that is
-                // not coming, which is the one shape this project refuses to ship.
+                // because the prototype's own return is `None`. A host that laid the answer out and
+                // never called back would leave a pack waiting for a notification that is not
+                // coming, which is the one shape this project refuses to ship.
                 //
                 // Queued rather than called inline: an `AEECallback` comes due later (it is the same
                 // struct `ISHELL_SetTimerEx` takes — see [`Timer`]), and a pack that is still inside
@@ -338,6 +344,14 @@ impl Runtime {
                         Err(why) => {
                             self.net_log
                                 .push((at, format!("-> GET {asked} (id {id}) not sent: {why}")));
+                            // No reply is coming, so the callback `pcb` promises must find an
+                            // answer object, for the same reason the no-network path above lays
+                            // one out.
+                            if ppresp != 0 {
+                                let response =
+                                    self.build_failure_response(Self::WEB_ERROR_CONNECT)?;
+                                self.cpu.mem.write_u32(ppresp, response)?;
+                            }
                         }
                     }
                 }
@@ -383,7 +397,29 @@ impl Runtime {
         Ok(addr)
     }
 
+    /// `WEB_ERROR_CONNECT` from the error header ("some kind of connect error"), as the *negative*
+    /// `nCode` a handset with no data connection reports. The response object is still laid out:
+    /// `WebRespInfo.nCode` is where both a protocol code and this answer live.
+    const WEB_ERROR_CONNECT: i32 = -(g::WEB_ERROR_BASE as i32 + 9);
+
     pub(crate) fn build_response(&mut self, answer: &net::Answer) -> HResult<Option<u32>> {
+        self.build_response_code(answer, i32::from(answer.status))
+    }
+
+    /// The answer a request that could not be sent is reported with: no body, no content type, and
+    /// a negative `nCode`. It exists so the caller's callback has an object to read, which is what
+    /// the header's `GetInfo` contract assumes a callback is handed.
+    fn build_failure_response(&mut self, code: i32) -> HResult<u32> {
+        let answer = net::Answer {
+            status: 0,
+            content_type: None,
+            body: Vec::new(),
+            truncated: false,
+        };
+        Ok(self.build_response_code(&answer, code)?.unwrap_or(0))
+    }
+
+    fn build_response_code(&mut self, answer: &net::Answer, code: i32) -> HResult<Option<u32>> {
         let info_size = abi::struct_info("WebRespInfo")
             .expect("WebRespInfo is in the ABI tables")
             .size;
@@ -449,9 +485,7 @@ impl Runtime {
         self.cpu
             .mem
             .write_bytes(info, &vec![0u8; info_size as usize])?;
-        self.cpu
-            .mem
-            .write_u32(info + at("nCode"), u32::from(answer.status))?;
+        self.cpu.mem.write_u32(info + at("nCode"), code as u32)?;
         self.cpu
             .mem
             .write_u32(info + at("lContentLength"), answer.body.len() as u32)?;
@@ -535,7 +569,7 @@ impl Runtime {
             "SetOption" => {
                 let [option, value] = self.args()?;
                 let id = option as i32;
-                // The shipped setter carries a whitelist, not a table write:
+                // The reference setter carries a whitelist, not a table write:
                 //the two strings, three counters clamped into
                 // 0..=100, two colours and the `IWeb` pointer. Anything else answers
                 // `EUNSUPPORTED` and stores nothing, which is why this host cannot be talked into
@@ -568,7 +602,7 @@ impl Runtime {
                 } else {
                     self.widgets.html_set_option(this, id, value)?;
                 }
-                // A scrollbar column the page did not have is a different layout: the shipped
+                // A scrollbar column the page did not have is a different layout: the reference
                 // setter runs its whole `SetRect` again for exactly this option,
                 //and this host's `html_fit` is that re-run.
                 if id == crate::web::html::HVOPT_N_SBWIDTH {
@@ -597,7 +631,7 @@ impl Runtime {
                 // `HVOPT_PTR_IWEB` is a pointer, so it is never read as text — it only says whether
                 // the page has a transport. All three of these can make a `src` resolvable that was
                 // not before, so the picture scan runs again after any of them.
-                // `HVOPT_PTR_IWEB` arrives as an object the pack created. The shipped setter
+                // `HVOPT_PTR_IWEB` arrives as an object the pack created. The reference setter
                 // gates it on a `QueryInterface` for `AEECLSID_CONTROL` and answers `EBADPARM`
                 // when the object refuses; this host has no
                 // machine code to run the guest's `QueryInterface`, so the gate it can honestly
@@ -619,7 +653,7 @@ impl Runtime {
             "GetOption" => {
                 let [option, pv] = self.args()?;
                 let id = option as i32;
-                // The shipped getter answers the six numeric options it stores and nothing else:
+                // The reference getter answers the six numeric options it stores and nothing else:
                 //the string options answer `EUNSUPPORTED`
                 // without a write, and so does any id outside the pool. `HVOPT_N_ERROR` is one of
                 // the six — get-only, zeroed at birth, never written by a setter this host can
@@ -641,7 +675,7 @@ impl Runtime {
                 }
                 if id == crate::web::html::HVOPT_PTR_IWEB {
                     // A quirk worth keeping because a caller that checks the return value sees it:
-                    // the shipped getter writes the stored pointer and *then* answers
+                    // the reference getter writes the stored pointer and *then* answers
                     // `EUNSUPPORTED` (the delivered body falls through to the same
                     // `return 20` every unknown id takes).
                     if pv != 0 {
@@ -674,7 +708,7 @@ impl Runtime {
             }
             "SetData" => {
                 let [psz, len] = self.args()?;
-                // The shipped body cancels whatever load is in flight before it parses, and the
+                // The documented behaviour cancels whatever load is in flight before it parses, and the
                 // cancel is what tells the caller the previous load is over.
                 self.html_cancelled_notify(this)?;
                 self.widgets
@@ -764,7 +798,7 @@ impl Runtime {
                 let doc = self.widgets.html_document(this)?;
                 self.widgets
                     .html_set_state(this, &doc, &state, self.display.faces())?;
-                // The shipped reader clamps the offset it was given into
+                // The reference reader clamps the offset it was given into
                 // `[0, content - view height]` before it applies anything:
                 //a state saved on a taller control is a
                 // position this page may not have.
@@ -1092,7 +1126,7 @@ impl Runtime {
         // and the `name=value` pairs of everything the form encloses. `HViewJump` has a slot for
         // all four, and `HVN_SUBMIT` used to leave the last two at zero.
         let (url, method, data) = if code == g::HVN_SUBMIT {
-            // The form posts what its controls hold *now*, not what the page shipped with: that is
+            // The form posts what its controls hold *now*, not what the page came with: that is
             // the whole point of typing in one. The clone is because the notification below needs
             // `self` mutably while the values live on the control.
             let values = self.widgets.html(this)?.values.clone();
@@ -1204,7 +1238,7 @@ impl Runtime {
         code: u32,
         dwp: u32,
     ) -> HResult<bool> {
-        // The shipped door refuses *everything* while the control is inactive — its first line is
+        // The reference door refuses *everything* while the control is inactive — its first line is
         // `if (Dox_IsActive(...) == 0) return 0`, the same shape
         // `ITimeCtl` and `IDateCtl` have in this host's event door. Keys, characters and pen all
         // wait for `SetActive(TRUE)`.
@@ -1212,7 +1246,7 @@ impl Runtime {
             return Ok(false);
         }
         // The pen names a place, not a step, so it has its own door: `EVT_PEN_DOWN`/`EVT_PEN_UP`
-        // carry the position packed into `dwParam`. This SDK has no
+        // carry the position packed into `dwParam`. This platform has no
         // `EVT_STYLUS_*`; those belong to later BREW versions.
         if matches!(evt, g::EVT_PEN_DOWN | g::EVT_PEN_MOVE | g::EVT_PEN_UP) {
             return self.html_pointer(ctl, evt, dwp);
@@ -1315,7 +1349,7 @@ impl Runtime {
                 self.html_activate(ctl, &doc, elem, kind, (0, 0))
             }
             // The digits and the two keys beside them are the only characters with key codes in
-            // this SDK, so a pack that sends keys and no `EVT_CHAR` can still fill a
+            // this platform, so a pack that sends keys and no `EVT_CHAR` can still fill a
             // number in.
             _ => match key_char(code) {
                 Some(ch) => self.html_insert_at_focus(ctl, &doc, ch),
@@ -1553,7 +1587,7 @@ impl Runtime {
     /// on it, which is the same pair the keyboard performs with the arrows and `AVK_SELECT`.
     ///
     /// A pen that travels while it is down is dragging the page instead: a press is only a click
-    /// once it ends where it began, and this SDK's three pen events are what says whether it did.
+    /// once it ends where it began, and this platform's three pen events are what says whether it did.
     fn html_pointer(&mut self, ctl: u32, evt: u32, dwp: u32) -> HResult<bool> {
         // Signed x in the upper sixteen bits, signed y in the lower.
         let x = ((dwp >> 16) & 0xffff) as u16 as i16;
@@ -1638,7 +1672,7 @@ impl Runtime {
 }
 /// The character a key code stands for, when it stands for one.
 ///
-/// Only the digits and the two keys after them have key codes in this SDK's the header; the
+/// Only the digits and the two keys after them have key codes in this platform's the header; the
 /// letters arrive as `EVT_CHAR` because a phone keypad has no letter keys. That asymmetry is the
 /// interface's, not this host's.
 fn key_char(code: u32) -> Option<char> {

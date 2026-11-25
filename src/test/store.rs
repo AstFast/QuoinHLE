@@ -3,7 +3,7 @@
 // that is what lets these tests reach its private items with `use super::*`.
 
 use super::*;
-use crate::resource::{synthetic_container, RESTYPE_IMAGE};
+use crate::resource::{synthetic_container, RESTYPE_BINARY, RESTYPE_IMAGE};
 use std::path::PathBuf;
 
 /// A throwaway fixture directory. Named with this process's id because the suite runs tests in
@@ -105,6 +105,64 @@ fn a_flat_layout_adopts_the_manifest_named_for_the_module() {
         .find(None, RESTYPE_IMAGE, 8)
         .expect("the neighbour still has an id 8");
     assert_eq!(fell_through.from, "someone-else.mif");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_single_numeric_manifest_is_the_app_own() {
+    // Expanded packs are often `<appid>/` with `<appid>.mif` inside, not `app.mif` beside the
+    // module. When that is the only manifest mounted, it is this app's — nothing else in the
+    // directory carries an `AEEAppInfo`.
+    let root = scratch("numeric-own");
+    std::fs::write(root.join("app.mod"), b"x").unwrap();
+    std::fs::write(
+        root.join("18555.mif"),
+        synthetic_container(&[(RESTYPE_BINARY, 2, b"app-info")], 0),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("art.bar"),
+        synthetic_container(&[(RESTYPE_IMAGE, 7, b"BMart")], 0),
+    )
+    .unwrap();
+    let mut store = Store::default();
+    store.mount_beside(&root.join("app.mod"));
+    assert_eq!(store.manifest().as_deref(), Some("18555.mif"));
+    assert!(
+        store
+            .applet_info()
+            .is_some_and(|bytes| bytes.ends_with(b"app-info")),
+        "the numeric manifest is where the applet class comes from"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_same_stem_art_bar_does_not_outvote_the_numeric_manifest() {
+    // The layout `splintercell.mod` ships: `15099.mif` carries the app info, while the art container
+    // is named for the module. The old same-stem rule adopted the art, so discovery never saw the
+    // class id and said the module claimed none of the ids in its image.
+    let root = scratch("numeric-plus-art");
+    std::fs::write(root.join("app.mod"), b"x").unwrap();
+    std::fs::write(
+        root.join("15099.mif"),
+        synthetic_container(&[(RESTYPE_BINARY, 2, b"info-15099")], 0),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.bar"),
+        synthetic_container(&[(RESTYPE_IMAGE, 7, b"BMart")], 0),
+    )
+    .unwrap();
+    let mut store = Store::default();
+    store.mount_beside(&root.join("app.mod"));
+    assert_eq!(store.manifest().as_deref(), Some("15099.mif"));
+    assert!(
+        store
+            .applet_info()
+            .is_some_and(|bytes| bytes.ends_with(b"info-15099")),
+        "the art container has no app-info to adopt"
+    );
     std::fs::remove_dir_all(&root).unwrap();
 }
 

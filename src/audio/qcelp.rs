@@ -166,7 +166,7 @@ impl<'a> Qcp<'a> {
             let rate = FrameRate::from_byte(byte).ok_or(Error::BadFrameRate(byte))?;
             let end = offset + rate.packet_len();
             if end > self.data.len() {
-                // RFC 3625 files in the corpus can end with a trimmed packet. The complete packets
+                // RFC 3625 files in the sample set can end with a trimmed packet. The complete packets
                 // before it are still usable; refusing the whole clip over the last fragment would
                 // turn a playable ring tone into silence.
                 break;

@@ -1,4 +1,4 @@
-//! Disassembly: what the guest's own bytes mean, written the way an assembler would write them.
+//! Inspection: what the guest's own bytes mean, written the way an assembler would write them.
 //!
 //! [`crate::cpu::arm`] decodes and executes in one pass — it matches on an encoding and does the
 //! work — so it cannot be asked "what is this word?" without executing it. This is the other half,

@@ -28,7 +28,7 @@ use crate::mem::Mem;
 
 /// A colour as `IGraphics` holds it: three components, packed `(r << 8) + (g << 16) + (b << 24)`.
 ///
-/// The fourth byte is part of the *prototype* and not part of the state — the shipped setters drop
+/// The fourth byte is part of the *prototype* and not part of the state — the reference setters drop
 /// the `alpha` argument on the floor and `GetColor` answers it from the packed word's low byte, which
 /// is always `0`. So `a` is stored rather than guessed at, and it is `0` on every path the runtime
 /// itself writes. AEEGraphics.h is explicit that it is "just a placeholder that has no effect".
@@ -95,7 +95,7 @@ pub struct State {
     /// rebuilding the struct, so a pack's padding bytes round trip — and a shape the body refused on a
     /// radius test still left them stored.
     pub clip_raw: [u8; 16],
-    /// `SetClip`: the shipped `byte[+102]`, remembered because `GetViewport` reports it and
+    /// `SetClip`: the reference `byte[+102]`, remembered because `GetViewport` reports it and
     /// `ClearViewport` shrinks by one pixel on each side when it is set.
     pub framed: bool,
     /// The `byte[+50]`/`byte[+52]` world origin that `Translate` accumulates into and `Pan` recentres.
@@ -105,7 +105,7 @@ pub struct State {
     /// The `IBitmap` being drawn into, or `0` for the screen itself.
     pub dest: u32,
     /// The depth of that destination, which `GetColorDepth` answers and `SetDestination` re-reads.
-    /// The shipped object caches it at `byte[+105]` from the same `IBitmap::GetInfo` that sized the
+    /// The reference object caches it at `byte[+105]` from the same `IBitmap::GetInfo` that sized the
     /// window, so it changes only when the destination does.
     pub depth: u32,
     /// The display this state was made from, so `Update` reaches something. Resolved again at the
@@ -217,7 +217,7 @@ impl Graphics {
     /// The two boxes a clip is made of, stored together: the figure the caller named, run through
     /// `transformRectToScreen`, and the window `valid` tests, which is that figure clamped into the
     /// drawn window the way `drawRect` and `initShapeClipInfo` clamp `[+88]..[+94]`. Clamping happens
-    /// **here**, at the call that sets the clip, and never at draw time: the box the shipped code tests
+    /// **here**, at the call that sets the clip, and never at draw time: the box the platform code tests
     /// is whatever the last reset or narrowing left behind, and a `Translate` afterwards moves the
     /// figure's mapping without moving it.
     pub fn set_clip(st: &mut State, figure: Rect, kind: u32) {

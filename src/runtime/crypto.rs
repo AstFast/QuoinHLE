@@ -10,7 +10,7 @@ impl Runtime {
     /// the same gate order, and one difference a caller cannot miss. DES pads or over-reads a length
     /// that is not a whole block; **SEED holds those bytes in the object** and emits nothing for them,
     /// and because this table has no `Finish` and its `Flush` is empty, a held tail is never produced.
-    /// The other difference is the answer itself: the shipped `Cipher` returns `*pcbOut`, so a call that
+    /// The other difference is the answer itself: the reference `Cipher` returns `*pcbOut`, so a call that
     /// produced thirty-two bytes answers `32` where the DES family answered `0`.
     ///
     /// Kept out of the dispatch frame on purpose: `the_host_stack_one_downcall_level_costs_is_measured`
@@ -18,7 +18,13 @@ impl Runtime {
     /// inlining it would charge those bytes to *every* level of the chain rather than to the one call
     /// that asks for SEED.
     #[inline(never)]
-    pub(crate) fn icipher_seed(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn icipher_seed(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -95,9 +101,15 @@ impl Runtime {
     /// decided here is only what the guest's memory sees.
     ///
     /// The fault rules are the caller's, not this host's: a null `pbData` beside a non-zero count
-    /// faults at address 0 through `read_bytes`, exactly where the shipped body's copy would; a zero
+    /// faults at address 0 through `read_bytes`, exactly where the documented behaviour's copy would; a zero
     /// count beside a null pointer is the no-op that body performs without touching it.
-    pub(crate) fn ihash(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ihash(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -105,7 +117,7 @@ impl Runtime {
         };
         match name {
             // `void Update(IHash* po, byte* pbData, int cbData)`. `cbData` is signed in the
-            // prototype and the shipped body walks it as a count, so a negative figure feeds
+            // prototype and the documented behaviour walks it as a count, so a negative figure feeds
             // nothing rather than being widened into four gigabytes of reads.
             "Update" => {
                 let [pdata, cbdata] = self.args()?;
@@ -181,13 +193,19 @@ impl Runtime {
     /// holding the vector it was given; the length word is clamped to `min(cbIn, *pcbOut)` *before* the
     /// initialized flag is looked at, and is echoed back after a walk that wrote a whole block past it;
     /// and `Flush` is two bytes of `BX LR` that clear nothing at all.
-    pub(crate) fn icipher(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn icipher(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
             this,
         };
-        // Two shipped members publish this same five-slot table and disagree about what a short length
+        // Two reference members publish this same five-slot table and disagree about what a short length
         // means, so the record map decides which body answers — the class decided at creation.
         if self.seeds.contains_key(&this) {
             return self.icipher_seed(id, this, label, name);
@@ -313,7 +331,7 @@ impl Runtime {
             // key, no vector and no flag, so the object goes on encrypting after it; the only thing a
             // caller could read out of the call is `r0`, which the body leaves holding `po`.
             "Flush" => Ok(this),
-            // The shipped table is five words with **no `QueryInterface`** among them, so there is no
+            // The reference table is five words with **no `QueryInterface`** among them, so there is no
             // such slot to answer — a caller that reached for one was calling `Init`.
             _ => Err(Error::Hle(unimplemented())),
         }
@@ -326,14 +344,20 @@ impl Runtime {
     /// `Encrypt` hands the ciphertext to the caller's buffer, a `Decrypt` strips padding off the block,
     /// a `VerifySig` strips it in place and then walks a DER `DigestInfo`.
     ///
-    /// Nothing here defers. The shipped deferral is a chunked loop inside `BIGINT_ModExpEx` that
+    /// Nothing here defers. The reference deferral is a chunked loop inside `BIGINT_ModExpEx` that
     /// reaches eighteen bits before it yields (`if (a6 == 0 || v53 < 18)`), and this host has no
     /// chunking to yield from, so it publishes the result and resumes the callback — the state a
-    /// handset ends in, one dispatch step early, and without the `pfnCancel` hookup the shipped body
+    /// handset ends in, one dispatch step early, and without the `pfnCancel` hookup the documented behaviour
     /// writes into the caller's callback (`AEERSA_Cancel` is a function address, and the host's stub
     /// space encodes "interface and slot", not a free closure). The first operation that asks for a
     /// callback says so once.
-    pub(crate) fn irsa(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn irsa(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -392,7 +416,7 @@ impl Runtime {
                 let mut code = 0u32;
                 // Both words are written before anything is computed, and with the value the object
                 // holds — so an operation that was never given a key hands back `0` and a capacity of
-                // `0`, which is what the shipped body hands back out of its uninitialized record.
+                // `0`, which is what the documented behaviour hands back out of its uninitialized record.
                 self.cpu.mem.write_u32(ppbout, record.block)?;
                 self.cpu.mem.write_u32(pcbout, record.capacity as u32)?;
                 if record.modulus.is_none() || record.exponent.is_none() {
@@ -414,7 +438,7 @@ impl Runtime {
                 let mut code = 0u32;
                 // Both words are written before anything is computed, and with the value the object
                 // holds — so an operation that was never given a key hands back `0` and a capacity of
-                // `0`, which is what the shipped body hands back out of its uninitialized record.
+                // `0`, which is what the documented behaviour hands back out of its uninitialized record.
                 self.cpu.mem.write_u32(ppbout, record.block)?;
                 self.cpu.mem.write_u32(pcbout, record.capacity as u32)?;
                 if record.modulus.is_none() || record.exponent.is_none() {
@@ -615,7 +639,7 @@ impl Runtime {
     /// "leave it alone" — compare it against the modulus the way the body's `Cmp` call does, and
     /// exponentiate. `None` is that comparison refusing: the body tests `> 0`, so a value **equal** to
     /// the modulus gets through and comes back `0`, and only a bigger one answers `AEE_EBADPARM`. That
-    /// off-by-one is shipped, and the header even describes the gate with the same inequality.
+    /// off-by-one is reference, and the header even describes the gate with the same inequality.
     pub(crate) fn irsa_transform(
         &mut self,
         record: &mut rsa::Rsa,
@@ -639,7 +663,7 @@ impl Runtime {
     /// `VerifySig` then read their padded block from and where a caller of `IRSA_RSA` or
     /// `IRSA_ModExp` was pointed. The length `Get` reports goes into a local the body drops — the
     /// caller's `pcbOut` keeps the capacity the slot wrote into it, not the number of bytes that came
-    /// back — and the bytes past the answer are the previous operation's, exactly as the shipped
+    /// back — and the bytes past the answer are the previous operation's, exactly as the reference
     /// hundred-byte record leaves them.
     pub(crate) fn irsa_finished(
         &mut self,
@@ -657,7 +681,7 @@ impl Runtime {
     }
 
     /// The end of `AEERSA_Done`, in order: write the answer through the caller's result word — with no
-    /// test on it, so a null `pdwResult` faults here the way the shipped body faults writing through
+    /// test on it, so a null `pdwResult` faults here the way the documented behaviour faults writing through
     /// zero — and then, if a callback was named, resume it the way the body calls `IShell::Resume`
     /// (slot 36, byte 144) rather than calling the pack's function itself.
     pub(crate) fn rsa_publish(
@@ -691,7 +715,13 @@ impl Runtime {
     /// The memory-backed source `ISourceUtil` hands out. `gvtMemPeek_ISource` is the eight-slot
     /// `IPeek` table — the base three, then `Read`/`Readable`, then `Peek`/`Peekable`/`Advance` — over
     /// bytes the caller owns, with the shell that made the object copied into `+4`.
-    pub(crate) fn ipeek(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ipeek(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -725,7 +755,7 @@ impl Runtime {
                 }
                 Ok(n)
             }
-            // Both slots are the same one line in the shipped object: `IShell::Resume` on the shell the
+            // Both slots are the same one line in the reference object: `IShell::Resume` on the shell the
             // factory copied into `+4` (vtable byte 144 is slot 36, which is `Resume` in the vendored
             // table), i.e. "tell me through this callback when the applet is running again". Bytes
             // that are already in memory have nothing to wait for, so the callback is queued for the
@@ -744,7 +774,7 @@ impl Runtime {
                 Ok(g::SUCCESS)
             }
             // `Peek` answers a pointer into the caller's own bytes. The special length is the one
-            // question that does not ask for data: the shipped body writes `0x7fffffff` as the room
+            // question that does not ask for data: the documented behaviour writes `0x7fffffff` as the room
             // and `IPEEK_UNK` as the code, which is this object's way of saying "never full".
             "Peek" => {
                 let [wanted, avail_at, code_at] = self.args()?;
@@ -769,5 +799,4 @@ impl Runtime {
             _ => Err(Error::Hle(unimplemented())),
         }
     }
-
 }

@@ -357,6 +357,27 @@ fn thumb_add_sub_immediate() {
 }
 
 #[test]
+fn armv6_thumb_extends_widen_without_branching() {
+    // (halfword, input in r6, expected in r0, what)
+    let cases: &[(u16, u32, u32, &str)] = &[
+        (0xb2b0, 0x0000_8001, 0x0000_8001, "uxth r0, r6"),
+        (0xb2f0, 0x0000_00ff, 0x0000_00ff, "uxtb r0, r6"),
+        (0xb230, 0x0000_8001, 0xffff_8001, "sxth r0, r6"),
+        (0xb270, 0x0000_0080, 0xffff_ff80, "sxtb r0, r6"),
+    ];
+    for &(insn, input, expected, what) in cases {
+        let cpu = run(&[insn], |cpu| cpu.r[6] = input);
+        assert_eq!(cpu.r[0], expected, "{what}: r0 = {:#010x}", cpu.r[0]);
+        assert_eq!(
+            cpu.pc,
+            CODE + 2,
+            "an extend must not branch; pc moved to {:#010x}",
+            cpu.pc
+        );
+    }
+}
+
+#[test]
 fn later_architectures_are_refused_by_name() {
     // `0xb148` really is `cbz`: both would run as something plausible if the decoder guessed.
     // `0xdf2a` cannot carry an HLE id at all.

@@ -622,7 +622,11 @@ mod tests {
         c.pc = CODE_A;
         let _ = c.run(64);
         let published = shape(&jit_of(&c).core.memory.windows);
-        assert_ne!(published[0], (0, 0, 0), "a published main window is required");
+        assert_ne!(
+            published[0],
+            (0, 0, 0),
+            "a published main window is required"
+        );
         assert_eq!(c.mem.window_generation(), 0);
 
         // The heap maps a new page: the layout generation advances, the window generation must not.
@@ -651,6 +655,98 @@ mod tests {
             c.r[0], 0xdead_beef,
             "a page mapped after freezing the windows must read the real value through the callback"
         );
+    }
+
+    /// `--compat unmapped-read` is answered inside `Mem::at`, which every guest access reaches, so
+    /// the translating backend inherits the switch without a line of its own: an address outside the
+    /// published windows falls back to `Bridge`'s callbacks, those call `Mem`, and `Mem` answers
+    /// zero. This test pins *the seam*, not the switch — `Bridge` is the one place that could take
+    /// the switch back off, by turning "no window covers this address" into a fault of its own.
+    ///
+    /// The second half is the promise the switch makes: a store to the same address still faults.
+    /// That belongs here and not only in `mem.rs`, because compiled code touches a window inline and
+    /// no callback runs: a window stretched over an unmapped page would swallow the store silently.
+    /// So the window has to end exactly where the mapping ends, under the switch too.
+    #[test]
+    fn compat_unmapped_read_reaches_the_translating_backend() {
+        const FAR: u32 = 0x5000_0000; // mapped by nothing this test builds
+        const LDR_R0_R1: u32 = 0xe591_0000;
+        const STR_R0_R1: u32 = 0xe581_0000;
+        const SPIN: u32 = 0xeaff_fffe;
+
+        let machine = |insn: u32, compat: bool| {
+            let mut c = Cpu::new(Mem::new());
+            // Two pages, because `Mem::fast_spans` drops a one-page run: "an extra comparison on
+            // every access to save one callback does not pay". The window is what this test is
+            // about, so it has to exist.
+            c.mem.map(CODE_A, 0x2000);
+            c.mem.write_u32(CODE_A, insn).unwrap();
+            c.mem.write_u32(CODE_A + 4, SPIN).unwrap();
+            c.mem.set_compat_read_zero(compat);
+            c.pc = CODE_A;
+            c.r[0] = 0x1234;
+            c.r[1] = FAR;
+            c.r[13] = CODE_A + 0x800;
+            c.enable_jit();
+            c
+        };
+
+        // Without the switch: the load is a data abort, the way the interpreter reports it.
+        match machine(LDR_R0_R1, false).run(64) {
+            Stop::Fault(CpuFault {
+                kind: FaultKind::Data { addr, reason },
+                ..
+            }) => {
+                assert_eq!(addr, FAR, "the fault names the address the load read");
+                assert_eq!(
+                    reason,
+                    MemFault::Unmapped { addr: FAR },
+                    "and says why: nothing is mapped there"
+                );
+            }
+            other => panic!("expected a data abort from the load, got {other:?}"),
+        }
+
+        // With it: the load answers zero and the guest keeps running to the end of the budget.
+        let mut loose = machine(LDR_R0_R1, true);
+        assert!(
+            matches!(loose.run(64), Stop::Budget { .. }),
+            "under the switch an unmapped load is not a fault"
+        );
+        assert_eq!(loose.r[0], 0, "it answers zero, not whatever was in r0");
+
+        // The switch must not be implemented by widening a window. The mapped pages publish
+        // exactly `[CODE_A, CODE_A + 0x2000)`, so the address past them still goes through `Mem` —
+        // and a store there faults, as the switch promises.
+        let published = jit_of(&loose).core.memory.windows;
+        let page = published
+            .iter()
+            .flatten()
+            .find(|w| CODE_A >= w.base && CODE_A < w.base + w.len as u32)
+            .expect("the mapped pages are published as a window");
+        assert_eq!(
+            page.base + page.len as u32,
+            CODE_A + 0x2000,
+            "the window ends where the mapping ends: past it, accesses have to reach `Mem`"
+        );
+        assert!(
+            !published
+                .iter()
+                .flatten()
+                .any(|w| FAR >= w.base && FAR < w.base + w.len as u32),
+            "nothing is mapped at {FAR:#010x}, so no window may cover it"
+        );
+
+        match machine(STR_R0_R1, true).run(64) {
+            Stop::Fault(CpuFault {
+                kind: FaultKind::Data { addr, reason },
+                ..
+            }) => {
+                assert_eq!(addr, FAR);
+                assert_eq!(reason, MemFault::Unmapped { addr: FAR });
+            }
+            other => panic!("a store past the map still faults under the switch, got {other:?}"),
+        }
     }
 
     /// With the compile budget clamped to two blocks, almost every block runs into an
@@ -696,10 +792,19 @@ mod tests {
         let mut tiny = build(Some(2));
         assert!(matches!(wide.run(500), Stop::Budget { .. }));
         assert!(matches!(tiny.run(500), Stop::Budget { .. }));
-        assert_eq!(tiny.r, wide.r, "a cache invalidation must not rewrite registers");
+        assert_eq!(
+            tiny.r, wide.r,
+            "a cache invalidation must not rewrite registers"
+        );
         assert_eq!(tiny.pc, wide.pc, "a cache invalidation must not rewrite pc");
-        assert_eq!(tiny.cpsr, wide.cpsr, "lazy flag materialisation must be equivalent");
-        assert_eq!(tiny.steps, wide.steps, "invalidation must not swallow or add instructions");
+        assert_eq!(
+            tiny.cpsr, wide.cpsr,
+            "lazy flag materialisation must be equivalent"
+        );
+        assert_eq!(
+            tiny.steps, wide.steps,
+            "invalidation must not swallow or add instructions"
+        );
     }
 
     /// The HUD's JIT line is only as good as this accessor: it must see a real block count, and a
@@ -719,7 +824,11 @@ mod tests {
             "the interpreter has no code cache, so there is no reading"
         );
         c.enable_jit();
-        assert_eq!(c.jit_cached_blocks(), Some(0), "the cache is empty right after enabling the backend");
+        assert_eq!(
+            c.jit_cached_blocks(),
+            Some(0),
+            "the cache is empty right after enabling the backend"
+        );
         assert!(matches!(c.run(64), Stop::Budget { .. }));
         assert!(
             c.jit_cached_blocks().is_some_and(|n| n > 0),
@@ -779,7 +888,9 @@ mod tests {
         let mut tight = build();
         tight.set_jit_compile_budget(Some(8));
         let _ = tight.run(CHUNK);
-        let per_turn = tight.jit_cached_blocks().expect("the backend must report a reading once enabled");
+        let per_turn = tight
+            .jit_cached_blocks()
+            .expect("the backend must report a reading once enabled");
         assert!(
             per_turn <= 8,
             "the number of blocks compiled in one turn must be capped by the quota: quota 8, actual {per_turn}"
@@ -808,7 +919,10 @@ mod tests {
         assert_eq!(tight.r, loose.r, "the quota must not change registers");
         assert_eq!(tight.pc, loose.pc, "the quota must not change pc");
         assert_eq!(tight.cpsr, loose.cpsr, "the quota must not change flags");
-        assert_eq!(tight.steps, loose.steps, "the quota must not swallow or add instructions");
+        assert_eq!(
+            tight.steps, loose.steps,
+            "the quota must not swallow or add instructions"
+        );
         assert!(
             tight.jit_cached_blocks().unwrap() <= loose.jit_cached_blocks().unwrap(),
             "the quota can only reduce compilation, never increase it"

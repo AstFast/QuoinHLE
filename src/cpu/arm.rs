@@ -2,9 +2,9 @@
 //!
 //! Coverage is the ARMv5TE subset a RVCT-built BREW module actually emits. Where a group is
 //! defined but not implemented the executor reports it by name instead of inventing a semantic,
-//! so `--trace` points straight at the gap. Every encoding here was read off either the real
-//! bytes of a delivered module or an independent disassembly of a hand-assembled word; a
-//! hand-assembler was tried as the other witness and is not trustworthy (it mis-encodes
+//! so `--trace` points straight at the gap. Every encoding here was derived either from the
+//! bytes of a delivered module or an independent inspection of a hand-assembled word; a
+//! hand-assembler was tried as the other record and is not trustworthy (it mis-encodes
 //! BLX-immediate, the halfword transfers and SWP), so it is not the source of any claim below.
 //!
 //! Refused by name rather than guessed at: the coprocessor group, multiply-shaped words this core
@@ -57,11 +57,30 @@ fn scaled_offset(insn: u32) -> u32 {
     }
 }
 
+/// `SXTB`/`SXTH`/`UXTB`/`UXTH`, returned as `(Rd, Rm, signed, source bits)`.
+///
+/// Two fixed fields tell them from everything else in the load/store group — `bits[19:16]` are
+/// `1111` and `bits[11:4]` are `0x07` — so no media-space word can be mistaken for one of these by
+/// sharing a neighbour's bits.
+const fn extend_operands(insn: u32) -> Option<(u32, u32, bool, u32)> {
+    if (insn >> 16) & 0xf != 0xf || (insn >> 4) & 0xff != 0x07 {
+        return None;
+    }
+    let (signed, bits) = match (insn >> 20) & 0xff {
+        0x6a => (true, 8),
+        0x6b => (true, 16),
+        0x6e => (false, 8),
+        0x6f => (false, 16),
+        _ => return None,
+    };
+    Some(((insn >> 12) & 0xf, insn & 0xf, signed, bits))
+}
+
 impl Cpu {
     pub(crate) fn step_arm(&mut self, pc: u32, insn: u32) -> Result<(), Stop> {
         // ARMv5TE leaves condition `0b1111` UNDEFINED — it is not "always", which only came back in
         // ARMv8. The space that prefix opens is not all undefined, though: ARMv5 put BLX-immediate
-        // there for ARM→Thumb interworking, and shipped modules emit it. Executing the rest as a nop
+        // there for ARM→Thumb interworking, and guest modules emit it. Executing the rest as a nop
         // instead lets a guest that has branched into a data blob slide through whole `0xffffffff`
         // words and abort far from the branch that left the code, so everything else still faults.
         if insn >> 28 == 0b1111 {
@@ -82,7 +101,19 @@ impl Cpu {
         // condition code sits directly above it.
         match (insn >> 25) & 0b111 {
             0b000 | 0b001 => self.arm_dp_muls(pc, insn),
-            0b010 | 0b011 => self.arm_transfer(pc, insn),
+            0b010 | 0b011 => {
+                // ARMv6's sign/zero extends put themselves in this group's bits[27:25] but in none
+                // of its fields: bits[19:16] are fixed `1111` and bits[11:4] fixed `0x07`. Read as a
+                // transfer — which is what this host did — the instruction *ran* and changed
+                // nothing, because `Rn` came out as r15 and the write-back through PC is skipped. A
+                // guest pack's `sxth` (`a sample module`, `a sample module`) therefore executed as a no-op with
+                // its effect pushed 600 000 instructions down the road, which is the failure shape
+                // this file's own rule forbids: a value that looks reasonable instead of a refusal.
+                if let Some((rd, rm, signed, bits)) = extend_operands(insn) {
+                    return self.extend_register(rd, rm, signed, bits);
+                }
+                self.arm_transfer(pc, insn)
+            }
             0b100 => self.arm_block_transfer(pc, insn),
             0b101 => self.arm_branch(insn),
             // 0b110 is LDC/STC, 0b111 is CDP/MRC/MCR. An ARM1136J-S with no VFP still has the
@@ -188,8 +219,14 @@ impl Cpu {
         if top == 0x0120_0070 {
             return Err(self.illegal(pc, insn)); // BKPT with no debugger attached.
         }
-        if top == 0x016f_1f10 {
-            // CLZ r1, r2 -> e16f1f12
+        // CLZ carries its destination in bits 15..12, so the mask has to leave Rd free. With
+        // `0x0fff_fff0` the comparison pinned Rd to 1, and every `clz` with another destination
+        // fell through to the multiply group — where it was decoded as something else and left
+        // the register untouched. A 64-bit division routine normalises its divisor with
+        // `clz r6, r2` and then shifts by that count, so a silent zero there turns the whole
+        // quotient into nonsense rather than raising anything.
+        if insn & 0x0fff_0ff0 == 0x016f_0f10 {
+            // CLZ r6, r2 -> e16f6f12
             let value = self.reg(insn & 0xf);
             self.set_reg((insn >> 12) & 0xf, value.leading_zeros());
             return Ok(());
@@ -234,9 +271,9 @@ impl Cpu {
         }
 
         // The halfword group. Bits[7:4]=0xb is `LDRH`/`STRH` with an immediate offset — the
-        // instruction a real shipped module faulted on, `0xe1c405b0` = `strh r0, [r4, #0x50]` — and
+        // instruction a real guest module faulted on, `0xe1c405b0` = `strh r0, [r4, #0x50]` — and
         // its 0xd/0xf neighbours are the signed loads `LDRSB`/`LDRSH`, all four confirmed against
-        // an independent disassembly. With bit20 clear those same two nibbles
+        // an independent inspection. With bit20 clear those same two nibbles
         // are instead the pair transfers `LDRD`/`STRD`, which is what stopped two store titles.
         // What is left in this bit pattern is refused by name: an even nibble in bits[7:4] is not
         // one of the four transfer forms above, and this core has not identified it.
@@ -252,7 +289,7 @@ impl Cpu {
         // The multiply group numbers its registers differently from data processing, which is easy
         // to get wrong and impossible to notice from a test that was written against the same
         // mistake: `Rd` is bits[19:16], and bits[15:12] is the accumulator — required to be r0 for
-        // `MUL`, which is how a shipped module's `mul r2, r5, r10` (`0xe002059a`) confirms the order
+        // `MUL`, which is how a guest module's `mul r2, r5, r10` (`0xe002059a`) confirms the order
         // from both directions. Only the long forms pair the two fields, as `RdLo`/`RdHi`.
         let rd = (insn >> 16) & 0xf;
         let rn = (insn >> 12) & 0xf;
@@ -296,7 +333,7 @@ impl Cpu {
                     // Hardware leaves C and V alone (measured with both preset: `umulls`/`smlals`
                     // return `C=1 V=1`), and sets N and Z from the *low* half — the product's high
                     // half being zero does not raise Z. This core still writes both from `RdHi` and
-                    // clears C and V, which no corpus word has been measured to exercise; recorded
+                    // clears C and V, which no sample set word has been measured to exercise; recorded
                     // rather than quietly kept.
                     self.set_nz((out >> 32) as u32);
                     self.set_flag(FLAG_C, false);
@@ -306,13 +343,13 @@ impl Cpu {
             }
             // What reaches here has the multiply nibble `1001` in bits[7:4] but no combination of
             // bit24 and bits[23:21] this core has identified. Sweeping every word of all five
-            // shipped modules finds no such word executed anywhere, so there is no corpus evidence
+            // guest modules finds no such word executed anywhere, so there is no sample set evidence
             // to name it by and no way to check a guess — which is exactly why it stops by name
             // rather than being run as the data-processing instruction its nibble resembles.
             _ if insn & 0xf0 == 0x90 => Err(self.unimplemented(pc, insn, "unclassified multiply")),
             // Nothing special matched this word, so it is a data-processing instruction that
             // happened to arrive here because `bit4` is set — a shift by register. Measured over
-            // 29 525 words of a shipped module, the old catch-all (`bits[27:24] == 0001`, which is
+            // 29 525 words of a guest module, the old catch-all (`bits[27:24] == 0001`, which is
             // also `MOV`'s shape) swallowed 903 words, and the binary contains no `QADD`, `QSUB` or
             // `SAT` at all; this is where `lsl r1, r0, r3` died.
             _ => self.arm_dp_operand(insn),
@@ -372,6 +409,32 @@ impl Cpu {
         Ok(())
     }
 
+    /// `SXTB`/`SXTH`/`UXTB`/`UXTH`, shared by both instruction sets: the ARM encodings at
+    /// `cond 0110 101x 1111 Rd 0000 0111 Rm` and Thumb's `0xB200`-`0xB2FF`.
+    ///
+    /// ARMv6, and outside the class this core otherwise models, but a guest pack executes them on
+    /// its own module-init path (the ARM words from `a sample module`, the Thumb ones from a pack built for
+    /// a v6 handset). Four instructions answered honestly beats the alternative the host had —
+    /// decoding one as a transfer and letting it do nothing, or refusing the Thumb form outright —
+    /// because a guest that reads the result cannot tell "not implemented" from "computed".
+    pub(super) fn extend_register(
+        &mut self,
+        rd: u32,
+        rm: u32,
+        signed: bool,
+        bits: u32,
+    ) -> Result<(), Stop> {
+        let raw = self.reg(rm);
+        let up = 32 - bits;
+        let out = if signed {
+            (((raw << up) as i32) >> up) as u32
+        } else {
+            (raw << up) >> up
+        };
+        self.set_reg(rd, out);
+        Ok(())
+    }
+
     /// Groups `010`/`011`: LDR/STR, word and byte, immediate and register offset. The halfword,
     /// signed and doubleword forms are *not* here — they encode in group `000`.
     #[inline(always)]
@@ -423,7 +486,16 @@ impl Cpu {
 
         if l {
             let value = self.load(pc, effective, size)?;
-            self.set_reg(rd, value);
+            if rd == 15 {
+                // `LDR pc, ...` is `LoadWritePC`, and from ARMv5 on that behaves as `BX` — bit 0 of
+                // the loaded word selects the instruction set. It is how ARM code returns to a Thumb
+                // caller: `pop {pc}` assembles to exactly this instruction (`e49df004`), and reading
+                // it as an ordinary register write dropped the T bit, so the caller's Thumb bytes were
+                // then fetched as ARM (a sample pack faulted on `f0 f7 a5 f9` at 0x1000fce0).
+                self.branch_to(value, true);
+            } else {
+                self.set_reg(rd, value);
+            }
         } else {
             // A stored R15 is the address of the *next* instruction plus four.
             let value = if rd == 15 {
@@ -456,7 +528,7 @@ impl Cpu {
         // bit20 *clear* and bits[6:5] = `10`/`11` (nibbles `0xd` and `0xf`), and take load-versus-
         // store from **bit5** rather than from bit20. That is why the word `0xe1cd82d0` is
         // `ldrd r8, sb, [sp, #0x20]` while setting bit5 on it — moving the nibble to `0xf` — reads
-        // the matching `strd`, both confirmed by two independent disassemblies of the same bytes.
+        // the matching `strd`, both confirmed by two independent inspections of the same bytes.
         // The pair therefore has to be picked out ahead of the store side below, which reads bit20
         // as the direction the way the rest of the group does.
         let pair = !l && nibble != 0xb;
@@ -489,7 +561,7 @@ impl Cpu {
 
         if pair {
             // The pair moves `Rt` from the addressed word and `Rt + 1` from the one after it. An odd
-            // `Rt`, or a second register past r14, is UNPREDICTABLE: no shipped compiler emits one, so
+            // `Rt`, or a second register past r14, is UNPREDICTABLE: no reference compiler emits one, so
             // it is named rather than answered with a result the architecture refuses to define.
             let store = insn & bit(5) != 0;
             let hi = rd + 1;
@@ -559,7 +631,7 @@ impl Cpu {
         }
         // Only `W` moves the base in this group — `!P` is Thumb's "always write back" rule and does
         // not belong here — and it happens *before* the transfers, because when the base register is
-        // itself in the list the loaded value is what the register ends up holding. A shipped module
+        // itself in the list the loaded value is what the register ends up holding. A guest module
         // reloads its own argument pointer exactly that way (`ldm r6, {r4,r5,r6}`, no writeback), and
         // taking the address instead handed it a stack address where a small index belonged.
         if w {
@@ -600,7 +672,7 @@ impl Cpu {
     ///
     /// This comment used to assert that no ARMv5 module built for BREW calls a Thumb function
     /// through BLX-immediate and that it therefore need not be decoded. That is withdrawn: two
-    /// shipped Resident Evil builds and six QQ builds open with a compiler-generated veneer that
+    /// reference Resident Evil builds and six QQ builds open with a compiler-generated veneer that
     /// shuffles arguments in ARM and then `blx` into the pack's Thumb body.
     #[inline(always)]
     fn arm_branch(&mut self, insn: u32) -> Result<(), Stop> {

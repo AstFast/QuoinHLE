@@ -37,7 +37,7 @@
 //! POST /quit                          end the run, the way closing the window does
 //! ```
 //!
-//! A code or an event is a published SDK name (`AVK_DOWN`) or a number (`0xe031`), the same two
+//! A code or an event is a published interface name (`AVK_DOWN`) or a number (`0xe031`), the same two
 //! forms the command line takes — because a report says names, and this interface is meant to be
 //! driven by whoever is reading the report.
 
@@ -421,11 +421,11 @@ impl Request {
             .map(|(_, v)| v.clone())
     }
 
-    /// A field that has to be there, and has to be a number or a published SDK name.
+    /// A field that has to be there, and has to be a number or a published interface name.
     fn code(&self, key: &str) -> Result<u32, String> {
         let raw = self.get(key).ok_or_else(|| format!("{key} is required"))?;
         resolve(&raw)
-            .ok_or_else(|| format!("{key}={raw:?} is neither a number nor a published SDK name"))
+            .ok_or_else(|| format!("{key}={raw:?} is neither a number nor a published interface name"))
     }
 
     fn number<T: std::str::FromStr>(&self, key: &str, default: T) -> Result<T, String> {
@@ -486,7 +486,7 @@ fn route(rt: &mut Runtime, journal: &mut Journal, req: &Request) -> Answer {
         ("POST", "/input/keydown") => match req.code("code") {
             Ok(code) => {
                 // A key that is already down is not pressed a second time. The device sends its own
-                // repeats from there (`AEEVCodes.h`: the first one `KB_AUTOREPEAT_START` ms after the
+                // repeats from there (the key declarations: the first one `KB_AUTOREPEAT_START` ms after the
                 // initial `EVT_KEY`, then every `KB_AUTOREPEAT_RATE`), and a second press pair would
                 // tell the pack the key went down twice — which a pack keeping a mask of the keys down
                 // reads as a key that stays down after its one release. Refusing is the honest answer,
@@ -578,7 +578,7 @@ fn route(rt: &mut Runtime, journal: &mut Journal, req: &Request) -> Answer {
                 None => Answer::text(
                     400,
                     "Bad Request",
-                    format!("cls={raw:?} is neither a number nor a published SDK name\n"),
+                    format!("cls={raw:?} is neither a number nor a published interface name\n"),
                 ),
                 Some(cls) => match rt.start_app(cls, None) {
                     Ok(rv) => Answer::json(
@@ -682,7 +682,7 @@ fn event_args(req: &Request) -> Result<(u32, u32, u32), String> {
         match req.get(key) {
             None => Ok(0),
             Some(raw) => resolve(&raw).ok_or_else(|| {
-                format!("{key}={raw:?} is neither a number nor a published SDK name")
+                format!("{key}={raw:?} is neither a number nor a published interface name")
             }),
         }
     };
@@ -777,7 +777,7 @@ fn fault_text(c: &crate::runtime::Crash) -> String {
     )
 }
 
-/// A number, or an SDK name for one — the two forms the command line takes too, for the same
+/// A number, or a platform name for one — the two forms the command line takes too, for the same
 /// reason: a report says `AVK_DOWN`, so an interface meant to be driven by someone reading reports
 /// has to accept it.
 fn resolve(v: &str) -> Option<u32> {
@@ -791,7 +791,7 @@ fn resolve(v: &str) -> Option<u32> {
     }
 }
 
-/// The published name for a value, or the number when the SDK has none. Header enums share values
+/// The published name for a value, or the number when the platform has none. Header enums share values
 /// freely, so the caller says which family it is naming rather than taking whichever entry the
 /// table lists first.
 fn named(value: u32, prefers: &str) -> String {

@@ -1,7 +1,7 @@
 //! The database store's own tests: the bytes [`encode`] builds and the walk [`step`] takes.
 //!
 //! Every expectation here is derived from `AEEDBRecord_Update` and `AEEDBRecord_NextField` read
-//! instruction by instruction, so a failure means the codec drifted from the shipped body rather
+//! instruction by instruction, so a failure means the codec drifted from the documented behaviour rather
 //! than that a format was chosen differently. The two are worth telling apart, which is why the
 //! arithmetic appears in the comments rather than only in the assertions.
 
@@ -91,7 +91,7 @@ fn the_walk_reads_every_field_and_then_stops_at_the_terminator() {
 #[test]
 fn the_end_of_a_record_parks_the_walk_where_it_started() {
     // The body stores zero in `m_pCurField` when a field read fails, and zero is also "nothing read
-    // yet" — so a record enumerated to its end starts over. This is that, and it is the shipped
+    // yet" — so a record enumerated to its end starts over. This is that, and it is the reference
     // shape rather than a convenience.
     let bytes = encode(&[field(3, 1, Value::Bytes(1u32.to_le_bytes().to_vec()))]);
     let (first, _) = step(&bytes, None).expect("the only field");
@@ -108,8 +108,8 @@ fn a_record_needs_only_its_terminator() {
 
 #[test]
 fn a_header_that_runs_past_its_bytes_is_not_a_field() {
-    // A four-byte header that claims 40 bytes of payload in a 6-byte record. The shipped body read
-    // this through an OEM layer that had validated it; here it has to answer "no field".
+    // A four-byte header that claims 40 bytes of payload in a 6-byte record. The documented behaviour read
+    // this through a platform layer that had validated it; here it has to answer "no field".
     assert_eq!(field_at(&[5, 1, 40, 0], 0), None);
 }
 
@@ -325,7 +325,7 @@ fn a_damaged_file_is_refused_whole() {
         "a record that runs into the index"
     );
     assert_eq!(decode_file(b"NOT-A-QBDB-FILE"), None, "not ours");
-    // `LoadIndex` reads exactly `recCount` entries and ignores the rest, so the shipped reader
+    // `LoadIndex` reads exactly `recCount` entries and ignores the rest, so the reference reader
     // tolerates slack at the end of a file. This host has to agree or it would delete such a file.
     let mut slack = file.clone();
     slack.push(0);
@@ -388,7 +388,7 @@ fn one_name_is_one_database_however_many_handles() {
     assert!(dbs.is_open("chess"));
     assert_eq!(dbs.by_id(0x2000, 0).map(|r| r.bytes), Some(vec![1]));
     // Two handles on one name is a state the store allows, so "open" is a question about the name
-    // and stays true until the last of them goes. The shipped body hands out a fresh object for
+    // and stays true until the last of them goes. The documented behaviour hands out a fresh object for
     // every open, so this is also the state a pack that opened twice is really in.
     dbs.detach(0x1000);
     assert!(dbs.is_open("chess"));
@@ -414,7 +414,7 @@ fn a_record_outlives_the_database_it_came_from() {
     );
     assert!(dbs.detach(0x1000).is_some());
     // The record keeps its bytes and its cursor — releasing the database cannot take back a pointer
-    // the pack still holds, and the shipped `Release` documents that it cannot even close while one
+    // the pack still holds, and the reference `Release` documents that it cannot even close while one
     // is out. What it loses is the database behind it.
     assert_eq!(dbs.holder(0x3000).map(|h| h.id), Some(0));
     assert!(dbs.open(0x1000).is_none());

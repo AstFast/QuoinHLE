@@ -42,15 +42,21 @@ impl Runtime {
     /// The `IDBMgr` — the database manager (`AEEDBMgr_New`, the delivered body).
     ///
     /// The manager is the one DB object that needs no OEM state to build: its constructor allocates
-    /// a record and sets the reference count, nothing else. `OpenDatabase` is where the shipped body
+    /// a record and sets the reference count, nothing else. `OpenDatabase` is where the documented behaviour
     /// reaches `OEM_DBOpenEx`/`OEM_DBCreate`, and that layer lived in the handset's
     /// firmware — so this host stands one up, which is what [`crate::db`] is: the record bodies the
-    /// shipped `AEEDBRecord_Update` builds, stored in a file in the app's own volume, behind the
+    /// reference `AEEDBRecord_Update` builds, stored in a file in the app's own volume, behind the
     /// same three interfaces.
     ///
-    /// `IDBMgr` inherits only `IBase`: the shipped vtable is AddRef/Release/OpenDatabase/Remove/
+    /// `IDBMgr` inherits only `IBase`: the reference vtable is AddRef/Release/OpenDatabase/Remove/
     /// SetCacheSize, with **no `QueryInterface` slot**, so there is none to answer.
-    pub(crate) fn idbmgr(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn idbmgr(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -58,7 +64,7 @@ impl Runtime {
         };
         match name {
             // `IDatabase *IDBMgr_OpenDatabase(me, const char *pszFile, boolean bCreate, uint32
-            // dwMinSize, uint16 wMinRecs)`. The name is not validated here because the shipped body
+            // dwMinSize, uint16 wMinRecs)`. The name is not validated here because the documented behaviour
             // does not validate it either — it hands it straight to the OEM, which is
             // the volume's own lookup. `dwMinSize`/`wMinRecs` are the OEM's preallocation hints
             // (the delivered body passes them straight to `OEM_DBCreate`): they decide how much room a
@@ -68,8 +74,8 @@ impl Runtime {
                 let [file, create, _min_size, _min_recs] = self.args()?;
                 let name = self.cstring(file)?;
                 if name.is_empty() {
-                    // `OEM_DBOpenEx` was handed a null or empty name; the shipped body does not
-                    // check it and the OEM layer answered "not found", which is the NULL this gives.
+                    // `OEM_DBOpenEx` was handed a null or empty name; the documented behaviour does not
+                    // check it and the platform layer answered "not found", which is the NULL this gives.
                     return Ok(0);
                 }
                 self.db_open(&name, create != 0)
@@ -106,11 +112,11 @@ impl Runtime {
     /// first, and only its `AEE_DB_ERR_NOT_EXIST` reaches `OEM_DBCreate`. A file that is there but
     /// cannot be read is a different failure — a short header gives `BAD_STATE`,
     /// while a broken index just makes `LoadIndex` rebuild one from the data area — and on
-    /// `BAD_STATE` the shipped body *deletes* the file and still returns NULL: `OEM_DBDelete`
+    /// `BAD_STATE` the documented behaviour *deletes* the file and still returns NULL: `OEM_DBDelete`
     /// writes `NO_ERR` into the same error word, so the create test below it
     /// can no longer pass. The next open is the one that finds `NOT_EXIST` and creates.
     ///
-    /// `db::decode_file` now reads the shipped OEM layout as well as the older container this host
+    /// `db::decode_file` now reads the reference OEM layout as well as the older container this host
     /// used to write, so a preloaded handset database opens here rather than arriving at that
     /// branch. What still fails is a file that is not a database in either format, or one whose
     /// data area is damaged. `bCreate` is permission to make a *missing* file, not to overwrite
@@ -145,7 +151,7 @@ impl Runtime {
                 Vec::new()
             }
         };
-        // A fresh object per open, which is what the shipped body does: `OEM_DBOpenEx` shares its
+        // A fresh object per open, which is what the documented behaviour does: `OEM_DBOpenEx` shares its
         // OEM context (refCount++) but `AEEDatabase_New` still builds a new
         // object every time. The store is shared by name, so two handles see one set of records.
         let addr =
@@ -206,7 +212,7 @@ impl Runtime {
                     self.read_or_empty(buffer, width)?
                 }
                 // Everything else is `wDataLen` bytes the caller named. A null pointer with a
-                // non-zero length is the caller's mistake; the shipped body would hand it to
+                // non-zero length is the caller's mistake; the documented behaviour would hand it to
                 // `aee_memmove`, and a fault is not something this host can be more useful about
                 // than an empty field.
                 _ => self.read_or_empty(buffer, stated as u32)?,
@@ -218,7 +224,11 @@ impl Runtime {
 
     /// An `IDBRecord` object for one record of `database`, its bytes copied where the guest can read
     /// them.
-    pub(crate) fn db_record_object(&mut self, database: u32, record: &db::Record) -> Result<u32, Error> {
+    pub(crate) fn db_record_object(
+        &mut self,
+        database: u32,
+        record: &db::Record,
+    ) -> Result<u32, Error> {
         let addr =
             self.hle
                 .new_object(&mut self.cpu.mem, "IDBRecord", g::AEECLSID_DBMGR, 8, 4, &[])?;
@@ -245,7 +255,7 @@ impl Runtime {
 
     /// Install a freshly encoded record as the bytes the guest reads through this object.
     ///
-    /// `false` is the shipped body's `ENOMEMORY`: the new copy does not fit and the heap has no room
+    /// `false` is the documented behaviour's `ENOMEMORY`: the new copy does not fit and the heap has no room
     /// for a bigger one. The object is left exactly as it was in that case, so an `Update` can answer
     /// the error without the store and the guest copy disagreeing — in particular nothing ends up
     /// pointing at address zero or at a block already back on the free list.
@@ -303,7 +313,10 @@ impl Runtime {
     /// The pointer is into the guest's copy of the record except for a *narrow* string, where the
     /// body `aee_malloc`s a wide transcription per call; that block is kept on the record object and
     /// reused, which is the same bytes and one allocation instead of one per read.
-    pub(crate) fn db_current_field(&mut self, addr: u32) -> Result<Option<(u8, u8, u32, u16)>, Error> {
+    pub(crate) fn db_current_field(
+        &mut self,
+        addr: u32,
+    ) -> Result<Option<(u8, u8, u32, u16)>, Error> {
         let Some(holder) = self.dbs.holder(addr).cloned() else {
             return Ok(None);
         };
@@ -342,7 +355,7 @@ impl Runtime {
                     if block == 0 {
                         // The body falls back to the narrow bytes in place when its allocation
                         // fails, and so does this: the caller then reads one byte per character,
-                        // which is the bug the shipped code has when out of memory.
+                        // which is the bug the platform code has when out of memory.
                         return Ok(Some((view.kind, view.name, pointer + 1, view.len)));
                     }
                     if let Some(held) = self.dbs.holder_mut(addr) {
@@ -369,7 +382,13 @@ impl Runtime {
 
     /// The `IDatabase` face. Every slot reads through the store by the name the
     /// object was opened under, which is why the manager is the only place a record can come from.
-    pub(crate) fn idbdatabase(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn idbdatabase(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -378,7 +397,7 @@ impl Runtime {
         let Some(open) = self.dbs.open(this).cloned() else {
             // An address that is not an open database: the object was released, or it was never one.
             // Both answer zero for the slots that return a pointer and zero for a count, which is
-            // what the shipped body does with a null handle (`AEEDatabase_GetRecordCount` returns
+            // what the documented behaviour does with a null handle (`AEEDatabase_GetRecordCount` returns
             // its zero for `[+12] == 0`).
             return match name {
                 "Reset" => Ok(0),
@@ -405,7 +424,7 @@ impl Runtime {
                 self.db_record_object(this, &record)
             }
             // `IDBRecord *IDatabase_GetRecordByID(me, uint16 wID)`. The body refuses
-            // `AEE_DB_RECID_NULL` before it asks the OEM layer for anything.
+            // `AEE_DB_RECID_NULL` before it asks the platform layer for anything.
             "GetRecordByID" => {
                 let [want] = self.args()?;
                 let Some(record) = self.dbs.by_id(this, want as u16) else {
@@ -437,7 +456,13 @@ impl Runtime {
     /// Every slot works on the record's *current field*, which `Reset` puts before the first and
     /// `NextField` walks forward — the header's own wording, and the reason `GetFieldWord` and
     /// friends do not move it.
-    pub(crate) fn idbrecord(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn idbrecord(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -475,7 +500,7 @@ impl Runtime {
                 }
                 let fields = self.db_fields(pfields, count)?;
                 let bytes = db::encode(&fields);
-                // The shipped body mallocs the new record before it asks the OEM layer to write it,
+                // The documented behaviour mallocs the new record before it asks the platform layer to write it,
                 // and answers ENOMEMORY when that malloc fails. Do it in the same order: the store
                 // only changes once the guest-visible copy can actually hold the new bytes.
                 if !self.db_holder_recopy(this, &bytes)? {
@@ -491,7 +516,7 @@ impl Runtime {
                 Ok(0)
             }
             // `int IDBRecord_Remove(me)`: the record leaves the database and the object goes with it.
-            // The body returns the OEM layer's error byte, which this host owns now.
+            // The body returns the platform layer's error byte, which this host owns now.
             "Remove" => {
                 let Some(holder) = self.dbs.holder(this).cloned() else {
                     return Ok(g::DB_ERROR_BASE);
@@ -557,7 +582,7 @@ impl Runtime {
                 Ok(pointer)
             }
             // The three typed readers are `GetField` plus a type test and a copy, which is what the
-            // shipped bodies are (`AEEDBRecord_GetFieldWord` calls slot 7 through the vtable).
+            // the platform's own routines are (`AEEDBRecord_GetFieldWord` calls slot 7 through the vtable).
             "GetFieldWord" | "GetFieldDWord" => {
                 let [out] = self.args()?;
                 if out == 0 {
@@ -588,5 +613,4 @@ impl Runtime {
             _ => Err(unimplemented().into()),
         }
     }
-
 }

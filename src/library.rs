@@ -37,22 +37,22 @@ pub struct Icon {
     pub rgb: Vec<u8>,
 }
 
-/// Which witness claims a screen. Naming one by hand is not a witness, so it is not in this list: the
+/// Which record claims a screen. Naming one by hand is not a record, so it is not in this list: the
 /// player has that option too, and it is neither of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Witness {
+pub enum Claim {
     /// The `WxH` typed into the directory the pack is filed under.
     Folder,
     /// The canvas the pack's own art argues for (`crate::probe::Screen`).
     Art,
 }
 
-impl Witness {
-    /// What the picker calls this witness — the two words a person reads before choosing it.
+impl Claim {
+    /// What the picker calls this record — the two words a person reads before choosing it.
     pub fn name(&self) -> &'static str {
         match self {
-            Witness::Folder => "directory",
-            Witness::Art => "art",
+            Claim::Folder => "directory",
+            Claim::Art => "art",
         }
     }
 }
@@ -63,8 +63,8 @@ impl Witness {
 pub struct Candidate {
     pub width: u16,
     pub height: u16,
-    pub witness: Witness,
-    /// What backs this claim, in the witness's own words. The picker shows it beside the number because
+    pub claim: Claim,
+    /// What backs this claim, in the record's own words. The picker shows it beside the number because
     /// `sizes` is **not** a vetted list: a marquee bar can sit in it looking exactly like a background
     /// and the one thing that tells the two apart is this sentence.
     pub evidence: String,
@@ -77,7 +77,7 @@ impl Candidate {
         Pick::Claim {
             width: self.width,
             height: self.height,
-            witness: self.witness,
+            claim: self.claim,
         }
     }
 }
@@ -91,7 +91,7 @@ pub enum Pick {
     Claim {
         width: u16,
         height: u16,
-        witness: Witness,
+        claim: Claim,
     },
     /// Typed by hand, and labelled as such wherever it is shown.
     Manual { width: u16, height: u16 },
@@ -114,7 +114,7 @@ pub struct Decision {
 /// The directory-name scan ([`screen_of`]) and the CLI's `--device` (`src/main.rs`, which takes any
 /// non-zero `u16` pair) still have no upper bound, so the hazard is not closed by this function — it is
 /// closed nowhere until one rule sits where the frame is allocated. That gap is recorded in
-/// The measurement that makes it cheap: every size the corpus claims in a directory name is inside
+/// The measurement that makes it cheap: every size the sample set claims in a directory name is inside
 /// these bounds (128x128, 176x220, 220x176, 240x320, 320x240, 480x240 — 0 of 6 outside), so tightening
 /// it would not change any pack this library has ever booted.
 pub fn manual_size(wide: &str, high: &str) -> Option<(u16, u16)> {
@@ -139,12 +139,12 @@ pub fn decide(row: &Row, pick: Option<Pick>) -> Decision {
         Some(Pick::Claim {
             width,
             height,
-            witness,
+            claim,
         }) => (
             Some((width, height)),
             format!(
                 "{width}x{height} from {what}'s evidence",
-                what = witness.name()
+                what = claim.name()
             ),
         ),
         Some(Pick::Manual { width, height }) => (
@@ -161,7 +161,7 @@ pub fn decide(row: &Row, pick: Option<Pick>) -> Decision {
                 (
                     None,
                     format!(
-                        "host default {}x{} (not chosen, no witness)",
+                        "host default {}x{} (not chosen, no record)",
                         d.width, d.height
                     ),
                 )
@@ -183,7 +183,7 @@ pub struct Row {
     /// Which build this is and which screen somebody claimed for it.
     pub subtitle: String,
     pub detail: Vec<String>,
-    /// What each witness claims, folder first. Empty is an honest answer, not a missing one. A claim the
+    /// What each record claims, folder first. Empty is an honest answer, not a missing one. A claim the
     /// probe calls thin is withheld and explained by [`Row::caution`]. Each claim that *is* left carries
     /// its own evidence sentence, and the picker has to show it: a marquee bar has an area over
     /// `THIN_ART` and so reads as a plain candidate — the number alone cannot tell that
@@ -213,13 +213,13 @@ impl Row {
                 evidence: format!("from the directory: {}", entry.build),
                 width,
                 height,
-                witness: Witness::Folder,
+                claim: Claim::Folder,
             });
         }
         // An art canvas too wide for the size a boot takes is not a screen anyone could ask for, so it is
         // offered as a `detail` line rather than as a candidate — the number itself stays readable there.
         // And when the probe says its art is too thin to judge, the number it produces is an icon's
-        // width: 16 of this corpus's 35 builds mount nothing but their three icons (widest 65x42) and
+        // width: 16 of this sample set's sample builds mount nothing but their three icons (widest 65x42) and
         // some mount only a few small pictures (widest 50x50). Those claims stay in the report, where the
         // warning travels with them, and off the list, where a number alone would read as evidence.
         if let Some(s) = probe.screen.as_ref().filter(|_| caution.is_none()) {
@@ -230,7 +230,7 @@ impl Row {
                     evidence: s.evidence(),
                     width,
                     height,
-                    witness: Witness::Art,
+                    claim: Claim::Art,
                 });
             }
         }
@@ -312,13 +312,13 @@ fn collect(dir: &Path, out: &mut Vec<Entry>) {
 /// The build a pack is, and the screen it was built for — read from the same directory, because they are
 /// the same fact.
 ///
-/// The corpus files these two ways. One layout puts a model-and-screen directory above an application
+/// The sample set files these two ways. One layout puts a model-and-screen directory above an application
 /// id; another has only the id. Walking up looking for the screen tells the two apart without a rule
 /// per layout, and it is the screen directory that names the build — a list that used the application
 /// id would be naming the app store's row, not the build.
 ///
 /// The walk is bounded at three levels: a `.mod` filed deep under a directory that happens to be called
-/// `320x240` for some unrelated reason must not reach the root, and the corpus is nowhere near that deep.
+/// `320x240` for some unrelated reason must not reach the root, and the sample set is nowhere near that deep.
 fn build_of(mod_path: &Path) -> (String, Option<(u16, u16)>) {
     let start = crate::store::dir_of(mod_path);
     let mut at = Some(start.as_path());
@@ -357,7 +357,7 @@ pub fn screen_of_dir(mod_path: &Path) -> Option<(u16, u16)> {
 /// default screen.
 pub fn screen_of(name: &str) -> Option<(u16, u16)> {
     // `×` is not decoration for `x`. It is what a phone keyboard produces, and a directory named by
-    // hand on one gets it; reading only the ASCII pair means that half the corpus is invisible here.
+    // hand on one gets it; reading only the ASCII pair means that half the sample set is invisible here.
     const SEP: [char; 3] = ['x', 'X', '×'];
     let chars: Vec<char> = name.chars().collect();
     let digits = |at: usize| {
@@ -408,14 +408,14 @@ pub fn screen_of(name: &str) -> Option<(u16, u16)> {
 /// happened to write first.
 ///
 /// Which formats count is [`resource::image`]'s answer, the same one a viewer request goes through, and
-/// not a test invented here. The corpus's pictures are not all BMPs: ten of its thirty-five builds carry
+/// not a test invented here. The sample set's pictures are not all BMPs: ten of its thirty-five builds carry
 /// three `image/png` images and no BMP at all.
 ///
 /// Inheriting that entry point also inherits its **last** arm: a resource with no property block is
 /// decided by its own bytes rather than refused. The old prefix test refused those, so this is a
 /// widening beyond "PNG works now", and it is pinned by a test rather than left implied.
 ///
-/// Two things about the corpus are worth knowing before reading this. The container is named after the
+/// Two things about the sample set are worth knowing before reading this. The container is named after the
 /// *directory* the pack sits in — a `.mif` beside its own directory — not after the module, so the
 /// module's own name is the wrong guess; and a picture this host has no reader for is not an icon this
 /// function can invent, which is why a pack whose art is refused by [`resource::image`] shows a blank
@@ -463,16 +463,63 @@ fn icon_of(mod_path: &Path) -> Option<Icon> {
 /// The `.mif` that belongs to a pack.
 ///
 /// It is named after the *directory* the pack sits in — a `.mif` beside its own directory — which is
-/// how this corpus files them, and the module's own name is tried after that because a pack assembled by
+/// how this sample set files them, and the module's own name is tried after that because a pack assembled by
 /// hand is as likely to have used it. Asking the file system which one exists is cheaper than deciding.
 fn mif_beside(mod_path: &Path) -> Option<PathBuf> {
     let dir = crate::store::dir_of(mod_path);
     let mut candidates = Vec::new();
     if let (Some(id), Some(parent)) = (dir.file_name().and_then(|n| n.to_str()), dir.parent()) {
         candidates.push(parent.join(format!("{id}.mif")));
+        // A handset files the app-info file under `fs:/mif/`, one level beside `fs:/mod/<id>/`.
+        if let Some(fs) = parent.parent() {
+            candidates.push(fs.join("mif").join(format!("{id}.mif")));
+        }
     }
     candidates.push(mod_path.with_extension("mif"));
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// The app-info file that belongs to a pack. Public because the installer copies it into the
+/// device's own `fs/mif` directory.
+pub fn app_info_of(mod_path: &Path) -> Option<PathBuf> {
+    mif_beside(mod_path)
+}
+
+/// The applet class this module's own manifest declares, read at the width the ABI table gives it.
+///
+/// `None` means the manifest is absent or carries no `AEEAppInfo` — the normal shape of a module
+/// built to be a library rather than an applet. That answer is not an error: it is the discrimination
+/// [`load_sibling_modules`] needs.
+fn applet_cls_of(mod_path: &Path) -> Option<u32> {
+    let mut store = crate::store::Store::default();
+    store.mount_beside(mod_path);
+    let raw = store.applet_info()?;
+    let at = usize::try_from(crate::abi::offset_of("AEEAppInfo", "cls")?).ok()?;
+    let bytes = raw.get(at..at + 4)?;
+    let cls = u32::from_le_bytes(bytes.try_into().ok()?);
+    (cls != 0).then_some(cls)
+}
+
+/// Whether an image contains `cls` as a little-endian word anywhere in its bytes.
+///
+/// A launcher shim passes its target class as a constant to `IShell::StartApplet`, so the class sits
+/// in the image verbatim; `Refresher.mod` has the four copies that made this check possible. Reading
+/// the bytes rather than disassembling keeps the rule valid for an image whose literal pool is in a
+/// data section instead of an instruction stream.
+fn names_cls(image: &[u8], cls: u32) -> bool {
+    cls != 0 && image.windows(4).any(|w| w == cls.to_le_bytes())
+}
+
+/// Whether a bundle sibling may be loaded beside `image`.
+///
+/// `Some(cls)` is a sibling that declares its own applet: it is another game, and only gets loaded
+/// when this module names that class. `None` is a library with no applet of its own, which is exactly
+/// what automatic loading is for.
+fn sibling_is_wanted(image: &[u8], cls: Option<u32>) -> bool {
+    match cls {
+        Some(cls) if cls != 0 => names_cls(image, cls),
+        _ => true,
+    }
 }
 
 /// Load the other `.mod` files that belong to the same installed bundle as `mod_path`.
@@ -488,6 +535,15 @@ fn mif_beside(mod_path: &Path) -> Option<PathBuf> {
 /// on. Only when that manifest is actually there do the root's other subdirectories count: without
 /// the gate, a pack filed directly in a collection directory would pull in its neighbours, and every
 /// load runs that module's own entry point.
+///
+/// A bundle is a *pool* of candidates, not a blank import. A sibling that declares an applet class
+/// of its own is another game, and loading it is only justified when this module actually names that
+/// class — `Refresher.mod` carries `0x0107f149` four times, and that is `Monopoly.mif`'s applet, so
+/// the shim can start it. A pack filed beside an unrelated game must not inherit that game's code:
+/// `a sample pack` shares a bundle root with `a sample pack` but never names its class, and the
+/// injected game's `AEEMod_Load` leaves an object field unset that the extension then dereferences.
+/// A sibling with **no** applet class is a library by definition and is still loaded as before —
+/// that is what this function exists for.
 ///
 /// A module that will not load is reported and skipped rather than failing the run: the app itself is
 /// fine, and what is missing is a class it meant to start.
@@ -516,7 +572,12 @@ pub fn load_sibling_modules(rt: &mut Runtime, mod_path: &Path) -> Vec<String> {
         };
         if manifest("mif").is_file() || manifest("bar").is_file() {
             let mut subdirs: Vec<PathBuf> = std::fs::read_dir(root)
-                .map(|read| read.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+                .map(|read| {
+                    read.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect()
+                })
                 .unwrap_or_default();
             subdirs.sort();
             for sub in subdirs {
@@ -526,8 +587,23 @@ pub fn load_sibling_modules(rt: &mut Runtime, mod_path: &Path) -> Vec<String> {
     }
     candidates.sort();
     candidates.dedup();
+    let launched = std::fs::read(mod_path).ok();
     let mut loaded = Vec::new();
     for path in candidates {
+        // An explicit --lib may already have mapped this very file. A second copy would give the
+        // pack two owners of the same class at different bases.
+        if rt.library_path_loaded(&path) {
+            continue;
+        }
+        // A bundle also holds other complete games. Without this, a pack that merely shares a
+        // folder with one gets that game's `AEEMod_Load` run as a library and then calls into code
+        // whose objects were never built. If the launched image cannot be read, keep the old
+        // behaviour rather than guessing: a run that could not read its own module will say so.
+        if let Some(image) = launched.as_deref() {
+            if !sibling_is_wanted(image, applet_cls_of(&path)) {
+                continue;
+            }
+        }
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -566,7 +642,18 @@ pub fn boot_at(entry: &Entry, screen: Option<(u16, u16)>) -> Result<Runtime, Str
         Some((w, h)) => DeviceProfile::standard().with_screen(w, h),
         None => DeviceProfile::standard(),
     };
+    let compat = crate::compat::load(&entry.mod_path)?;
+    // The same resolution the command line does, from the declaration and the sample set directory
+    // alone: a pack opened from the picker has to be the machine `quoin <file>` would have given it,
+    // or the same pack boots differently depending on which way it was started.
+    let profile = crate::spec::resolve(None, None, &compat, &entry.mod_path)?.apply_to(profile);
     let mut rt = Runtime::with_device(profile);
+    rt.oem_native_images = compat.convertbmp == crate::compat::ConvertBmp::Pixels;
+    rt.oem_until_applet = compat.scope == crate::compat::Scope::Constructor;
+    rt.cpu
+        .mem
+        .set_slack_newline(compat.slack_fill == crate::compat::SlackFill::Newline);
+
     // The manager has no command line to carry `--jit`: a game opened from the GUI gets
     // the same engine a CLI run gets by default when the binary was built with the backend.
     // A build without the feature keeps the interpreter unchanged. This has to happen before
@@ -583,10 +670,21 @@ pub fn boot_at(entry: &Entry, screen: Option<(u16, u16)>) -> Result<Runtime, Str
     // name means. The CLI does the same before it loads anything.
     rt.resources.mount_beside(&entry.mod_path);
     rt.volume.mount_beside(&entry.mod_path);
+    // An installed game may expect the device's preinstalled middleware (IM3D, iPremium). Those
+    // libraries are host-side, named by the device manifest; load them before the module's entry
+    // point runs. A pack run straight from a sample set keeps the old behavior and gets no shared libs.
+    if is_installed_pack(&entry.mod_path) {
+        load_device_libraries(&mut rt, &entry.mod_path);
+    }
     // The manager is a second way to start a pack, so it has to give the volume the same home the
     // command line does; without this a game launched from the library writes its save into memory and
-    // forgets it when the window closes.
-    if let Some(dir) = default_save_dir(&entry.mod_path) {
+    // forgets it when the window closes. An installed pack keeps its saves beside itself, which is
+    // what a handset does; a pack run straight from a sample set keeps them in the per-pack data
+    // directory, so a GUI launch does not edit the sample set.
+    if is_installed_pack(&entry.mod_path) {
+        rt.volume
+            .write_back_to(&crate::store::dir_of(&entry.mod_path));
+    } else if let Some(dir) = default_save_dir(&entry.mod_path) {
         rt.volume.persist_to(&dir);
     }
     rt.load(&image, false).map_err(|e| e.to_string())?;
@@ -638,6 +736,270 @@ pub fn boot_at(entry: &Entry, screen: Option<(u16, u16)>) -> Result<Runtime, Str
 }
 
 pub use crate::platform::data::{migrate_legacy_data, program_data_dir};
+
+/// The host-side `fs:/` tree a game is installed into.
+///
+/// A handset keeps a module and its saves in one directory. Installing a pack here gives a run the
+/// same shape: `data/device/fs/mod/<modid>/` holds the module and everything beside it, and
+/// `data/device/fs/mif/<modid>.mif` holds its app-info file. The sample set a pack was copied from is
+/// never written to.
+///
+/// A development build lives under `target/{debug,release}`; its device tree stays in the checkout's
+/// `data/`, not under `target/`, which a clean build may remove. `QUOIN_DEVICE_DIR` overrides both.
+pub fn device_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("QUOIN_DEVICE_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    let in_target = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "debug" || n == "release")
+        && parent
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("target");
+    let data = if in_target {
+        parent.parent()?.parent()?.join("data")
+    } else {
+        parent.join("data")
+    };
+    Some(data.join("device"))
+}
+
+/// `device/fs/mod`: the directories the library scans for installed packs.
+pub fn device_mods() -> Option<PathBuf> {
+    device_root().map(|root| root.join("fs").join("mod"))
+}
+
+/// `device/fs/mif`: the app-info files that sit beside the module directories on a handset.
+pub fn device_mifs() -> Option<PathBuf> {
+    device_root().map(|root| root.join("fs").join("mif"))
+}
+
+/// Whether a pack lives in the device tree, where its saves belong beside the module.
+pub fn is_installed_pack(mod_path: &Path) -> bool {
+    let Some(mods) = device_mods() else {
+        return false;
+    };
+    let mods = std::path::absolute(&mods).unwrap_or(mods);
+    let candidate = std::path::absolute(mod_path).unwrap_or_else(|_| mod_path.to_path_buf());
+    candidate.starts_with(&mods)
+}
+
+/// The shared-library manifest beside an installed pack, when `--install` created one.
+///
+/// A game that expects preinstalled middleware (IM3D, iPremium) cannot find it beside its own
+/// image: the device tree holds the game, not the middleware. `libs.json` names the host-side
+/// copies, and the run loads them before the module.
+pub fn device_libs_manifest() -> Option<PathBuf> {
+    let path = device_root()?.join("libs.json");
+    path.is_file().then_some(path)
+}
+
+/// Whether a file name is one of the shared middleware libraries.
+pub fn is_library_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".mod").unwrap_or(&lower);
+    ["im3d", "ipremium", "imedia", "ma3", "smaf", "brewsmaf"]
+        .iter()
+        .any(|key| stem.contains(key))
+}
+
+/// Library `.mod` files reference inside the installed pack itself. A shared manifest entry with the
+/// same name must not shadow one of these: the pack's own copy is the version it was built against.
+pub fn local_library_names(mod_path: &Path) -> std::collections::BTreeSet<String> {
+    fn walk(dir: &Path, depth: u8, out: &mut std::collections::BTreeSet<String>) {
+        if depth > crate::file::MOUNT_DEPTH {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, depth + 1, out);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let is_mod = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("mod"));
+            if is_mod && is_library_name(name) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(&crate::store::dir_of(mod_path), 0, &mut out);
+    out
+}
+
+/// Load the device's shared middleware into a run started from the device tree.
+fn load_device_libraries(rt: &mut Runtime, mod_path: &Path) {
+    let Some(manifest) = device_libs_manifest() else {
+        return;
+    };
+    let local = local_library_names(mod_path);
+    if !local.is_empty() {
+        // The pack ships its own middleware. Loading a shared set as well changes behavior
+        // (and can shadow a version the title was built against); the bundle's own libs are loaded
+        // with it, so the manifest is only for packs that ship none.
+        return;
+    }
+    let plan = match crate::virtual_lib::LibraryPlan::read_manifest(&manifest) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("device libraries: {e}");
+            return;
+        }
+    };
+    match plan.resolved_libs() {
+        Ok(paths) => {
+            for path in paths {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if local.contains(name) {
+                    // The pack's own copy is loaded with the bundle; do not shadow it.
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        if let Err(e) = rt.load_library(&bytes, false) {
+                            eprintln!("device library {}: {e}", path.display());
+                        }
+                    }
+                    Err(e) => eprintln!("device library {}: {e}", path.display()),
+                }
+            }
+        }
+        Err(e) => eprintln!("device libraries: {e}"),
+    }
+    for lib in plan.virtual_libs {
+        rt.load_virtual_library(lib);
+    }
+}
+
+/// What an install copied, for the command that asked for it to report.
+#[derive(Debug)]
+pub struct Installed {
+    pub id: String,
+    pub pack: PathBuf,
+    pub manifest: Option<PathBuf>,
+    pub files: usize,
+    pub skipped: Vec<PathBuf>,
+}
+
+/// Copy a pack into the device tree, without touching the directory it came from.
+///
+/// The entire directory the `.mod` sits in is copied, because that is what a handset's module
+/// directory holds. The `.mif` is copied to `fs/mif/<modid>.mif` rather than left beside the module,
+/// which is where a handset keeps it. Links are not followed: an entry that resolves outside the
+/// source directory is skipped and reported.
+///
+/// An already-installed id is refused rather than overwritten, because a second copy would replace
+/// the saves the first run put beside the game.
+pub fn install_pack(mod_path: &Path, device: &Path) -> Result<Installed, String> {
+    let source =
+        std::path::absolute(mod_path).map_err(|e| format!("{}: {e}", mod_path.display()))?;
+    if !source.is_file() {
+        return Err(format!("not a file: {}", source.display()));
+    }
+    if !source
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mod"))
+    {
+        return Err(format!("not a .mod file: {}", source.display()));
+    }
+    let pack = crate::store::dir_of(&source);
+    let id = pack
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("cannot name the pack's directory: {}", pack.display()))?
+        .to_string();
+    let dest = device.join("fs").join("mod").join(&id);
+    if dest.exists() {
+        return Err(format!(
+            "already installed: {} (move it aside to install a fresh copy)",
+            dest.display()
+        ));
+    }
+    let root = std::fs::canonicalize(&pack).map_err(|e| format!("{}: {e}", pack.display()))?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+
+    let mut files = 0;
+    let mut skipped = Vec::new();
+    let mut todo = vec![(root.clone(), dest.clone())];
+    while let Some((src_dir, dst_dir)) = todo.pop() {
+        let Ok(read) = std::fs::read_dir(&src_dir) else {
+            skipped.push(src_dir);
+            continue;
+        };
+        for entry in read.flatten() {
+            let src = entry.path();
+            let dst = dst_dir.join(entry.file_name());
+            let Ok(real) = std::fs::canonicalize(&src) else {
+                skipped.push(src);
+                continue;
+            };
+            if !real.starts_with(&root) {
+                skipped.push(src);
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&real) else {
+                skipped.push(src);
+                continue;
+            };
+            if meta.is_dir() {
+                if std::fs::create_dir_all(&dst).is_ok() {
+                    todo.push((real, dst));
+                } else {
+                    skipped.push(src);
+                }
+            } else if meta.is_file() {
+                if std::fs::copy(&real, &dst).is_ok() {
+                    files += 1;
+                    // A sample set file may carry the read-only attribute. The installed copy is the
+                    // one the game will write its saves beside, so it must not inherit that bit.
+                    if let Ok(meta) = std::fs::metadata(&dst) {
+                        let mut permissions = meta.permissions();
+                        if permissions.readonly() {
+                            permissions.set_readonly(false);
+                            let _ = std::fs::set_permissions(&dst, permissions);
+                        }
+                    }
+                } else {
+                    skipped.push(src);
+                }
+            } else {
+                skipped.push(src);
+            }
+        }
+    }
+
+    let manifest = app_info_of(&source).and_then(|mif| {
+        let mifs = device.join("fs").join("mif");
+        std::fs::create_dir_all(&mifs).ok()?;
+        let dst = mifs.join(format!("{id}.mif"));
+        std::fs::copy(&mif, &dst).ok()?;
+        Some(dst)
+    });
+    Ok(Installed {
+        id,
+        pack: dest,
+        manifest,
+        files,
+        skipped,
+    })
+}
 
 /// Where a run's own writes go when the caller named no directory: `data/saves/<pack>-<hash>`
 /// beside the emulator itself.

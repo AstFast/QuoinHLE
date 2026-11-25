@@ -83,15 +83,64 @@ fn an_object_that_is_not_an_aeeapplet_is_named_as_such() {
         "the report names the object and its class: {err}"
     );
     let text = format!("{}", err);
-    assert!(text.contains("is not an AEEApplet object this host knows"), "{text}");
+    assert!(
+        text.contains("is not an AEEApplet object this host knows"),
+        "{text}"
+    );
     let advice = crate::hle::advice(&text).expect("this failure has its own advice line");
     assert!(advice.contains("actors"), "{advice}");
+}
+
+/// A self-unpacking pack builds its real module *after* the loader has finished: the `.mod` on disk
+/// is only an unpacker that inflates 400 KB into the guest heap and jumps into it, and the payload
+/// carries its own `IModule`. The applet names that module, so a check that accepts only pointers
+/// this host handed out refuses a start that works — measured on seven sample set packs, all of which
+/// drew a frame once the word was read as what it is.
+#[test]
+fn an_applet_whose_module_is_the_packs_own_payload_is_still_adopted() {
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    // The three words every module this host synthesizes has: pvt, refs, IShell.
+    let payload = rt.cpu.mem.alloc_zeroed(32).unwrap();
+    rt.cpu.mem.write_u32(payload, payload + 0x14).unwrap();
+    rt.cpu.mem.write_u32(payload + 4, 2).unwrap();
+    rt.cpu.mem.write_u32(payload + 8, shell).unwrap();
+    // `_AEEApplet` as the platform lays it out, holding that module at 16.
+    let applet = rt.cpu.mem.alloc_zeroed(32).unwrap();
+    rt.cpu.mem.write_u32(applet + 8, 1).unwrap();
+    rt.cpu.mem.write_u32(applet + 12, shell).unwrap();
+    rt.cpu.mem.write_u32(applet + 16, payload).unwrap();
+    rt.adopt_applet(applet, 0x0108_b27e)
+        .expect("a module-shaped payload is a module");
+    assert_eq!(rt.applet, applet);
+    assert_eq!(rt.app_cls, 0x0108_b27e);
+    assert!(rt.applet_layout == AppletLayout::CLASSIC);
+}
+
+/// The widening has a floor. A module word that is not shaped like an `IModule` still refuses the
+/// start, or the check would accept any object whose neighbouring word happens to be the shell.
+#[test]
+fn an_applet_whose_module_word_is_not_module_shaped_is_refused() {
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let stranger = rt.cpu.mem.alloc_zeroed(32).unwrap();
+    // Not this shell at an `IModule`'s offset, so it is not a module of this run.
+    rt.cpu.mem.write_u32(stranger + 8, shell + 8).unwrap();
+    let applet = rt.cpu.mem.alloc_zeroed(32).unwrap();
+    rt.cpu.mem.write_u32(applet + 12, shell).unwrap();
+    rt.cpu.mem.write_u32(applet + 16, stranger).unwrap();
+    let err = rt.adopt_applet(applet, 0x0108_b27e).unwrap_err();
+    assert!(
+        matches!(err, Error::Hle(HleError::NotAnApplet { .. })),
+        "{err}"
+    );
 }
 
 /// The report names the last dispatch *entered*, and for years the only thing it could add was a
 /// parenthesis admitting it did not know whether that call had run. [`Runtime::last_call_refused`] is
 /// that answer, and it has exactly one meaning: the dispatch was refused at the door — `this` is not an
 /// object this host made — so nothing inside it executed and the argument is the whole story.
+
 ///
 /// The trap it exists to avoid is the shape of this test: `last_call` is written on the way *in*, so a
 /// refused call looks exactly like a call that happened. A report read from that alone blames the body
@@ -107,8 +156,7 @@ fn a_call_refused_at_the_door_says_so_and_the_next_dispatch_clears_it() {
     call(&mut rt, addref, shell).unwrap();
     assert!(!rt.last_call_refused, "an answered call was not refused");
     assert_eq!(
-        rt.last_call,
-        "IShell::AddRef",
+        rt.last_call, "IShell::AddRef",
         "and the report would have named it"
     );
     // Down to zero and through the stale pointer, which is the refusal itself (see the test above for
@@ -393,7 +441,10 @@ fn an_unzip_stream_reads_a_gzip_file_back_as_its_contents() {
     // reading what it already holds, which the read below has to show.
     assert_eq!(call_many(&mut rt, set_stream, unzip, &[0]).unwrap(), 0);
     // Both are `void` in `IAStream`; `CUnzipStream_Readable` keeps the pair and `Cancel` clears
-    // it, and neither has anything asynchronous here to register with or call off.
+    // it. Registering here is not free of consequence any more — it queues the notification, which
+    // is what `registering_readable_on_an_unzip_stream_raises_the_notification` is about — so the
+    // `Cancel` below is what keeps this test's later read from running a guest address that is not
+    // code at all.
     let readable = abi::method_of("IUnzipAStream", "Readable").unwrap();
     assert_eq!(
         call_many(&mut rt, readable, unzip, &[0x1234, 0x5678]).unwrap(),
@@ -412,6 +463,89 @@ fn an_unzip_stream_reads_a_gzip_file_back_as_its_contents() {
     // A stream that has handed over its last byte answers a count of zero, which is how the
     // caller learns the module ended.
     assert_eq!(call_many(&mut rt, read, unzip, &[dst, 4]).unwrap(), 0);
+}
+
+/// `IUnzipAStream::Readable` is `void` in `IAStream`, which makes a caller that registers one that
+/// has run out of bytes and has nothing to do until it hears back. A source this host already holds
+/// is readable the moment it is asked, so the registration is answered on the next turn rather than
+/// never — and the answer carries the context the caller named, because `PFNNOTIFY` is
+/// `void (*)(void *pData)`.
+///
+/// `lost_planet` is why this is not a formality: it names a memory stream, inflates its whole data
+/// set through this pair, and spends every frame re-registering while it waits. With nothing ever
+/// raised it polled a clock for as long as the run lasted and drew nothing at all.
+#[test]
+fn registering_readable_on_an_unzip_stream_raises_the_notification() {
+    fn gzip_of(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut out = Vec::new();
+        let mut enc = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap();
+        out
+    }
+
+    let mut rt = Runtime::new();
+    let mgr = new_service(&mut rt, g::AEECLSID_FILEMGR);
+    let open = abi::method_of("IFileMgr", "OpenFile").unwrap();
+    let name = put_cstr(&mut rt, "data.z");
+    let file = call_many(
+        &mut rt,
+        open,
+        mgr,
+        &[name, g::_OFM_READWRITE | g::_OFM_CREATE],
+    )
+    .unwrap();
+    let payload: Vec<u8> = (0..1024u32).map(|i| (i % 97) as u8).collect();
+    let gz = gzip_of(&payload);
+    let src = rt.cpu.mem.alloc(gz.len() as u32, 4).unwrap();
+    rt.cpu.mem.write_bytes(src, &gz).unwrap();
+    let write = abi::method_of("IFile", "Write").unwrap();
+    call_many(&mut rt, write, file, &[src, gz.len() as u32]).unwrap();
+    let seek = abi::method_of("IFile", "Seek").unwrap();
+    call_many(&mut rt, seek, file, &[g::FS_SEEK_SET, 0]).unwrap();
+
+    let unzip = new_service(&mut rt, g::AEECLSID_UNZIPSTREAM);
+    let set_stream = abi::method_of("IUnzipAStream", "SetStream").unwrap();
+    call_many(&mut rt, set_stream, unzip, &[file]).unwrap();
+
+    // A handler whose whole body leaves `r0` — the one argument a `PFNNOTIFY` gets — where the test
+    // can read it.
+    let seen = rt.cpu.mem.alloc(4, 4).unwrap();
+    let handler = arm_code(
+        &mut rt,
+        &[
+            0xe59f_2004, // ldr r2, [pc, #4]  where to leave the context
+            0xe582_0000, // str r0, [r2]
+            0xe12f_ff1e, // bx lr
+            seen,
+        ],
+    );
+    let readable = abi::method_of("IUnzipAStream", "Readable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, readable, unzip, &[handler, 0x5678]).unwrap(),
+        0
+    );
+    assert_eq!(
+        rt.pump(1).unwrap().callbacks,
+        1,
+        "the registration is answered on the next turn"
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(seen).unwrap(),
+        0x5678,
+        "and it is answered with the context the caller named"
+    );
+
+    // `Cancel` before the turn that would have delivered it drops the notification: the caller has
+    // just said it is no longer waiting, so nothing should arrive afterwards.
+    assert_eq!(
+        call_many(&mut rt, readable, unzip, &[handler, 0x9abc]).unwrap(),
+        0
+    );
+    let cancel = abi::method_of("IUnzipAStream", "Cancel").unwrap();
+    call(&mut rt, cancel, unzip).unwrap();
+    assert_eq!(rt.pump(1).unwrap().callbacks, 0, "a cancelled one is gone");
 }
 
 #[test]
@@ -478,7 +612,7 @@ fn a_tone_reports_done_for_the_length_it_was_asked_to_play() {
     let packed = (40 << 16) | 5;
     call_many(&mut rt, play, sound, &[packed]).unwrap();
 
-    // Nothing was heard yet: the shipped slots queue the report rather than raising it in the
+    // Nothing was heard yet: the reference slots queue the report rather than raising it in the
     // caller's frame, so a pack that returns from `PlayTone` to find its own handler already run
     // has been told something a handset would not have told it.
     assert_eq!(rt.cpu.mem.read_u32(seen).unwrap(), 0);
@@ -523,7 +657,7 @@ fn a_tone_outside_the_published_list_is_refused_in_the_callers_own_frame() {
     // which is the **synchronous** door: it calls the registered function directly, bracketed by
     // the interface's own `AddRef` and `Release`. So the caller hears the refusal before its call
     // returns — the opposite of everything the tone generator reports later. Two ends of the range
-    // are refused here: `AEE_TONE_FIRST` itself (the shipped compare is `<=`, not `<`) and
+    // are refused here: `AEE_TONE_FIRST` itself (the reference compare is `<=`, not `<`) and
     // `AEE_TONE_LAST`.
     let mut rt = Runtime::new();
     let sound = new_service(&mut rt, g::AEECLSID_SOUND);
@@ -532,7 +666,7 @@ fn a_tone_outside_the_published_list_is_refused_in_the_callers_own_frame() {
     call_many(&mut rt, reg, sound, &[handler, seen + 12]).unwrap();
     let play = abi::method_of("ISound", "PlayTone").unwrap();
 
-    // The shipped compare is `(char)a2 <= 0 || (char)v4 >= 100`, so the top of the range is 100 and
+    // The reference compare is `(char)a2 <= 0 || (char)v4 >= 100`, so the top of the range is 100 and
     // not `AEE_TONE_LAST`: that constant is `0x68`, a reserved sentinel, while the published list
     // ends at `AEE_TONE_PTT_FLOOR_AVAILABLE` = `0x63`. Ids 100 to 103 name nothing any header lists.
     for bad in [
@@ -640,7 +774,7 @@ fn a_tone_list_is_walked_out_of_the_callers_own_buffer() {
         assert_eq!(rt.cpu.mem.read_u32(seen + 4).unwrap(), g::AEE_SOUND_FAILURE);
     }
 
-    // `StopTone` is the case the shipped code handles by clearing the list *pointer* and leaving
+    // `StopTone` is the case the platform code handles by clearing the list *pointer* and leaving
     // the flag alone: the item then playing is the last one, and the stop's own report is the
     // accepted news, not a `DONE` the caller never asked to hear.
     call_many(&mut rt, play_list, sound, &[list, 3]).unwrap();
@@ -661,9 +795,9 @@ fn a_tone_list_is_walked_out_of_the_callers_own_buffer() {
 
 #[test]
 fn the_volume_answers_on_the_callback_channel_and_not_in_a_register() {
-    // `ISOUND_GetVolume` is `void` in the published table and in the shipped body, which raises
+    // `ISOUND_GetVolume` is `void` in the published table and in the documented behaviour, which raises
     // `AEE_SOUND_VOLUME_CB` with `dwParam` pointing at a `uint16`. It used
-    // to answer this host's own r0 with the number, which is the register the shipped slot leaves
+    // to answer this host's own r0 with the number, which is the register the reference slot leaves
     // holding the bridle call's result — so a pack that ignored r0 and waited for the callback got
     // silence, and a pack that read r0 was reading a coincidence.
     let mut rt = Runtime::new();
@@ -778,7 +912,7 @@ fn a_sound_record_is_stored_only_when_every_member_is_named() {
         call_many(&mut rt, set, sound, &[0]).unwrap(),
         g::AEE_EBADPARM
     );
-    // A null record to `Get` is not an error the shipped slot makes: it simply does not copy.
+    // A null record to `Get` is not an error the reference slot makes: it simply does not copy.
     assert_eq!(call_many(&mut rt, get, sound, &[0]).unwrap(), 0);
 }
 
@@ -1218,8 +1352,8 @@ fn posted_media(rt: &Runtime, object: u32) -> Vec<(u32, u32, u32)> {
 #[test]
 fn a_media_object_hands_its_handler_a_struct_and_tells_it_when_the_clip_ends() {
     // `IMedia::RegisterNotify` used to store the pair and never call it. Seven `IMedia::Play` calls
-    // across the corpus's sweep logs did register a handler first, so every one of those packs was
-    // waiting on a report this host had decided not to send — including the shipped Media Player
+    // across the sample set's sweep logs did register a handler first, so every one of those packs was
+    // waiting on a report this host had decided not to send — including the reference Media Player
     // sample, whose handler moves its own menu selection on `MM_STATUS_START` and stops the "now
     // playing" chrome on `MM_STATUS_DONE`.
     let mut rt = Runtime::new();
@@ -2527,7 +2661,7 @@ fn the_sound_player_set_info_and_get_info_answer_the_branches_the_bodies_switch_
     // A name, for the `SDT_FILE` branch.
     let name = put_cstr(&mut rt, "theme.mid");
 
-    // An idle player is not "no answer": `GetInfo(NULL)` is the shipped status query, and a fresh
+    // An idle player is not "no answer": `GetInfo(NULL)` is the reference status query, and a fresh
     // object has nothing in flight, so it is `AEE_EIDLE` (31) rather than `AEE_EBADPARM` (14).
     assert_eq!(
         call_many(&mut rt, get_info, player, &[0]).unwrap(),
@@ -2827,7 +2961,7 @@ fn a_set_during_a_clip_is_queued_and_the_next_play_switches_to_it() {
     );
 }
 
-/// The shapes whose pending media the shipped `Set` reports as NULL **before** `FreeData`, and the
+/// The shapes whose pending media the reference `Set` reports as NULL **before** `FreeData`, and the
 /// shape where `FreeData` has already run by the time the refusal happens.
 #[test]
 fn a_set_whose_media_cannot_be_made_leaves_the_player_alone() {
@@ -2905,7 +3039,7 @@ fn a_set_whose_media_cannot_be_made_leaves_the_player_alone() {
     }
 
     // A naming the body can make is queued; the clip then ends by itself, which is where the
-    // shipped `MediaNotify` clears `m_bDataSet` — so the wait does not survive it.
+    // reference `MediaNotify` clears `m_bDataSet` — so the wait does not survive it.
     call_many(&mut rt, set, player, &[g::SDT_BUFFER, second]).unwrap();
     assert_eq!(
         rt.cpu.mem.read_u32(seen + 4).unwrap(),
@@ -2967,7 +3101,7 @@ fn a_set_whose_media_cannot_be_made_leaves_the_player_alone() {
         "nothing is playing, so `FreeData` ran first and the naming is already gone"
     );
 
-    // `Stop` drops a queued naming, because the shipped stop completion is what clears
+    // `Stop` drops a queued naming, because the reference stop completion is what clears
     // `m_bDataSet`: the `Play` after it starts the record's clip rather than answering a refused
     // stop.
     call_many(&mut rt, set_info, player, &[info]).unwrap();
@@ -3431,7 +3565,7 @@ fn a_freed_clip_buffer_leaves_the_audio_table_with_it() {
 }
 
 /// A `Play` with a queued naming only switches if a clip is actually running: the swap rides on a
-/// `Stop`, and the shipped `Stop` refuses when `m_bPlaying` is clear.
+/// `Stop`, and the reference `Stop` refuses when `m_bPlaying` is clear.
 #[test]
 fn a_queued_naming_that_is_played_while_paused_starts_nothing() {
     let mut rt = Runtime::new();
@@ -3691,7 +3825,7 @@ fn a_media_object_pointed_at_a_buffer_plays_the_same_clip() {
 /// value for a source with no length. `IMedia::GetTotalTime` is `int` with no out-parameter, so
 /// the same zero is `AEE_SUCCESS` — a promise that the length follows, on a channel this host
 /// keeps but never fires. Asserting the refusal alone would only repeat the implementation, so the
-/// witness here is the sibling: after naming the same clip to both interfaces, one answers a
+/// record here is the sibling: after naming the same clip to both interfaces, one answers a
 /// number and the other refuses, and neither writes through the caller's memory.
 #[test]
 fn a_media_length_is_refused_by_name_where_the_sound_player_answers_a_number() {
@@ -3744,17 +3878,17 @@ fn a_void_getter_answers_in_r0_and_writes_through_nothing() {
     let player = new_service(&mut rt, g::AEECLSID_SOUNDPLAYER);
     let set = abi::method_of("ISoundPlayer", "SetVolume").unwrap();
     call_many(&mut rt, set, player, &[7]).unwrap();
-    let witness = rt.cpu.mem.alloc(4, 4).unwrap();
-    rt.cpu.mem.write_u32(witness, 0xa5a5).unwrap();
+    let evidence = rt.cpu.mem.alloc(4, 4).unwrap();
+    rt.cpu.mem.write_u32(evidence, 0xa5a5).unwrap();
     for (name, want) in [("GetVolume", 0), ("GetTotalTime", 0)] {
-        // Both slots are `void` in the shipped build — `AEESoundPlayer_GetVolume` answers nothing in
+        // Both slots are `void` in the guest build — `AEESoundPlayer_GetVolume` answers nothing in
         // `r0` and hands the number to `AEE_SOUNDPLAYER_VOLUME_CB` instead — so an answer of zero is
         // the contract, and the `7` this loop used to expect was this host's own convenience that no
         // pack could legally read.
         let id = abi::method_of("ISoundPlayer", name).unwrap();
-        assert_eq!(call_many(&mut rt, id, player, &[witness]).unwrap(), want);
+        assert_eq!(call_many(&mut rt, id, player, &[evidence]).unwrap(), want);
         assert_eq!(
-            rt.cpu.mem.read_u32(witness).unwrap(),
+            rt.cpu.mem.read_u32(evidence).unwrap(),
             0xa5a5,
             "{name} wrote through an argument its caller never offered"
         );
@@ -3903,6 +4037,98 @@ fn the_tone_player_hands_back_the_routing_it_was_given() {
     assert_eq!(
         call_many(&mut rt, request, obj, &[1, status]).unwrap(),
         g::AEE_EBADPARM
+    );
+}
+
+/// The three au resource-controller classes answer `IResourceCtl`, and each of them keeps its own
+/// resource.
+///
+/// The order below is the one the 3D packs use: build the controller, arm the notify with
+/// `RESCTL_STATUS_USER_BASE`, then take the resource with an OEM reason. `0x01046DA0` is the id they
+/// ask for and `0x010431DA` is the reason they pass — neither is an interface id, which is exactly
+/// what the two slots being 3 and 7 rather than `QueryInterface` shows.
+#[test]
+fn an_oem_resource_controller_answers_the_slots_the_3d_packs_use() {
+    let mut rt = Runtime::new();
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let request = abi::method_of("IResourceCtl", "Request").unwrap();
+    let get_status = abi::method_of("IResourceCtl", "GetStatus").unwrap();
+    let notify = abi::method_of("IResourceCtl", "OnStatusChangeNotify").unwrap();
+    let can = abi::method_of("IResourceCtl", "CanAcquire").unwrap();
+    assert_eq!(abi::slot_of("IResourceCtl", "Request"), Some(3));
+    assert_eq!(abi::slot_of("IResourceCtl", "OnStatusChangeNotify"), Some(7));
+
+    // What the packs do, in their order: build the Q3D controller, arm the notify, take the
+    // resource with the OEM reason.
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[0x0104_6da0, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let ctl = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(ctl, 0, "a real object, not a null handle");
+
+    let pcb = rt.cpu.mem.alloc(16, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, notify, ctl, &[g::RESCTL_STATUS_USER_BASE, pcb]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let status = rt.cpu.mem.alloc(4, 4).unwrap();
+    rt.cpu.mem.write_u32(status, 0xffff_ffff).unwrap();
+    assert_eq!(
+        call_many(&mut rt, request, ctl, &[0x0104_31da, status]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(status).unwrap(),
+        g::RESCTL_STATUS_ACQUIRED,
+        "one client, so taking the resource succeeds instead of answering BUSY"
+    );
+    let reason = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, get_status, ctl, &[reason]).unwrap(),
+        g::RESCTL_STATUS_ACQUIRED
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(reason).unwrap(),
+        0x0104_31da,
+        "the OEM reason is the word GetStatus hands back"
+    );
+
+    // A second class is a second resource: the Flash controller must not see the 3D one's status.
+    let slot2 = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[0x0104_6d95, slot2]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let other = rt.cpu.mem.read_u32(slot2).unwrap();
+    assert_ne!(other, ctl, "one object per class, not a shared controller");
+    assert_eq!(
+        call_many(&mut rt, get_status, other, &[reason]).unwrap(),
+        g::RESCTL_STATUS_FREE
+    );
+    assert_eq!(rt.cpu.mem.read_u32(reason).unwrap(), g::RESCTL_REASON_BASE + 1);
+    assert_eq!(
+        call_many(&mut rt, can, other, &[0x0104_31da, status]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(status).unwrap(),
+        g::RESCTL_STATUS_BUSY,
+        "a querent that has not taken it is not the owner, same as the sound controller"
+    );
+
+    // Releasing the last reference forgets the state, so a later controller of the same class starts
+    // free instead of inheriting a held resource.
+    let release = abi::method_of("IResourceCtl", "Release").unwrap();
+    let refs = rt.hle.object(ctl).map(|o| o.refs_off).unwrap_or(4);
+    while rt.cpu.mem.read_u32(ctl + refs).unwrap_or(0) > 0 {
+        call_many(&mut rt, release, ctl, &[]).unwrap();
+    }
+    assert!(
+        !rt.oem_res_ctl.iter().any(|(obj, _)| *obj == ctl),
+        "the state goes with the object"
     );
 }
 
@@ -4260,7 +4486,7 @@ fn a_wake_reads_the_resource_registration_when_it_runs_rather_than_when_it_was_a
     );
     assert_eq!(rt.res_ctl.notify, (0, 0), "and that registration is spent");
 
-    // Two changes with nobody re-registering between them: the shipped list cannot hold the block twice,
+    // Two changes with nobody re-registering between them: the reference list cannot hold the block twice,
     // and here the second arrival finds the pair already spent — either way, one callback.
     call_many(&mut rt, notify, obj, &[mask, a]).unwrap();
     call_many(&mut rt, request, obj, &[0x2000, status]).unwrap();
@@ -4707,7 +4933,7 @@ fn a_close_cancels_only_the_work_of_the_applet_that_closed() {
 #[test]
 fn a_null_source_struct_is_answered_as_each_delivered_body_answers_it() {
     // Four audio slots take a struct the caller owns. What a caller that handed over `0` gets is not
-    // one answer but three, and they come from the shipped bodies rather than from a documented
+    // one answer but three, and they come from the platform's own routines rather than from a documented
     // convention: `AEESoundPlayer_SetInfo` reaches `if ( a2 == nullptr ) return 0;` *after* its
     // `FreeData`, `AEESoundPlayer_GetInfo` turns the null pointer into a status query answered
     // `AEE_EIDLE`, and `AEESound_Set` refuses with 14 and writes nothing. None of them is a data
@@ -4870,6 +5096,276 @@ fn create_instance_answers_the_shell_and_the_display() {
 }
 
 #[test]
+fn a_virtual_library_answers_create_instance_for_its_classes() {
+    // A class the handset had preinstalled and this run has no image for: the host builds it, and
+    // `QueryClass` has to agree or a `GetHandler` row naming it would be dropped on the way out.
+    let mut rt = Runtime::new();
+    let iface = abi::iface("IImage").expect("IImage is in the tables").name;
+    rt.load_virtual_library(crate::virtual_lib::VirtualLibrary {
+        name: "kddi".into(),
+        classes: vec![crate::virtual_lib::VirtualClass {
+            class: 0x0100_9999,
+            iface,
+        }],
+    });
+    assert!(rt.query_class_known(0x0100_9999));
+    assert!(
+        !rt.query_class_known(0x0100_9998),
+        "only the declared class"
+    );
+
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[0x0100_9999, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_ne!(
+        rt.cpu.mem.read_u32(slot).unwrap(),
+        0,
+        "the caller gets an object, not just a success"
+    );
+}
+
+#[test]
+fn a_profile_answers_the_premium_class_and_its_auth_slot() {
+    // The guest packs create `0x01088b1d` and call slot 3 on the object once. A profile makes
+    // that object the host's, and the slot answers from the profile's decision.
+    let text = r#"{
+        "subscriber_number": "09012345678",
+        "apps": [{"id": "tokumori", "mode": "authorized"}]
+    }"#;
+    let profile = crate::auth::Profile::from_json(text, std::path::Path::new("auth.json")).unwrap();
+    let mut rt = Runtime::new();
+    rt.set_authorization(profile, "tokumori".into());
+    assert!(rt.query_class_known(crate::auth::AEECLSID_KDDIPREMIUM));
+
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            create,
+            shell,
+            &[crate::auth::AEECLSID_KDDIPREMIUM, slot]
+        )
+        .unwrap(),
+        g::AEE_SUCCESS
+    );
+    let object = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(object, 0, "the class has an object");
+
+    let auth = abi::premium_id(crate::auth::premium_slots::AUTH);
+    assert_eq!(call(&mut rt, auth, object).unwrap(), 0, "authorized");
+    let release = abi::premium_id(crate::auth::premium_slots::RELEASE);
+    assert_eq!(call(&mut rt, release, object).unwrap(), 0, "last release");
+}
+
+#[test]
+fn the_authorization_default_is_deny() {
+    let profile =
+        crate::auth::Profile::from_json(r#"{"apps": []}"#, std::path::Path::new("a.json")).unwrap();
+    let mut rt = Runtime::new();
+    rt.set_authorization(profile, "tokumori".into());
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(
+        &mut rt,
+        create,
+        shell,
+        &[crate::auth::AEECLSID_KDDIPREMIUM, slot],
+    )
+    .unwrap();
+    let object = rt.cpu.mem.read_u32(slot).unwrap();
+    let auth = abi::premium_id(crate::auth::premium_slots::AUTH);
+    assert_eq!(call(&mut rt, auth, object).unwrap(), 2, "denied");
+}
+
+/// The au paid-content class `0x0102f14b`. Served only when a profile says who this run is, and
+/// only through the slots a pack has been seen to reach: the observed pack creates it once, reads a zero
+/// return as "this handset has the middleware", sends its own messages to slot 9 and expects zero
+/// back, and releases it. No entitlement answer is read from the object — which is why this is a
+/// class the shell answers rather than a licence it grants.
+#[test]
+fn the_au_collect_class_is_served_only_with_a_profile() {
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let class = crate::auth::AEECLSID_AU_COLLECT;
+
+    // No profile: the class is not served, and the slot stays NULL — the answer every run gave
+    // before this existed, so a pack that never needed it cannot start depending on it.
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(slot).unwrap(),
+        0,
+        "a refusal leaves NULL"
+    );
+
+    // With one: an object, and only the slots its record reaches have bodies.
+    let text = r#"{
+        "subscriber_number": "09012345678",
+        "apps": [{"id": "drummania", "mode": "authorized"}]
+    }"#;
+    let profile = crate::auth::Profile::from_json(text, std::path::Path::new("auth.json")).unwrap();
+    let mut rt = Runtime::new();
+    rt.set_authorization(profile, "drummania".into());
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let object = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(object, 0, "the class has an object");
+
+    // Slot 9 takes the pack's message and answers zero: "accepted, nothing done".
+    let command = abi::collect_id(crate::auth::collect_slots::COMMAND);
+    assert_eq!(
+        call_many(&mut rt, command, object, &[0x7001, 0, 0]).unwrap(),
+        0,
+        "the message is accepted"
+    );
+
+    // A slot with no record refuses by the name it was given, not with a number a pack would
+    // believe.
+    let unnamed = abi::collect_id(5);
+    let refused = call_many(&mut rt, unnamed, object, &[]);
+    assert!(refused.is_err(), "an unrecorded slot is refused");
+    let said = format!("{}", refused.unwrap_err());
+    assert!(
+        said.contains("Unnamed5"),
+        "the refusal names the slot: {said}"
+    );
+
+    let release = abi::collect_id(crate::auth::collect_slots::RELEASE);
+    assert_eq!(call_many(&mut rt, release, object, &[]).unwrap(), 0);
+}
+
+/// A carrier build's device-info class: served only for a Carrier profile, and its one method fills
+/// the model/MIN/channel block the firmware's create function builds.
+#[test]
+fn the_ktf_device_info_class_fills_the_firmwares_block() {
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let class = abi::AEECLSID_KTF_OEM;
+
+    // The standard handset has no such class: refusing it is what keeps every existing run's
+    // answer unchanged.
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(slot).unwrap(), 0);
+
+    // The reference Carrier profile is the one that says this handset has it.
+    let text = include_str!("../../assets/devices/ktf-kp2100.json");
+    let profile = crate::device_file::from_json(
+        &crate::json::parse(text).expect("the shipped profile is JSON"),
+    )
+    .expect("the shipped profile reads");
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let object = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(object, 0, "the class has an object");
+
+    let buf = rt.cpu.mem.alloc(0x26, 4).unwrap();
+    let info = abi::ktf_oem_id(abi::KTF_OEM_INFO);
+    assert_eq!(call_many(&mut rt, info, object, &[buf]).unwrap(), 1);
+    let block = rt.cpu.mem.read_bytes(buf, 0x26).unwrap();
+    assert_eq!(
+        &block[..10],
+        b"LG-KP2100\0",
+        "the model is the firmware's 10-byte field"
+    );
+    assert_eq!(
+        &block[0x0a..0x15],
+        b"01000000000",
+        "the MIN follows the model"
+    );
+    assert_eq!(block[0x1a], b'A', "the zero radio state is channel A");
+    assert_eq!(&block[0x1c..0x26], &[0u8; 10], "no radio, no network ids");
+
+    let release = abi::ktf_oem_id(abi::KTF_OEM_RELEASE);
+    assert_eq!(call_many(&mut rt, release, object, &[]).unwrap(), 0);
+}
+
+/// `o2jam_176` reads `certify.txt`, passes its bytes to the certificate object's second slot, and
+/// then dereferences the object without ever checking that the shell supplied one. The standard
+/// handset still refuses the class; a Carrier profile answers it as a license whose status is "not
+/// expired", which is the answer that takes the pack down its own success branch.
+#[test]
+fn the_ktf_certificate_class_gives_o2jam_an_object_to_check_its_certificate_with() {
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let class = abi::AEECLSID_KTF_CERT;
+
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(slot).unwrap(), 0);
+
+    let text = include_str!("../../assets/devices/ktf-kp2100.json");
+    let profile = crate::device_file::from_json(
+        &crate::json::parse(text).expect("the shipped profile is JSON"),
+    )
+    .expect("the shipped profile reads");
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[class, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let object = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(object, 0, "the certificate class has an object");
+
+    // `ILicense::IsExpired` is slot 2, the one the guest calls with the certificate buffer and
+    // length. The host's answer is FALSE, which the pack reads as its success case.
+    let is_expired = abi::method_of("ILicense", "IsExpired").unwrap();
+    assert_eq!(call_many(&mut rt, is_expired, object, &[]).unwrap(), g::FALSE);
+}
+
+#[test]
+fn the_bmp_handler_names_a_class_create_instance_builds() {
+    // The handler table and the `CreateInstance` door have to agree: a lookup that names a class
+    // the shell cannot build sends the caller one step into a refusal. A carrier premium check is
+    // exactly that caller — it decodes a BMP, asks who handles `image/bmp`, and creates the answer.
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let name = put_cstr(&mut rt, resource::MIME_BMP);
+    let get = abi::method_of("IShell", "GetHandler").unwrap();
+    assert_eq!(
+        call_many(&mut rt, get, shell, &[g::AEECLSID_VIEW, name]).unwrap(),
+        g::AEECLSID_WINBMP
+    );
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_WINBMP, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_ne!(rt.cpu.mem.read_u32(slot).unwrap(), 0);
+}
+
+#[test]
 fn the_heap_span_and_first_slice_are_what_the_caller_named() {
     let mut device = crate::device::DeviceProfile::standard();
     device.ram = 128 * 1024 * 1024;
@@ -4895,9 +5391,13 @@ fn the_heap_span_and_first_slice_are_what_the_caller_named() {
 }
 
 #[test]
-fn the_default_heap_is_the_delivery_span_and_slice() {
+fn the_default_heap_is_a_phones_span_and_the_first_slice() {
     let rt = Runtime::new();
-    assert_eq!(rt.cpu.mem.heap_limit(), crate::layout::HEAP_LIMIT);
+    assert_eq!(
+        rt.cpu.mem.heap_limit(),
+        crate::layout::HEAP_BASE + crate::layout::HEAP_DEFAULT,
+        "the ceiling a run is given is a handset's writable span, not the reserved one"
+    );
     let mut mem = crate::mem::Mem::new();
     mem.set_heap(crate::layout::HEAP_BASE, crate::layout::HEAP_LIMIT);
     assert_eq!(
@@ -4906,20 +5406,116 @@ fn the_default_heap_is_the_delivery_span_and_slice() {
     );
 }
 
+/// A zlib stream reaches the caller through `IUnzipAStream`, which is the only door a pack has.
+///
+/// The resources a pack marks `application/x-compressed` arrive as zlib, not as raw deflate: the
+/// `0x78` header is the difference, and a raw-deflate reader answers it with nothing. The wrapper is
+/// decided from the first bytes the source gives, so this also pins that the decision happens
+/// before the whole stream is on hand.
 #[test]
 fn a_zlib_stream_inflates_for_the_unzip_stream() {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write as _;
 
-    // The resources a pack marks `application/x-compressed` arrive as zlib, not as raw deflate:
-    // the `0x78` header is the difference, and a raw-deflate reader answers it with nothing.
     let payload = b"application/x-compressed payload".repeat(8);
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&payload).unwrap();
     let packed = enc.finish().unwrap();
     assert_eq!(packed[0], 0x78, "the fixture has to be zlib, not deflate");
-    assert_eq!(super::inflate(&packed).unwrap(), payload);
+
+    let mut rt = Runtime::new();
+    let mgr = new_service(&mut rt, g::AEECLSID_FILEMGR);
+    let open = abi::method_of("IFileMgr", "OpenFile").unwrap();
+    let name = put_cstr(&mut rt, "logo1.bin");
+    let file = call_many(
+        &mut rt,
+        open,
+        mgr,
+        &[name, g::_OFM_READWRITE | g::_OFM_CREATE],
+    )
+    .unwrap();
+    let src = rt.cpu.mem.alloc(packed.len() as u32, 4).unwrap();
+    rt.cpu.mem.write_bytes(src, &packed).unwrap();
+    let write = abi::method_of("IFile", "Write").unwrap();
+    assert_eq!(
+        call_many(&mut rt, write, file, &[src, packed.len() as u32]).unwrap(),
+        packed.len() as u32
+    );
+    let seek = abi::method_of("IFile", "Seek").unwrap();
+    assert_eq!(
+        call_many(&mut rt, seek, file, &[g::FS_SEEK_SET, 0]).unwrap(),
+        g::AEE_SUCCESS
+    );
+
+    let unzip = new_service(&mut rt, g::AEECLSID_UNZIPSTREAM);
+    let set_stream = abi::method_of("IUnzipAStream", "SetStream").unwrap();
+    assert_eq!(call_many(&mut rt, set_stream, unzip, &[file]).unwrap(), 0);
+    let read = abi::method_of("IUnzipAStream", "Read").unwrap();
+    let dst = rt.cpu.mem.alloc(payload.len() as u32, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, read, unzip, &[dst, payload.len() as u32]).unwrap(),
+        payload.len() as u32
+    );
+    assert_eq!(rt.cpu.mem.read_bytes(dst, payload.len()).unwrap(), payload);
+}
+
+/// A caller may hand the stream **a window at a time** and refill it between reads.
+///
+/// One pack in this sample set does exactly that: it fills a 512-byte buffer, names it as the stream,
+/// reads, puts the next window in the same stream object and names it again — never a second
+/// `IUnzipAStream`. A reader that inflated "everything the source holds" when the stream was named
+/// would stop at the first window, and the pack reads that stop as a corrupt stream.
+#[test]
+fn a_gzip_fed_a_window_at_a_time_inflates_across_the_refills() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as _;
+
+    // A plain modular pattern compresses into one window; xorshift32 gives bytes with no structure
+    // to find, so the gzip really spans several windows — which is the shape being tested.
+    let mut x: u32 = 0x1234_5678;
+    let payload: Vec<u8> = (0..6000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect();
+    let mut gz = Vec::new();
+    let mut enc = GzEncoder::new(&mut gz, Compression::default());
+    enc.write_all(&payload).unwrap();
+    enc.finish().unwrap();
+    assert!(gz.len() > 2048, "the fixture has to span several windows");
+
+    let mut rt = Runtime::new();
+    let mem = new_service(&mut rt, g::AEECLSID_MEMASTREAM);
+    let unzip = new_service(&mut rt, g::AEECLSID_UNZIPSTREAM);
+    let set_ex = abi::method_of("IMemAStream", "SetEx").unwrap();
+    let set_stream = abi::method_of("IUnzipAStream", "SetStream").unwrap();
+    let read = abi::method_of("IUnzipAStream", "Read").unwrap();
+    let dst = rt.cpu.mem.alloc(payload.len() as u32, 4).unwrap();
+
+    let mut got = 0u32;
+    for window in gz.chunks(512) {
+        let buf = rt.cpu.mem.alloc(window.len() as u32, 4).unwrap();
+        rt.cpu.mem.write_bytes(buf, window).unwrap();
+        assert_eq!(
+            call_many(&mut rt, set_ex, mem, &[buf, window.len() as u32, 0, 0, 0]).unwrap(),
+            0
+        );
+        assert_eq!(call_many(&mut rt, set_stream, unzip, &[mem]).unwrap(), 0);
+        let want = payload.len() as u32 - got;
+        let n = call_many(&mut rt, read, unzip, &[dst + got, want]).unwrap();
+        got += n;
+    }
+    assert_eq!(
+        got as usize,
+        payload.len(),
+        "every refill is accounted for, and the last one ends the stream"
+    );
+    assert_eq!(rt.cpu.mem.read_bytes(dst, payload.len()).unwrap(), payload);
 }
 
 #[test]
@@ -5204,7 +5800,11 @@ fn query_class_hands_back_the_mounted_manifest_path() {
     );
     assert!(
         rt.resources
-            .find(Some("fs:/mif/probe.mif"), crate::resource::RESTYPE_STRING, 8)
+            .find(
+                Some("fs:/mif/probe.mif"),
+                crate::resource::RESTYPE_STRING,
+                8
+            )
             .is_some(),
         "Store::candidates strips the path, so a later LoadRes* finds this same file"
     );
@@ -5219,7 +5819,7 @@ fn query_class_hands_back_the_mounted_manifest_path() {
 fn every_host_service_row_can_build_a_vtable() {
     for (face, cls) in HOST_SERVICES {
         assert!(
-            abi::iface(face).is_some(),
+            abi::iface_index(face).is_some(),
             "{face} ({cls:#010x}) is in HOST_SERVICES but not in the interface tables"
         );
     }
@@ -5234,8 +5834,438 @@ fn every_host_service_row_can_build_a_vtable() {
     );
     let obj = rt.cpu.mem.read_u32(slot).unwrap();
     assert_ne!(obj, 0, "and the out-parameter names the object");
-    assert_ne!(rt.cpu.mem.read_u32(obj).unwrap(), 0, "it has a vtable pointer");
+    assert_ne!(
+        rt.cpu.mem.read_u32(obj).unwrap(),
+        0,
+        "it has a vtable pointer"
+    );
     assert_eq!(rt.cpu.mem.read_u32(obj + 4).unwrap(), 1, "one reference");
+}
+
+/// `AEECLSID_GL` is the header's Common-Lite class: `IGL`'s GL slots take no `this`, so the
+/// texture enum is in r0, not an object pointer. The runtime has to find the object for the
+/// call's bookkeeping from the handle it recorded while the class was built.
+#[test]
+fn the_gl_class_builds_igl_and_its_methods_take_no_this() {
+    assert_eq!(abi::slot_of("IGL", "ActiveTexture"), Some(3));
+    assert_eq!(abi::slot_of("IGL", "AlphaFuncx"), Some(4));
+    assert_eq!(abi::slot_of("IGL", "TexParameterfv"), Some(109));
+    assert_eq!(abi::slot_of("IGL", "TexParameterxv"), Some(110));
+
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_GL, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let obj = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_eq!(rt.gl_object, obj, "the object the no-this methods use");
+
+    let active = abi::method_of("IGL", "ActiveTexture").unwrap();
+    assert_eq!(call_many(&mut rt, active, g::GL_TEXTURE1, &[]).unwrap(), 0);
+
+    let out = rt.cpu.mem.alloc(4, 4).unwrap();
+    let get = abi::method_of("IGL", "GetIntegerv").unwrap();
+    assert_eq!(
+        call_many(&mut rt, get, g::GL_ACTIVE_TEXTURE, &[out]).unwrap(),
+        0
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(out).unwrap(),
+        g::GL_TEXTURE1,
+        "the enum in r0 reached Gl::ActiveTexture unshifted"
+    );
+
+    let qi = abi::method_of("IGL", "QueryInterface").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, obj, &[g::AEEIID_GLES10, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let common = rt.cpu.mem.read_u32(ppv).unwrap();
+    assert_ne!(common, 0, "the Common face builds");
+    assert_ne!(
+        rt.cpu.mem.read_u32(common).unwrap(),
+        rt.cpu.mem.read_u32(obj).unwrap(),
+        "and it carries the IGLES10 vtable, not the Common-Lite one"
+    );
+}
+
+/// The EGL extension interfaces are not QEGL faces: a QI for their IIDs builds a separate
+/// object whose methods land on the same `Egl` presentation state. The V1 face carries
+/// scale/rotate/transparency; the full `IEGLSurfaceManip` face adds the colour key and the
+/// composite/overlay calls.
+#[test]
+fn egl_extension_interfaces_round_trip_through_qi() {
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_EGL, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let egl = rt.cpu.mem.read_u32(slot).unwrap();
+    let qi = abi::method_of("IEGL", "QueryInterface").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, egl, &[g::AEEIID_EGLSURFACEMANIP_V1, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let v1 = rt.cpu.mem.read_u32(ppv).unwrap();
+    assert_ne!(v1, 0, "the V1 face is built");
+
+    let surf = rt.egl.alloc();
+    rt.egl.surfaces.insert(
+        surf,
+        crate::gl::Surface::new(8, 8, crate::gl::SurfaceKind::Pbuffer),
+    );
+    let ret = rt.cpu.mem.alloc(4, 4).unwrap();
+    let enable = abi::method_of("IEGLSurfaceManip_V1", "SurfaceRotateEnable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, enable, v1, &[0, surf, 1, ret]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ret).unwrap(), 1);
+
+    let set = abi::method_of("IEGLSurfaceManip_V1", "SetSurfaceRotate").unwrap();
+    assert_eq!(
+        call_many(&mut rt, set, v1, &[0, surf, 1, 1, 0, ret]).unwrap(),
+        0
+    );
+    let (enabled, rot90, hmirror, vmirror) = (
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+    );
+    let get = abi::method_of("IEGLSurfaceManip_V1", "GetSurfaceRotate").unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            get,
+            v1,
+            &[0, surf, enabled, rot90, hmirror, vmirror, ret]
+        )
+        .unwrap(),
+        0
+    );
+    for (at, want) in [(enabled, 1), (rot90, 1), (hmirror, 1), (vmirror, 0)] {
+        assert_eq!(rt.cpu.mem.read_u32(at).unwrap(), want);
+    }
+
+    let scale = abi::method_of("IEGLSurfaceManip_V1", "SurfaceScaleEnable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, scale, v1, &[0, surf, 1, ret]).unwrap(),
+        0
+    );
+    let src = rt.cpu.mem.alloc(16, 4).unwrap();
+    let dst = rt.cpu.mem.alloc(16, 4).unwrap();
+    for (i, v) in [10u32, 20, 40, 30].iter().enumerate() {
+        rt.cpu.mem.write_u32(src + 4 * i as u32, *v).unwrap();
+    }
+    for (i, v) in [0u32, 0, 80, 60].iter().enumerate() {
+        rt.cpu.mem.write_u32(dst + 4 * i as u32, *v).unwrap();
+    }
+    let set_scale = abi::method_of("IEGLSurfaceManip_V1", "SetSurfaceScale").unwrap();
+    assert_eq!(
+        call_many(&mut rt, set_scale, v1, &[0, surf, src, dst, ret]).unwrap(),
+        0
+    );
+    let src_out = rt.cpu.mem.alloc(16, 4).unwrap();
+    let dst_out = rt.cpu.mem.alloc(16, 4).unwrap();
+    let get_scale = abi::method_of("IEGLSurfaceManip_V1", "GetSurfaceScale").unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            get_scale,
+            v1,
+            &[0, surf, enabled, src_out, dst_out, ret]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(enabled).unwrap(), 1);
+    for (i, want) in [10u32, 20, 40, 30].iter().enumerate() {
+        assert_eq!(rt.cpu.mem.read_u32(src_out + 4 * i as u32).unwrap(), *want);
+    }
+
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, egl, &[g::AEEIID_EGLSURFACEMANIP, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let full = rt.cpu.mem.read_u32(ppv).unwrap();
+    assert_ne!(full, 0, "the full SurfaceManip face is built");
+    let key_enable = abi::method_of("IEGLSurfaceManip", "SurfaceColorKeyEnable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, key_enable, full, &[0, surf, 1, ret]).unwrap(),
+        0
+    );
+    let set_key = abi::method_of("IEGLSurfaceManip", "SetSurfaceColorKey").unwrap();
+    assert_eq!(
+        call_many(&mut rt, set_key, full, &[0, surf, 10, 20, 30, ret]).unwrap(),
+        0
+    );
+    let (red, green, blue) = (
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+    );
+    let get_key = abi::method_of("IEGLSurfaceManip", "GetSurfaceColorKey").unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            get_key,
+            full,
+            &[0, surf, enabled, red, green, blue, ret]
+        )
+        .unwrap(),
+        0
+    );
+    for (at, want) in [(enabled, 1), (red, 10), (green, 20), (blue, 30)] {
+        assert_eq!(rt.cpu.mem.read_u32(at).unwrap(), want);
+    }
+    let composite = abi::method_of("IEGLSurfaceManip", "CreateCompositeSurface").unwrap();
+    assert_eq!(
+        call_many(&mut rt, composite, full, &[0, surf, 0, ret]).unwrap(),
+        0
+    );
+    let comp = rt.cpu.mem.read_u32(ret).unwrap();
+    assert_ne!(comp, 0, "a composite surface is a real drawable");
+    assert_ne!(comp, surf);
+
+    // Overlay layers: a second composite surface is the overlay; it binds to layer 1 on `comp`.
+    assert_eq!(
+        call_many(&mut rt, composite, full, &[0, surf, 0, ret]).unwrap(),
+        0
+    );
+    let overlay = rt.cpu.mem.read_u32(ret).unwrap();
+    assert_ne!(overlay, 0);
+    let overlay_enable = abi::method_of("IEGLSurfaceManip", "SurfaceOverlayEnable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, overlay_enable, full, &[0, overlay, 1, ret]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ret).unwrap(), 1);
+    let layer_enable = abi::method_of("IEGLSurfaceManip", "SurfaceOverlayLayerEnable").unwrap();
+    assert_eq!(
+        call_many(&mut rt, layer_enable, full, &[0, comp, 1, 1, ret]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ret).unwrap(), 1);
+    let bind = abi::method_of("IEGLSurfaceManip", "SurfaceOverlayBind").unwrap();
+    assert_eq!(
+        call_many(&mut rt, bind, full, &[0, comp, overlay, 1, 1, ret]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ret).unwrap(), 1);
+
+    let (bound_comp, bound_layer) = (
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+    );
+    let get_binding = abi::method_of("IEGLSurfaceManip", "GetSurfaceOverlayBinding").unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            get_binding,
+            full,
+            &[0, overlay, bound_comp, bound_layer, ret]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(bound_comp).unwrap(), comp);
+    assert_eq!(rt.cpu.mem.read_u32(bound_layer).unwrap(), 1);
+    let (layer_on, surface_on) = (
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+        rt.cpu.mem.alloc(4, 4).unwrap(),
+    );
+    let get_overlay = abi::method_of("IEGLSurfaceManip", "GetSurfaceOverlay").unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            get_overlay,
+            full,
+            &[0, overlay, layer_on, surface_on, ret]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(layer_on).unwrap(), 1);
+    assert_eq!(rt.cpu.mem.read_u32(surface_on).unwrap(), 1);
+
+    let caps = rt.cpu.mem.alloc(24, 4).unwrap();
+    let get_caps = abi::method_of("IEGLSurfaceManip", "GetSurfaceOverlayCaps").unwrap();
+    assert_eq!(
+        call_many(&mut rt, get_caps, full, &[0, surf, caps, ret]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ret).unwrap(), 1);
+    assert_eq!(rt.cpu.mem.read_u32(caps).unwrap(), 1);
+    assert_eq!(rt.cpu.mem.read_u32(caps + 4).unwrap(), 1);
+    assert_eq!(rt.cpu.mem.read_u32(caps + 8).unwrap(), 16);
+    assert_eq!(rt.cpu.mem.read_u32(caps + 12).unwrap(), 33);
+
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, egl, &[g::AEEIID_EGLOESSWAPINTERVAL, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let swap = rt.cpu.mem.read_u32(ppv).unwrap();
+    let set_interval = abi::method_of("IEGLOESSwapInterval", "SwapInterval").unwrap();
+    assert_eq!(
+        call_many(&mut rt, set_interval, swap, &[0, 2, ret]).unwrap(),
+        0
+    );
+    let interval = rt.cpu.mem.alloc(4, 4).unwrap();
+    let get_interval = abi::method_of("IEGLOESSwapInterval", "GetSwapInterval").unwrap();
+    assert_eq!(
+        call_many(&mut rt, get_interval, swap, &[0, interval]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(interval).unwrap(), 2);
+
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, egl, &[g::AEEIID_EGLGETPOWERLEVEL, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let power = rt.cpu.mem.read_u32(ppv).unwrap();
+    let level = rt.cpu.mem.alloc(4, 4).unwrap();
+    let get_power = abi::method_of("IEGLGetPowerLevel", "GetPowerLevel").unwrap();
+    assert_eq!(call_many(&mut rt, get_power, power, &[level]).unwrap(), 0);
+    assert_eq!(rt.cpu.mem.read_u32(level).unwrap(), 0);
+}
+
+/// A Common-Lite EGL entry is reached by address, not by object: the pack jumps to the entry with
+/// the display argument in `r0` and, for the next one, leaves whatever was there. Reading `r0` as
+/// `this` refuses the first call and then the second, which is how one reference GL title
+/// (`w61s_powersmash`) ended at its first frame.
+#[test]
+fn an_egl_entry_called_without_this_reads_its_arguments_from_r0() {
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(&mut rt, create, shell, &[g::AEECLSID_EGL, slot]).unwrap();
+    let egl = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_ne!(egl, 0, "the run has an EGL object to answer through");
+
+    // `eglGetDisplay(EGL_DEFAULT_DISPLAY)`: `r0` is the argument, and the handle that comes back is
+    // the object this host made.
+    let get_display = abi::method_of("IEGL", "eglGetDisplay").unwrap();
+    rt.cpu.r[0] = 0;
+    assert_eq!(
+        rt.dispatch(get_display, 0).unwrap(),
+        egl,
+        "the display handle is the object the host made, found through the argument register"
+    );
+
+    // `eglInitialize(display, &major, &minor)`: with no `this`, `r0` is the display, and the
+    // pointers after it are the second and third arguments — not the first and second.
+    let major = rt.cpu.mem.alloc(4, 4).unwrap();
+    let minor = rt.cpu.mem.alloc(4, 4).unwrap();
+    let initialize = abi::method_of("IEGL", "eglInitialize").unwrap();
+    rt.cpu.r[0] = egl;
+    rt.cpu.r[1] = major;
+    rt.cpu.r[2] = minor;
+    assert_eq!(
+        rt.dispatch(initialize, 0).unwrap(),
+        1,
+        "EGL_TRUE: the display it was handed is the one this host made"
+    );
+}
+
+/// W64S and older firmware do not expose `IEGLSurfaceManip`; a profile that names one of those
+/// handsets must answer the QI with `AEE_ECLASSNOTSUPPORT` instead of handing back an object the
+/// real device could not have made.
+#[test]
+fn a_profile_without_q3d_overlay_refuses_surface_manip() {    let mut profile = crate::device::DeviceProfile::standard();
+    profile.overlay = crate::device::OverlayCaps::none();
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_EGL, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let egl = rt.cpu.mem.read_u32(slot).unwrap();
+    let qi = abi::method_of("IEGL", "QueryInterface").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, egl, &[g::AEEIID_EGLSURFACEMANIP_V1, ppv]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppv).unwrap(), 0);
+}
+
+/// A profile can keep GLES 1.0 while saying the firmware never exposed the 1.1 faces. The QEGL
+/// family is still created, but a QI to a face the profile does not advertise is refused.
+#[test]
+fn a_profile_without_gles11_refuses_that_qegl_face() {
+    let mut profile = crate::device::DeviceProfile::standard();
+    profile.gl = crate::device::GlCaps {
+        gles10: true,
+        gles11: false,
+        gles10_ext: true,
+        gles11_ext: false,
+        gles11_ext_pak: false,
+        imageon_ext: true,
+        imageon_ext_v1: true,
+        ..crate::device::GlCaps::all()
+    };
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_QEGL, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let qegl = rt.cpu.mem.read_u32(slot).unwrap();
+    let qi = abi::method_of("IEGL10", "QueryInterface").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, qegl, &[g::AEEIID_GLES11, ppv]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppv).unwrap(), 0);
+
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, qi, qegl, &[g::AEEIID_GLES10, ppv]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_ne!(rt.cpu.mem.read_u32(ppv).unwrap(), 0);
+}
+
+/// The W64S image has neither a GLES/QEGL IID nor a GL string; a profile for it refuses the GL
+/// class and the QEGL family while leaving the plain EGL class available.
+#[test]
+fn a_w64s_profile_has_no_gl_or_qegl() {
+    let mut profile = crate::device::DeviceProfile::standard();
+    profile.overlay = crate::device::OverlayCaps::none();
+    profile.gl = crate::device::GlCaps::none();
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let create = abi::method_of("IShell", "CreateInstance").unwrap();
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    for cls in [g::AEECLSID_GL, g::AEECLSID_QEGL] {
+        assert_eq!(
+            call_many(&mut rt, create, shell, &[cls, slot]).unwrap(),
+            g::AEE_ECLASSNOTSUPPORT,
+            "{cls:#010x} is not a class the W64S exposes"
+        );
+    }
+    assert_eq!(
+        call_many(&mut rt, create, shell, &[g::AEECLSID_EGL, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
 }
 
 /// `ISHELL::QueryClass(cls, pai)`. The three packs that reach it ask about `0x0a000001` — their
@@ -5341,7 +6371,7 @@ fn the_running_applet_names_its_own_item() {
         "a class this host did not install has no item"
     );
 
-    // The case a shipped title actually lands in: the question is asked from inside the applet's
+    // The case a reference title actually lands in: the question is asked from inside the applet's
     // own constructor, so there is no adopted applet yet and `app_cls` is still zero. The class
     // under construction is the one being asked about, and it is the same fact
     // `GetAppInstance` already answers out of.
@@ -5362,8 +6392,8 @@ fn the_running_applet_names_its_own_item() {
 
 /// `IAppletCtl::GetRunningInfo` in the runtime this host answers for: the applet is found first,
 /// then one of the six named items is written. Item 0 has no name in that header and every number
-/// from 7 up lands on the same `EUNSUPPORTED` default in the shipped jump table — including the
-/// newer SDKs' `AEE_APPITEM_CUR_RUNNING_APP`, which this runtime never answers.
+/// from 7 up lands on the same `EUNSUPPORTED` default in the reference jump table — including the
+/// newer platform releases' `AEE_APPITEM_CUR_RUNNING_APP`, which this runtime never answers.
 #[test]
 fn the_applet_controller_answers_the_six_items_this_runtime_publishes() {
     let mut rt = Runtime::new();
@@ -5409,7 +6439,7 @@ fn the_applet_controller_answers_the_six_items_this_runtime_publishes() {
     assert!(rt.cpu.mem.read_u32(buff).unwrap() >= used);
 
     // A buffer shorter than the item is filled as far as it goes, the out size still reports the
-    // item's size, and the call succeeds — the shipped body truncates rather than refusing.
+    // item's size, and the call succeeds — the documented behaviour truncates rather than refusing.
     rt.cpu.mem.write_u32(buff, 0x5c5c_5c5c).unwrap();
     assert_eq!(ask(&mut rt, g::AEE_APPITEM_STATE, buff, 2), g::AEE_SUCCESS);
     assert_eq!(rt.cpu.mem.read_u16(buff).unwrap(), g::APPSTATE_TOP_VISIBLE);
@@ -5485,7 +6515,7 @@ fn the_applet_controller_answers_the_six_items_this_runtime_publishes() {
 
 /// `IAppletCtl::GetRunningList` reports the applets in states 1..=4, fills only whole ids that fit,
 /// and its out size is the count **required** — a short buffer is still a success. The header's
-/// `EBUFFERTOOSMALL` never comes out of the shipped body.
+/// `EBUFFERTOOSMALL` never comes out of the documented behaviour.
 #[test]
 fn the_running_list_counts_what_runs_and_reports_the_whole_count() {
     let mut rt = Runtime::new();
@@ -5549,7 +6579,7 @@ fn the_running_list_counts_what_runs_and_reports_the_whole_count() {
 }
 
 /// `IAppletCtl::Control` starts, asks about, and stops an applet. The record checks and the stop
-/// privilege gate are the shipped body's; a second start is busy because this host has one applet
+/// privilege gate are the documented behaviour's; a second start is busy because this host has one applet
 /// and no way to suspend it, and stop checks membership before it checks whether the class runs.
 #[test]
 fn the_applet_control_slot_checks_the_record_and_gates_a_stop() {
@@ -5684,7 +6714,11 @@ fn the_network_manager_is_also_served_under_its_versioned_id() {
         .filter(|(_, cls)| *cls == g::AEECLSID_NET_11)
         .map(|(face, _)| *face)
         .collect();
-    assert_eq!(rows, ["INetMgr"], "the versioned id names the manager, once");
+    assert_eq!(
+        rows,
+        ["INetMgr"],
+        "the versioned id names the manager, once"
+    );
 
     // The object, reached through *this* id, on a slot that touches state: `OpenSocket` hands back an
     // `ISocket` and registers its port, so this says the dispatch found `inetmgr`'s body. `GetLastError`
@@ -5867,7 +6901,7 @@ fn the_network_manager_answers_the_shape_a_host_without_a_radio_has() {
         0,
         "the callback is queued, not run inside GetHostByName"
     );
-    // The shipped body goes through `IShell::Resume`, so the block carries the queue's unregister
+    // The documented behaviour goes through `IShell::Resume`, so the block carries the queue's unregister
     // leg — the same door, and therefore the same stamp, as every other arming route.
     assert_eq!(
         rt.cpu.mem.read_u32(pcb + 8).unwrap(),
@@ -6348,7 +7382,7 @@ fn the_sprite_engine_holds_its_buffers_and_refuses_without_a_destination() {
     // the transform bodies are the ones in use — and their one extra rule is visible from outside: a
     // command that names a matrix while `SetTransformTable` was never called draws nothing and answers
     // `EBADPARM`, which the simple body has no way to say. The flag goes on the
-    // *visible* record: the shipped walk tests the size, then the layer, then the flag ().
+    // *visible* record: the reference walk tests the size, then the layer, then the flag ().
     let face = rt.sprites.engine(sprite).unwrap().transform;
     assert_ne!(face, 0, "a destination this host made has a transform face");
     let o_transform = abi::offset_of("AEESpriteCmd", "unTransform").unwrap();
@@ -6547,7 +7581,7 @@ fn netmgr_reports_no_connection_without_ending_the_run() {
         failed,
         "the caller's own result record says why"
     );
-    // `GetMyIPAddr` is an `INAddr` whose shipped body spends the return on the selection code itself, so
+    // `GetMyIPAddr` is an `INAddr` whose documented behaviour spends the return on the selection code itself, so
     // a run with no network answers **1** — and a test that read it as "the ABI's null" would be
     // asserting a zero address this host never returns. `OpenSocket` is the manager's one door with
     // something to hand back: a socket of the type asked for, and the reason waits in `GetLastError`
@@ -7001,7 +8035,7 @@ fn the_file_truncate_answers_a_boolean_and_leaves_the_reason_in_the_error_cell()
         "the flush neither clears nor refuses"
     );
 
-    // Success is **FALSE (0)**, and the error cell holds the file system's own 0 — the shipped body
+    // Success is **FALSE (0)**, and the error cell holds the file system's own 0 — the documented behaviour
     // writes it unconditionally, so a previous refusal does not survive a truncation that worked.
     rt.volume.refuse(g::AEE_EBADPARM);
     assert_eq!(
@@ -7028,7 +8062,7 @@ fn the_file_truncate_answers_a_boolean_and_leaves_the_reason_in_the_error_cell()
     );
 
     // Failure is **TRUE (1)**, with the reason in the cell. The same file reopened for reading is the
-    // shape this store can actually produce, and it travels the shipped route: reason to the cell,
+    // shape this store can actually produce, and it travels the reference route: reason to the cell,
     // boolean to the caller.
     let release = abi::method_of("IFile", "Release").unwrap();
     assert_eq!(call_many(&mut rt, release, file, &[]).unwrap(), 0);
@@ -7043,7 +8077,7 @@ fn the_file_truncate_answers_a_boolean_and_leaves_the_reason_in_the_error_cell()
     assert_eq!(
         call_many(&mut rt, get_last, mgr, &[]).unwrap(),
         g::AEE_EREADONLY,
-        "and the code the pack would want is where the shipped body keeps its own"
+        "and the code the pack would want is where the documented behaviour keeps its own"
     );
     call_many(&mut rt, seek, read_only, &[g::_SEEK_START, 0]).unwrap();
     assert_eq!(
@@ -7237,7 +8271,7 @@ fn the_file_info_slots_answer_a_boolean_and_leave_the_reason_in_the_cell() {
 
     // `nMaxFile` is a capacity in **bytes including the terminator**, and it is the name that gets cut:
     // a caller offering 5 is handed four characters and a NUL, with the rest of its own buffer left
-    // alone. The clamp is `aee_strlcpy`'s, which the shipped body runs with `nMaxFile` straight through.
+    // alone. The clamp is `aee_strlcpy`'s, which the documented behaviour runs with `nMaxFile` straight through.
     let small = rt.cpu.mem.alloc(8, 4).unwrap();
     rt.cpu.mem.fill(small, 8, 0xa5).unwrap();
     rt.cpu.mem.write_u32(ex + ex_at("pszFile"), small).unwrap();
@@ -7596,7 +8630,7 @@ fn ibitmap_round_trips_through_the_dispatch() {
         0,
         "and the caller's pointer is cleared before the refusal"
     );
-    // The header: the oldest spelling of this id, which "will phase out". The shipped body
+    // The header: the oldest spelling of this id, which "will phase out". The documented behaviour
     // answers it with an interior pointer and no reference; this host answers with the bitmap and the
     // reference the other ids carry, which is what the pairing below pins.
     rt.cpu.r[1] = g::AEECLSID_AEEDIB;
@@ -7997,6 +9031,42 @@ fn an_uninitialised_device_info_size_still_gets_the_whole_screen() {
     );
 }
 
+/// A BREW 1.2.3 pack puts its 60-byte `AEEDeviceInfo` on the stack and may leave the 4.0.x
+/// `wStructSize` word stale. The device's own struct size is what keeps the 4.0.x tail from
+/// running into the caller's saved registers.
+#[test]
+fn a_brew_1_2_device_info_does_not_write_past_the_callers_struct() {
+    let text = include_str!("../../assets/devices/ktf-kp2100.json");
+    let profile = crate::device_file::from_json(
+        &crate::json::parse(text).expect("the shipped profile is JSON"),
+    )
+    .expect("the shipped profile reads");
+    let mut rt = Runtime::with_device(profile);
+    let shell = rt.shell;
+    let pi = rt.cpu.mem.alloc(64, 4).unwrap();
+    rt.cpu.mem.write_bytes(pi, &[0xff; 64]).unwrap();
+    // A stale word, as in the pack: the profile's 60 bytes are the ceiling, not this.
+    rt.cpu.mem.write_u16(pi + 44, 0x038c).unwrap();
+    let get = abi::method_of("IShell", "GetDeviceInfo").unwrap();
+    rt.cpu.r[1] = pi;
+    call(&mut rt, get, shell).unwrap();
+    assert_eq!(
+        rt.cpu.mem.read_u32(pi + 60).unwrap(),
+        0xffff_ffff,
+        "nothing past the 60-byte 1.2.3 struct is written"
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u16(pi + 44).unwrap(),
+        60,
+        "the size the pack reads back is its own"
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u16(pi).unwrap(),
+        u32::from(rt.device.width),
+        "the screen fields are still there"
+    );
+}
+
 #[test]
 fn a_device_item_answers_a_size_query_before_it_answers_the_call() {
     let mut rt = Runtime::new();
@@ -8028,6 +9098,50 @@ fn a_device_item_answers_a_size_query_before_it_answers_the_call() {
     assert_eq!(rt.cpu.mem.read_u32(pn).unwrap(), need);
     // An item whose payload the published header does not size is not one this device answers.
     rt.cpu.r[1] = g::AEE_DEVICEITEM_RAM;
+    assert_eq!(call(&mut rt, get_ex, shell).unwrap(), g::AEE_EUNSUPPORTED);
+}
+
+/// The carrier item at the start of the carrier range is answered, and answered empty.
+///
+/// Both halves matter. A refusal here is what two packs read as "this handset cannot run me", so
+/// the item has to exist; and the body is unrecorded, so the honest body is no body at all —
+/// pinning the length at one NUL keeps a later "fill it with something plausible" from passing as
+/// this behaviour.
+#[test]
+fn the_first_carrier_item_is_present_and_holds_nothing() {
+    use crate::device;
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let get_ex = abi::method_of("IShell", "GetDeviceInfoEx").unwrap();
+    let pn = rt.cpu.mem.alloc(4, 4).unwrap();
+
+    rt.cpu.mem.write_u32(pn, 0).unwrap();
+    rt.cpu.r[1] = device::AEE_DEVICEITEM_CARRIER_FIRST;
+    rt.cpu.r[2] = 0;
+    rt.cpu.r[3] = pn;
+    assert_eq!(
+        call(&mut rt, get_ex, shell).unwrap(),
+        g::AEE_SUCCESS,
+        "a pack that asks whether the item is there must be told it is"
+    );
+    let need = rt.cpu.mem.read_u32(pn).unwrap();
+    assert_eq!(need, 1, "present, and a one-byte item: its own terminator");
+
+    let buff = rt.cpu.mem.alloc(need, 4).unwrap();
+    rt.cpu.mem.write_u8(buff, 0xaa).unwrap();
+    rt.cpu.mem.write_u32(pn, need).unwrap();
+    rt.cpu.r[2] = buff;
+    assert_eq!(call(&mut rt, get_ex, shell).unwrap(), g::AEE_SUCCESS);
+    assert_eq!(
+        rt.cpu.mem.read_u8(buff).unwrap(),
+        0,
+        "the byte handed over is the terminator, not a value"
+    );
+
+    // The neighbourhood is untouched: an id the carrier range does not explain still refuses.
+    rt.cpu.r[1] = 0x58f2;
+    rt.cpu.r[2] = 0;
+    rt.cpu.r[3] = pn;
     assert_eq!(call(&mut rt, get_ex, shell).unwrap(), g::AEE_EUNSUPPORTED);
 }
 
@@ -8167,9 +9281,9 @@ fn the_heap_statistics_move_with_the_heap_and_agree_across_both_routes() {
     );
     assert_eq!(
         mod_max,
-        crate::layout::HEAP_LIMIT - crate::layout::HEAP_BASE,
-        "the header asks for the size the module's heap is *allowed* to be, so the answer is this \
-         host's whole span — a high-water mark there tells a pack its heap is nearly full"
+        crate::layout::HEAP_DEFAULT,
+        "the header asks for the size the module's heap is *allowed* to be, so the answer is the \
+         ceiling this run was given — a high-water mark there tells a pack its heap is nearly full"
     );
     assert!(
         mod_max >= mod_cur,
@@ -8283,6 +9397,27 @@ fn alloc_no_zmem_is_a_flag_in_the_size_not_part_of_it() {
     // A request that is genuinely too large is still refused the same way.
     rt.cpu.r[0] = 0x7000_0000;
     assert_eq!(rt.dispatch(id, 0).unwrap(), 0);
+}
+
+#[test]
+fn a_string_terminated_past_four_kibibytes_is_still_measured() {
+    // A pack reads an HTML page into `malloc(size + 1)` and relies on that extra byte for the NUL,
+    // then parses the page with the C helpers. The page is longer than 4 KiB, so a fixed scan
+    // ceiling reported a terminated string as a non-string and ended the run. `aee_strlen` has no
+    // ceiling of its own; the guest's mapping is the only bound this host needs.
+    let mut rt = Runtime::new();
+    let id = abi::helper_id(abi::offset_of("AEEHelperFuncs", "strlen").unwrap());
+    let len = 22_211usize;
+    let s = rt.cpu.mem.alloc(len as u32 + 1, 4).unwrap();
+    let text = vec![b'a'; len];
+    rt.cpu.mem.write_bytes(s, &text).unwrap();
+    rt.cpu.mem.write_u8(s + len as u32, 0).unwrap();
+    rt.cpu.r[0] = s;
+    assert_eq!(
+        rt.dispatch(id, 0).unwrap(),
+        len as u32,
+        "the terminator after the page is what strlen stops at"
+    );
 }
 
 #[test]
@@ -8442,7 +9577,7 @@ fn get_app_instance_answers_with_the_applet_a_module_is_still_building() {
 /// The other half: a *second* `StartApplet` while an applet is already running. The constructor being
 /// built asks `GETAPPINSTANCE()` and has to get **itself**, not the applet it is replacing.
 ///
-/// Refresher → Monopoly is the shipped case: Monopoly's constructor reads its own fields through this
+/// Refresher → Monopoly is the reference case: Monopoly's constructor reads its own fields through this
 /// answer, and being handed Refresher's applet made it fault at `module+0x140b8` on a pointer that
 /// applet never had. Anything that is not an applet start keeps the old rule — a library object's
 /// constructor still sees the running applet.
@@ -8512,12 +9647,19 @@ fn get_aee_version_names_the_release_and_leaves_a_small_buffer_alone() {
     assert_eq!(rt.dispatch(id, 0).unwrap(), g::AEE_EFAILED);
 }
 
-/// `AEEHelperFuncs::aee_GetRand` fills the caller's buffer with random bytes, and the header says
-/// the sequence is seeded by the current time — so the model here derives the stream from the
-/// virtual clock rather than from a counter that keeps running. Two asks inside one virtual
-/// millisecond come back identical, which is the behaviour the header warns a pack to expect.
+/// `AEEHelperFuncs::aee_GetRand` fills the caller's buffer with random bytes.
+///
+/// The header's "seeded by the current time" is about the seed; the generator is a *stream* that
+/// advances on every call. This test used to assert the opposite — that two asks inside one virtual
+/// millisecond come back identical — and that reading cost three guest packs a billion
+/// instructions each: `a sample pack` draws a random number as its loop condition, so a constant
+/// answer is a loop that never ends, and the virtual clock cannot save it because it only moves when
+/// the guest calls the host.
+///
+/// What is still guaranteed, and why the seed is the clock's, is reproducibility: two runtimes
+/// started at the same virtual time hand out the same sequence, call for call.
 #[test]
-fn aee_get_rand_fills_the_buffer_and_replays_from_the_virtual_clock() {
+fn aee_get_rand_advances_its_stream_and_still_replays_from_a_fixed_seed() {
     let mut rt = Runtime::new();
     let id = abi::helper_id(abi::offset_of("AEEHelperFuncs", "aee_GetRand").unwrap());
     let buf = rt.cpu.mem.alloc_zeroed(16).unwrap();
@@ -8545,18 +9687,30 @@ fn aee_get_rand_fills_the_buffer_and_replays_from_the_virtual_clock() {
         &[0u8; 4],
         "it writes nSize bytes and no further"
     );
-    // The same virtual millisecond answers the same, because the clock is the whole seed.
+    // The next call in the *same* virtual millisecond differs, because the stream moved. A pack
+    // that loops until its random draw changes needs this to be true.
     rt.cpu.mem.write_bytes(buf, &[0u8; 16]).unwrap();
     assert_eq!(ask(&mut rt, 12), 0);
-    assert_eq!(&read(&rt, 12)[..], &first[..12]);
-    // A few milliseconds later the answer moves, which is what the pack was told would happen.
-    rt.clock_ms += 7;
-    rt.cpu.mem.write_bytes(buf, &[0u8; 16]).unwrap();
-    assert_eq!(ask(&mut rt, 12), 0);
+    let second = read(&rt, 12);
     assert_ne!(
-        &read(&rt, 12)[..],
+        &second[..],
         &first[..12],
-        "the stream follows the virtual clock"
+        "a second draw inside one millisecond must not repeat the first"
+    );
+    // Replays: a fresh runtime at the same virtual time hands out the same two blocks in order.
+    let mut replay = Runtime::new();
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..2 {
+        replay.cpu.r[0] = buf;
+        replay.cpu.r[1] = 12;
+        replay.dispatch(id, 0).unwrap();
+        got.extend_from_slice(&read(&replay, 12));
+    }
+    let mut want = first[..12].to_vec();
+    want.extend_from_slice(&second[..]);
+    assert_eq!(
+        got, want,
+        "the stream is a pure function of the seed and the call order"
     );
     // A null destination and a nonsense size are both not a write.
     let before = read(&rt, 16);
@@ -8657,7 +9811,7 @@ fn julian_date_writes_the_seven_fields_the_caller_pointed_at() {
 }
 
 /// A 2x2 24-bit Windows bitmap: bottom-up rows padded to a 4-byte boundary, which is the shape
-/// every image resource in the corpus turned out to have.
+/// every image resource in the sample set turned out to have.
 fn a_bmp() -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(b"BM");
@@ -8759,7 +9913,7 @@ fn convertbmp_hands_back_a_bitmap_the_display_can_blit() {
     );
 }
 
-/// An 8-bit palettised BMP — the form a shipped game's font strip and tile sheet arrive in, and
+/// An 8-bit palettised BMP — the form a guest game's font strip and tile sheet arrive in, and
 /// the one `a_bmp` above does not cover.
 fn a_palettised_bmp() -> Vec<u8> {
     let mut b = Vec::new();
@@ -8916,7 +10070,7 @@ fn an_unimplemented_slot_stops_the_run_by_name() {
     fake_module(&mut rt);
     // A slot this host genuinely does not answer. `GetPrefs` was the example here until it got
     // implemented for the applet that asked, then `GetActiveDialog` until it was answered with the
-    // header's own null, then `Obsolete` until the shipped stub behind it was
+    // header's own null, then `Obsolete` until the reference stub behind it was
     // read, then
     // `IMenuCtl::SetStyle` and `SetColors` until both bodies were read — which is the right way for
     // this test to fail: an unimplemented slot stops being unimplemented.
@@ -9062,7 +10216,7 @@ fn the_loop_keeps_running_work_that_work_scheduled_until_the_window_runs_out() {
 
 #[test]
 fn a_callback_record_with_no_function_inside_is_not_armed() {
-    // `ISHELL_SetTimerEx` arrives as this slot with the same word twice, and the shipped
+    // `ISHELL_SetTimerEx` arrives as this slot with the same word twice, and the reference
     // `AEE_USR_SetTimer` looks inside that record before it arms anything: a zero `pfnNotify` is
     // answered with the same code it uses for a null function pointer (`14`). A record with no
     // function in it cannot deliver, so answering SUCCESS would leave the applet waiting on a timer
@@ -9139,6 +10293,52 @@ fn a_timer_armed_through_a_callback_reaches_the_pair_inside_it() {
         1,
         "the notify pair in the struct ran, with its own context"
     );
+}
+
+#[test]
+fn a_timer_armed_inside_a_constructor_waits_for_the_constructor_to_return() {
+    let mut rt = Runtime::new();
+    let shell = rt.shell;
+    let set = abi::method_of("IShell", "SetTimer").unwrap();
+    let mark = rt.cpu.mem.alloc(4, 4).unwrap();
+    let notify = arm_code(
+        &mut rt,
+        &[0xe3a0_1001, 0xe580_1000, 0xe12f_ff1e], // mov r1,#1 ; str r1,[r0] ; bx lr
+    );
+    let at = |name: &str| abi::offset_of("_AEECallback", name).expect("_AEECallback");
+    let pcb = rt.cpu.mem.alloc(28, 4).unwrap();
+    rt.cpu.mem.write_u32(pcb + at("pfnNotify"), notify).unwrap();
+    rt.cpu.mem.write_u32(pcb + at("pNotifyData"), mark).unwrap();
+    assert_eq!(
+        call_many(&mut rt, set, shell, &[8, pcb, pcb]).unwrap(),
+        g::AEE_SUCCESS
+    );
+
+    // Eight virtual milliseconds pass while `IShell::StartApplet` is still inside the module's
+    // constructor. A handset's shell walks its timer list from the event loop, and the loop is what
+    // the constructor has to return *to*; a host that delivered here would run the callback over a
+    // half-built applet, which on one guest pack meant tearing down an array the constructor had
+    // not allocated yet.
+    rt.constructing_applets = 1;
+    rt.cpu.steps = rt.cpu.steps.saturating_add(8 * INSTR_PER_MS);
+    let clock = abi::helper_id(abi::offset_of("AEEHelperFuncs", "aee_GetTimeMS").unwrap());
+    rt.dispatch(clock, 0).unwrap();
+    assert_eq!(
+        rt.cpu.mem.read_u32(mark).unwrap(),
+        0,
+        "a host call inside the constructor is a safe point for the clock, not for the timer"
+    );
+    assert_eq!(rt.timers.len(), 1, "the timer is kept, not spent");
+
+    // The constructor returns; the next turn finds the timer already past due and runs it there.
+    rt.constructing_applets = 0;
+    assert_eq!(rt.pump(1).unwrap().callbacks, 1);
+    assert_eq!(
+        rt.cpu.mem.read_u32(mark).unwrap(),
+        1,
+        "and it runs once the shell has the loop back"
+    );
+    assert!(rt.timers.is_empty(), "spent, not waiting behind a stale copy");
 }
 
 #[test]
@@ -9472,7 +10672,7 @@ fn a_downcall_returns_the_guest_value_and_gives_back_the_host_state() {
 
 #[test]
 fn a_long_session_of_short_calls_does_not_spend_one_budget() {
-    // The allowance belongs to a guest function, not to a run. A shipped game's menu is tens of
+    // The allowance belongs to a guest function, not to a run. A guest game's menu is tens of
     // thousands of short callbacks, and charging them all to whichever one was live when the
     // total ran out reported a function that never returned when every one of them had.
     let mut rt = Runtime::new();
@@ -10087,7 +11287,7 @@ fn a_read_of_nothing_answers_the_whole_file_not_what_is_left() {
 #[test]
 fn a_read_wider_than_the_block_it_was_handed_stops_at_the_block_and_says_so() {
     // `IFILE_Read(p, pBuf, numBytes)` takes both the buffer and the length from the app, and nothing
-    // on the way checked that the two agree. The shape this closes is the one that ended a shipped
+    // on the way checked that the two agree. The shape this closes is the one that ended a reference
     // pack's run: a small live object with a file reading thousands of bytes through a pointer the
     // pack had already freed, which laid the file's content over the object's own fields and left
     // the next release dereferencing one of them. The host knows how wide a block it handed out, so
@@ -10452,7 +11652,7 @@ fn fill_mode_answers_the_boolean_it_was_set_to_and_a_new_object_starts_outlined(
 /// implements, so the app got a refusal for a service the handset does provide. Both names have to
 /// come back with an object that carries its own state.
 /// The header promises FALSE when a system that cannot do it is asked to turn double buffering
-/// on, and this repository refused for years on the strength of that paragraph. The shipped body is
+/// on, and this repository refused for years on the strength of that paragraph. The documented behaviour is
 /// `return a2;` — one instruction, no state, no support test — so the answer is the echo, and the
 /// refusal was a header reading rather than a measurement. `IGraphics::Update` says so too: it is a
 /// tail call to `IDisplay::Update(TRUE)`, which the host has always answered by presenting.
@@ -10501,7 +11701,7 @@ fn the_two_graphics_class_ids_both_answer_with_a_working_igraphics() {
     }
 }
 
-/// The BREW 1.0 spellings of two service classes. A pack built against the older SDK asks for
+/// The BREW 1.0 spellings of two service classes. A pack built against the older platform asks for
 /// these names, and the reference shell's class table carries them with the *current* service's
 /// own constructor and the `ASCF_UPGRADE` flag — so refusing them is refusing a thing the handset
 /// the pack was built for always had.
@@ -10512,7 +11712,16 @@ fn the_legacy_class_names_answer_with_the_current_service() {
     let shell = rt.shell;
     let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
     let query = abi::method_of("IShell", "QueryClass").unwrap();
-    for cls in [g::AEECLSID_SOUND_10, g::AEECLSID_TEXTCTL_10] {
+    for cls in [
+        g::AEECLSID_SOUND_10,
+        g::AEECLSID_TEXTCTL_10,
+        g::AEECLSID_STATIC_10,
+        g::AEECLSID_NET_10,
+        g::AEECLSID_MENUCTL_10,
+        g::AEECLSID_SOFTKEYCTL_10,
+        g::AEECLSID_LISTCTL_10,
+        g::AEECLSID_ICONVIEWCTL_10,
+    ] {
         let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
         assert_eq!(
             call_many(&mut rt, crinst, shell, &[cls, ppv]).unwrap(),
@@ -11628,16 +12837,8 @@ fn put_aecho(rt: &mut Runtime, text: &str) -> u32 {
 /// The `AECHAR` string at `at`, as far as its NUL — what a pack would read back out of a buffer one
 /// of the header's string getters filled.
 fn aechar_at(rt: &Runtime, at: u32) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    loop {
-        let unit = rt.cpu.mem.read_u16(at + i * 2).unwrap();
-        if unit == 0 {
-            return out;
-        }
-        out.push(char::from_u32(u32::from(unit)).expect("the unit of a basic-plane character"));
-        i += 1;
-    }
+    let units = rt.cpu.mem.read_u16str(at, 4096).unwrap();
+    rt.text_encoding().units_to_string(&units)
 }
 
 #[test]
@@ -11841,7 +13042,7 @@ fn a_julian_day_counts_from_the_sunday_before_1970() {
     call_many(&mut rt, get_date, date, &[y, m, d]).unwrap();
     assert_eq!(read(&rt), (1970, 1, 1), "and the two readers agree");
 
-    // A number the shipped member will not name is refused **and unwritten**: `JDayToDate` returns
+    // A number the reference member will not name is refused **and unwritten**: `JDayToDate` returns
     // FALSE before touching the caller's three integers, and `SetJulianDay` then
     // stores what they hold — zeros — with the day number and weekday at zero as well ().
     assert_eq!(
@@ -11991,11 +13192,55 @@ fn service(rt: &mut Runtime, cls: u32) -> u32 {
 }
 
 #[test]
+fn the_ram_cache_class_hands_out_a_working_record_store() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let cache = service(&mut rt, g::AEECLSID_RAMCACHE);
+
+    let set_ttl = abi::method_of("IRamCache", "SetTTL").unwrap();
+    let set_max_size = abi::method_of("IRamCache", "SetMaxSize").unwrap();
+    let set_max_entries = abi::method_of("IRamCache", "SetMaxEntries").unwrap();
+    let add = abi::method_of("IRamCache", "Add").unwrap();
+    let find = abi::method_of("IRamCache", "Find").unwrap();
+    let remove = abi::method_of("IRamCache", "Remove").unwrap();
+    // Each setter answers with the previous value, which a fresh cache holds as zero.
+    assert_eq!(call_many(&mut rt, set_ttl, cache, &[3600]).unwrap(), 0);
+    assert_eq!(call_many(&mut rt, set_max_size, cache, &[4096]).unwrap(), 0);
+    assert_eq!(call_many(&mut rt, set_max_entries, cache, &[8]).unwrap(), 0);
+
+    let key = put_cstr(&mut rt, "k");
+    let value = put_cstr(&mut rt, "value");
+    assert_eq!(
+        call_many(&mut rt, add, cache, &[key, 1, value, 5]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let out = rt.cpu.mem.alloc(16, 4).unwrap();
+    let len = rt.cpu.mem.alloc(4, 4).unwrap();
+    rt.cpu.mem.write_u32(len, 16).unwrap();
+    assert_eq!(
+        call_many(&mut rt, find, cache, &[key, 1, out, len]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(rt.cpu.mem.read_u32(len).unwrap(), 5);
+    assert_eq!(rt.cpu.mem.read_bytes(out, 5).unwrap(), b"value");
+
+    assert_eq!(
+        call_many(&mut rt, remove, cache, &[key, 1]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    rt.cpu.mem.write_u32(len, 16).unwrap();
+    assert_eq!(
+        call_many(&mut rt, find, cache, &[key, 1, out, len]).unwrap(),
+        g::AEE_ENOMORE
+    );
+}
+
+#[test]
 fn the_option_shell_stands_on_its_own() {
     let mut rt = Runtime::new();
     fake_module(&mut rt);
     // The class `ICallOrigOpts_New` asks the shell for before it will build: a pack that assembles
-    // its own option shell the way the shipped telephone body does gets here first.
+    // its own option shell the way the reference telephone body does gets here first.
     let opts = service(&mut rt, g::AEECLSID_WEBOPTS);
 
     // The body compares two ids and nothing else, and a refusal clears the caller's slot.
@@ -12448,7 +13693,7 @@ fn the_sms_message_object_is_the_option_list_the_runtime_builds() {
 /// The broadcast-service options object is the same list behind a privilege gate. Its constructor
 /// asks `ISHELL_CheckPrivLevel(SMSMAINCLIENT, TRUE)`, which this host answers
 /// permissively for the running app (see `Runtime::app_in_group`), and its `QueryInterface` tests
-/// `AEECLSID_SMSMSG` **rather than its own class id** () — the copy-paste the shipped
+/// `AEECLSID_SMSMSG` **rather than its own class id** () — the copy-paste the reference
 /// object carries, mirrored here rather than "fixed".
 #[test]
 fn the_broadcast_options_object_answers_the_ids_its_body_answers() {
@@ -12486,7 +13731,7 @@ fn the_broadcast_options_object_answers_the_ids_its_body_answers() {
     );
     let (id, ptr) = read_xopt(&rt, out);
     assert_eq!(id, opt);
-    // The shipped SMS objects start with `bCopy` FALSE (empty initial list ⇒ `WebOptMgr_CtorZ` never
+    // The reference SMS objects start with `bCopy` FALSE (empty initial list ⇒ `WebOptMgr_CtorZ` never
     // sees a `WEBOPT_COPYOPTS`, the header), so the runtime stores the caller's pointer.
     // This host always copies — `XOPT_COPYOPTS`'s documented default, and the only safe reading of
     // "the caller may reuse its buffer" — which is a deliberate D on the option-list face.
@@ -12497,7 +13742,7 @@ fn the_broadcast_options_object_answers_the_ids_its_body_answers() {
     assert_eq!(rt.cstring(ptr).unwrap(), "service");
 }
 
-/// The third option record the shipped runtime registers, and the only one whose constructor does not
+/// The third option record the reference runtime registers, and the only one whose constructor does not
 /// need the phone: `ICallOrigOpts_New` allocates eight bytes and fills them by asking the shell for an
 /// `AEECLSID_WEBOPTS` object, so the wrapper holds the manager's object and no count of
 /// its own — `AddRef` and `Release` go to the inner object. It compares **four** ids in
@@ -12779,8 +14024,8 @@ fn releasing_the_object_gives_back_what_its_options_held() {
     );
 }
 
-/// `IWEB_GetResponse`: no response object, the options it carries added to this object, and the
-/// caller's `AEECallback` queued so its failure is actually reported.
+/// `IWEB_GetResponse`: a request with no connection still has a response object, the options it
+/// carries added to this object, and the caller's `AEECallback` queued so its failure is reported.
 #[test]
 fn get_response_stores_its_options_and_calls_the_callers_callback() {
     let mut rt = Runtime::new();
@@ -12825,10 +14070,17 @@ fn get_response_stores_its_options_and_calls_the_callers_callback() {
     )
     .unwrap();
     assert_eq!(answer, 0, "the prototype returns void");
+    let response = rt.cpu.mem.read_u32(ppresp).unwrap();
+    assert_ne!(
+        response, 0,
+        "the callback is handed a response object, because the header's answer is its `GetInfo`"
+    );
+    let info_fn = abi::method_of("IWebResp", "GetInfo").unwrap();
+    let info = call(&mut rt, info_fn, response).unwrap();
     assert_eq!(
-        rt.cpu.mem.read_u32(ppresp).unwrap(),
-        0,
-        "there is no response object"
+        rt.cpu.mem.read_u32(info).unwrap() as i32,
+        -(g::WEB_ERROR_BASE as i32 + 9),
+        "no connection is the header's negative `WEB_ERROR_CONNECT`, not a protocol code"
     );
 
     // "options presented to IWEB_GetResponse() ... are IWEBOPTS_AddOpt()ed, in order, onto an
@@ -12985,7 +14237,7 @@ fn a_menu_control_paints_its_items_and_moves_its_selection() {
         "the control takes the cursor"
     );
     assert_eq!(call(&mut rt, get_sel, menu).unwrap(), 2);
-    // A key the control claimed repaints it: the shipped `MenuCtl_HandleEvent` ends on
+    // A key the control claimed repaints it: the reference `MenuCtl_HandleEvent` ends on
     // `HANDLER_Redraw`, which is why a pack that never calls
     // `IMenuCtl::Redraw` itself still follows the cursor. `chess_240x320_556` is such a pack — its
     // board is a control-hosted screen whose only repaints come from the keys.
@@ -13221,6 +14473,40 @@ fn the_class_scan_keeps_only_words_that_could_be_a_class() {
 }
 
 #[test]
+fn a_private_class_outside_the_narrow_families_is_offered_on_the_second_pass() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let words = [
+        0x0101_0ef6, // narrow: the first pass already offers this one
+        0x01a0_0001, // au's private family: only the wide pass reaches it
+        0x012f_ff1e, // `bx lr`, shaped like a class id and not one
+        0x01a0_0001, // the same id again
+    ];
+    let image = rt.cpu.mem.alloc(words.len() as u32 * 4, 4).unwrap();
+    for (i, w) in words.iter().enumerate() {
+        rt.cpu.mem.write_u32(image + i as u32 * 4, *w).unwrap();
+    }
+    rt.module = Some(Loaded {
+        base: image,
+        len: words.len() as u32 * 4,
+        out: 0,
+        writable: None,
+    });
+    let narrow = rt.candidate_classes().unwrap();
+    assert_eq!(
+        narrow,
+        [APPGEN_CLSID, 0x0101_0ef6],
+        "the first pass stays inside the published families"
+    );
+    let wide = rt.wide_candidate_classes(&narrow).unwrap();
+    assert_eq!(
+        wide,
+        [0x01a0_0001, 0x012f_ff1e],
+        "the private id comes before an instruction word, and no narrow id is repeated"
+    );
+}
+
+#[test]
 fn asking_which_class_the_module_owns_does_not_start_it() {
     let mut rt = Runtime::new();
     let f = fake_module(&mut rt);
@@ -13327,7 +14613,7 @@ fn a_class_the_module_only_fabricated_is_recorded_with_the_table_it_really_has()
     assert_eq!(
         hid.published,
         Some(("IHID", 8)),
-        "the SDK pairs the class with IHID"
+        "the platform pairs the class with IHID"
     );
     assert!(
         hid.too_short(),
@@ -13377,7 +14663,7 @@ fn a_class_the_module_only_fabricated_is_recorded_with_the_table_it_really_has()
 fn a_module_that_takes_only_ids_we_do_not_publish_leaves_the_accusation_unwritten() {
     // Two ids from the same run's list, both unknown to the tables — a module's own applet class
     // and one more it fabricated — with the same three-word object behind each. This is the shape a
-    // shipped pack really gives, and the shape the old single heading reported as two suspects.
+    // guest pack really gives, and the shape the old single heading reported as two suspects.
     let mut rt = Runtime::new();
     let (_, object, _) = generic_creator_module(&mut rt);
     let ppv = rt.cpu.mem.alloc_zeroed(4).unwrap();
@@ -13413,7 +14699,7 @@ fn a_module_that_takes_only_ids_we_do_not_publish_leaves_the_accusation_unwritte
 
 #[test]
 fn a_class_the_module_hands_back_is_refused_and_stays_off_the_record() {
-    // The three ways a module says no that shipped packs actually use. The immediate form moves
+    // The three ways a module says no that guest packs actually use. The immediate form moves
     // the answer into `r0` as a 12-bit constant, so both numbers have to stay small.
     let refusals = [
         (g::AEE_ECLASSNOTSUPPORT, false),
@@ -13915,7 +15201,7 @@ fn a_text_control_holds_thirty_two_characters_until_it_is_told_otherwise() {
     // claim, and this tree cannot settle it: `CTextCtl_GetText` is
     // `WSTRNCOPYN(pBuffer, nMaxChars, pszText, WSTRLEN(pszText))` and the
     // definition of `WSTRNCOPYN` is in no header on this box (the header here has no such name). What
-    // is witnessed is the ceiling — `CTextCtl_SetText` clamps `cch` to `m_nMaxChars`
+    // is recorded is the ceiling — `CTextCtl_SetText` clamps `cch` to `m_nMaxChars`
     //.
     let units = rt.cpu.mem.read_u16str(buf, 40).unwrap();
     assert_eq!(
@@ -14020,7 +15306,7 @@ fn a_use_count_is_refused_with_the_code_for_a_host_that_is_not_usage_licensed() 
     );
 }
 
-/// `ITAPI` on a host with no radio: the shipped parameter gates first, then the refusal. The
+/// `ITAPI` on a host with no radio: the reference parameter gates first, then the refusal. The
 /// `TAPIStatus` record the delivery writes is 20 bytes — the size the bridge checks — with the
 /// mobile ID at 0, the state byte at 16 and the flags inside the record, not in a word at 20.
 #[test]
@@ -14226,7 +15512,7 @@ fn a_version_report_is_about_this_host_and_not_the_platform() {
         .unwrap(),
         g::AEE_EUNSUPPORTED
     );
-    // And an info id this SDK does not define is a bad parameter.
+    // And an info id this platform does not define is a bad parameter.
     assert_eq!(
         call_many(&mut rt, get_info, shell, &[0x7fff, buf, 8, preq]).unwrap(),
         g::AEE_EBADPARM
@@ -14475,7 +15761,85 @@ fn a_registered_handler_is_read_back_with_the_bodys_own_codes() {
     );
 }
 
-/// `IBitmapScale` is a service this host does not publish: no class id for it exists in this SDK, so
+/// the display declarations: "A clone of the default display may be obtained with AEECLSID_DISPLAYCLONE." The
+/// class door has to build the same object `IDisplay::Clone` does — a second handle on the same
+/// device bitmap — because a pack that asks by class id never had a `this` to clone.
+#[test]
+fn the_display_clone_class_builds_the_clone_slot_behind_a_class_id() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let def = rt.display.default_display();
+    let clone = new_service(&mut rt, g::AEECLSID_DISPLAYCLONE);
+    assert_ne!(
+        clone, def,
+        "the class builds a second handle, not the default"
+    );
+    let dest = abi::method_of("IDisplay", "GetDestination").unwrap();
+    let a = call(&mut rt, dest, def).unwrap();
+    let b = call(&mut rt, dest, clone).unwrap();
+    assert_eq!(a, b, "both draw into the same device bitmap");
+}
+
+/// the display declarations names `AEECLSID_DISPLAY1`..`4` as further displays. One screen means one state, so each
+/// of them builds the second handle on the device bitmap that `DISPLAYCLONE` builds — which is what
+/// the reference EGL layer reads before it hands the DIB to QEGL, and the reason a 3D pack asks for it
+/// instead of for the default display.
+#[test]
+fn the_numbered_displays_answer_the_default_display_state() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let def = rt.display.default_display();
+    let one = new_service(&mut rt, g::AEECLSID_DISPLAY1);
+    assert_ne!(one, 0, "display 1 is served, not refused");
+    assert_ne!(one, def, "a second handle, not the default object");
+    let dest = abi::method_of("IDisplay", "GetDestination").unwrap();
+    assert_eq!(
+        call(&mut rt, dest, def).unwrap(),
+        call(&mut rt, dest, one).unwrap(),
+        "both draw into the same state"
+    );
+    let dev = abi::method_of("IDisplay", "GetDeviceBitmap").unwrap();
+    let bmp = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, dev, one, &[bmp]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_ne!(
+        rt.cpu.mem.read_u32(bmp).unwrap(),
+        0,
+        "the bitmap the EGL path hands to QEGL"
+    );
+    let two = new_service(&mut rt, g::AEECLSID_DISPLAY2);
+    assert_ne!(two, one, "each numbered class builds its own handle");
+}
+
+/// The Carrier media module's three faces are one body: `IMediaMA3.dll` registers `audio/mid`,
+/// `audio/mmf` and `audio/spf` against three class ids and implements them with the same 14-slot
+/// `IMedia` (`BREW_JP_ABI.md` §6.1). The SPF face is served for the same reason the MMF row is —
+/// the player behind it is this host's SMAF engine — and a lookup has to land on it, because the
+/// J2B runtime creates the class by id rather than through the registry.
+#[test]
+fn the_kddi_spf_face_is_served_and_filed_under_its_own_mime() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let spf = new_service(&mut rt, g::AEECLSID_MEDIAPHR);
+    assert_ne!(spf, 0, "the SPF face is a real media object, not a refusal");
+    assert_eq!(
+        rt.players.get(&spf).map(|p| p.media),
+        Some(g::AEECLSID_MEDIAPHR),
+        "and it is the same `Player` record the MIDI/MMF faces are"
+    );
+    let get = abi::method_of("IShell", "GetHandler").unwrap();
+    let name = put_cstr(&mut rt, crate::audio::MIME_SPF);
+    let shell = rt.shell;
+    assert_eq!(
+        call_many(&mut rt, get, shell, &[g::AEECLSID_MEDIA, name]).unwrap(),
+        g::AEECLSID_MEDIAPHR,
+        "`audio/spf` names the class the KDDI module files it under"
+    );
+}
+
+/// `IBitmapScale` is a service this host does not publish: no class id for it exists in this platform, so
 /// `CreateInstance` has nothing to hand out and `Scale` is reached by id. The answer is the named
 /// `EUNSUPPORTED` — a statement about a service that is absent rather than about a machine that
 /// cannot scale, since this host's own drawing primitives simply do not resample.
@@ -14528,7 +15892,7 @@ fn the_item_style_records_are_the_eight_bytes_the_shipped_slot_writes() {
     // `CShell_GetItemStyle` validates **both** pointers as 8-byte records (`AEE_CheckPtr(0, p, 8, 1)`),
     // clears eight bytes of each and then assigns one byte at `+0`, a word at `+2`, a word at `+4` and
     // a byte at `+6`. Our vendored header's `AEEItemStyle` is 12 bytes and has a fourth field at `+8` —
-    // writing that is reaching past a record the shipped runtime promises is eight.
+    // writing that is reaching past a record the reference runtime promises is eight.
     let mut rt = Runtime::new();
     fake_module(&mut rt);
     let shell = rt.shell;
@@ -14633,7 +15997,7 @@ fn a_menu_keeps_the_style_pair_and_the_colours_it_was_handed() {
     let at = |name: &str| abi::offset_of("AEEMenuColors", name).unwrap();
 
     // A control that has never been given colours answers the nine the constructor put there. They are
-    // indices — `CLR_SYS_ITEM` is 6, not a pixel — because the shipped member turns each into a colour
+    // indices — `CLR_SYS_ITEM` is 6, not a pixel — because the reference member turns each into a colour
     // at draw time by asking the display (`Menu_InitColors`: three `IDisplay::SetColor(CLR_USER_*,
     // value)` calls), and no slot of this interface ever resolves one.
     let words = rt.cpu.mem.alloc(40, 4).unwrap();
@@ -14745,7 +16109,7 @@ fn a_menu_keeps_the_style_pair_and_the_colours_it_was_handed() {
     let out_a = rt.cpu.mem.alloc(12, 4).unwrap();
     let out_b = rt.cpu.mem.alloc(12, 4).unwrap();
     // Asking only for the **selected** record must leave the other buffer alone. This is the gate the
-    // shipped body tests twice — `if (a2 != 0)` and `if (a3 != 0)` — and the one this host used to
+    // documented behaviour tests twice — `if (a2 != 0)` and `if (a3 != 0)` — and the one this host used to
     // apply to both pointers at once, turning a single-record ask into a call that wrote nothing.
     rt.cpu.mem.fill(out_a, 12, 0xa5).unwrap();
     rt.cpu.mem.fill(out_b, 12, 0x5c).unwrap();
@@ -14797,7 +16161,7 @@ fn a_menu_keeps_the_style_pair_and_the_colours_it_was_handed() {
         &[],
     )
     .unwrap();
-    // `IDIALOG_GetControl(p, dwID)` answers the control **by value**, the way the shipped body's
+    // `IDIALOG_GetControl(p, dwID)` answers the control **by value**, the way the documented behaviour's
     // `return … : NULL` line does (the header's own prototype has no out-parameter), so the handle is
     // the return and not a write into `out`.
     let in_dialog = call_many(
@@ -15010,7 +16374,7 @@ fn a_module_that_hands_a_class_back_is_taken_as_its_refusal() {
 
 #[test]
 fn a_module_that_publishes_a_pointer_and_then_refuses_leaves_null() {
-    // The shipped shell writes `*a2 = 0` again on the way out of every failure, **after** the module
+    // The reference shell writes `*a2 = 0` again on the way out of every failure, **after** the module
     // has had its turn at that address. The shape that needs the second write is a constructor that
     // stores an object and then answers an error: the caller was handed a refusal, so the only thing
     // standing between it and a call through a half-built vtable is the slot reading `NULL`.
@@ -15323,7 +16687,7 @@ fn fake_mp_module(rt: &mut Runtime, cls: u32) -> Fake {
     let module = f.module;
     let shell = rt.shell;
     let releases = f.releases;
-    // The SDK offsets the fixture wrote have to go, or the probe finds *that* shape first and the
+    // The platform offsets the fixture wrote have to go, or the probe finds *that* shape first and the
     // widened one never gets looked at.
     for at in [8u32, 12, 16, 20] {
         rt.cpu.mem.write_u32(f.applet + at, 0).unwrap();
@@ -15332,7 +16696,7 @@ fn fake_mp_module(rt: &mut Runtime, cls: u32) -> Fake {
     rt.cpu.mem.write_u32(f.applet + 16, 1).unwrap();
     rt.cpu.mem.write_u32(f.applet + 20, module).unwrap();
     rt.cpu.mem.write_u32(f.applet + 24, shell).unwrap();
-    // The fixture's `AddRef`/`Release` count at the SDK's offset, which on this shape is the
+    // The fixture's `AddRef`/`Release` count at the platform's offset, which on this shape is the
     // `Release` slot itself. Replacing them with the MP offsets is what makes `m_nRefs` at 16 a
     // fact the tests hold the object to rather than a word nothing reads.
     let addref = arm_code(
@@ -15366,7 +16730,7 @@ fn fake_mp_module(rt: &mut Runtime, cls: u32) -> Fake {
 }
 
 /// Replace the fixture's handler with one that answers `FALSE` to `EVT_APP_START` and `TRUE` to
-/// everything else — what both MP packs in the corpus do — and that counts its deliveries, leaves
+/// everything else — what both MP packs in the sample set do — and that counts its deliveries, leaves
 /// the last event it saw in `f.log` and that event's `dwParam` in `f.log + 4`. Answers the
 /// counter's address.
 fn refuse_classic_start(rt: &mut Runtime, f: &Fake) -> u32 {
@@ -15395,7 +16759,7 @@ fn refuse_classic_start(rt: &mut Runtime, f: &Fake) -> u32 {
 }
 
 /// A Brew MP window application is started with `EVT_APP_START_WINDOW`, not `EVT_APP_START`:
-/// both MP packs in the corpus refuse the classic event from a handler that asks this host for
+/// both MP packs in the sample set refuse the classic event from a handler that asks this host for
 /// nothing, and `contactapp` prints `EVT_APP_START_WINDOW` the moment it is given the other. So
 /// the applet's own `FALSE` is the question, and the windowed event is the follow-up.
 #[test]
@@ -15710,9 +17074,8 @@ fn draw_text_paints_the_glyphs_it_measures() {
         ink,
         "and the pixels are the proof"
     );
-    // What *is* refused is a designator inside those eight with nothing behind it: the shipped table
-    // entry is NULL and `IDisplay_DrawText` answers that with **20** — `AEE_EUNSUPPORTED` — without
-    // drawing.
+    // The italic designator is answered upright: this host has no slanted cut, and the same
+    // measured glyphs are drawn.
     assert_eq!(
         call_many(
             &mut rt,
@@ -15721,11 +17084,30 @@ fn draw_text_paints_the_glyphs_it_measures() {
             &[g::AEE_FONT_ITALIC, text, 2, 140, 110, 0, 0]
         )
         .unwrap(),
-        g::AEE_EUNSUPPORTED,
-        "no face for AEE_FONT_ITALIC on this host"
+        g::AEE_SUCCESS,
+        "italic is the upright face of the same size"
     );
     assert_eq!(
         device_pixel(&rt, 140, 110),
+        ink,
+        "and draws the same glyphs"
+    );
+    // What *is* refused is a user designator inside those eight with nothing behind it: the
+    // reference table entry is NULL and `IDisplay_DrawText` answers that with **20** —
+    // `AEE_EUNSUPPORTED` — without drawing.
+    assert_eq!(
+        call_many(
+            &mut rt,
+            draw,
+            disp,
+            &[g::AEE_FONT_USER_1, text, 2, 140, 130, 0, 0]
+        )
+        .unwrap(),
+        g::AEE_EUNSUPPORTED,
+        "no face for AEE_FONT_USER_1 on this host"
+    );
+    assert_eq!(
+        device_pixel(&rt, 140, 130),
         UNTOUCHED,
         "and the refusal draws nothing"
     );
@@ -15768,6 +17150,11 @@ fn draw_text_paints_the_glyphs_it_measures() {
     );
     assert_eq!(
         call_many(&mut rt, metrics, disp, &[g::AEE_FONT_ITALIC, asc, desc]).unwrap(),
+        8,
+        "italic is answered upright, so its metrics are the 5x8 cell's"
+    );
+    assert_eq!(
+        call_many(&mut rt, metrics, disp, &[g::AEE_FONT_USER_1, asc, desc]).unwrap(),
         g::AEE_EUNSUPPORTED,
         "inside the eight with no face behind it is the case that answers 20"
     );
@@ -15780,6 +17167,18 @@ fn draw_text_paints_the_glyphs_it_measures() {
             measure,
             disp,
             &[g::AEE_FONT_ITALIC, text, 2, 100, fits]
+        )
+        .unwrap(),
+        11,
+        "italic measures as the upright face of the same size"
+    );
+    rt.cpu.mem.write_u32(fits, 0xa5a5).unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            measure,
+            disp,
+            &[g::AEE_FONT_USER_1, text, 2, 100, fits]
         )
         .unwrap(),
         0,
@@ -15915,7 +17314,7 @@ fn a_release_waiting_on_its_press_dies_with_the_applet_it_was_waiting_for() {
     assert_eq!(
         codes(&rt.pending_release),
         vec![g::AVK_DOWN],
-        "witness that this test is about a held-back release"
+        "record that this test is about a held-back release"
     );
     rt.close_applet(false).expect("CloseApplet");
     assert!(
@@ -15952,7 +17351,11 @@ fn utf8towstr_writes_a_wide_character_into_exactly_its_own_room() {
         g::TRUE,
         "two bytes is room for one AECHAR"
     );
-    assert_eq!(rt.cpu.mem.read_u16(dst).unwrap(), 0x5f00, "the wide character");
+    assert_eq!(
+        rt.cpu.mem.read_u16(dst).unwrap(),
+        0xfffd,
+        "开 has no Shift-JIS code, so one cell still holds one unit: the replacement"
+    );
 
     // And a character that does not fit is still refused, rather than overrunning.
     assert_eq!(
@@ -15978,7 +17381,11 @@ fn utf8towstr_writes_a_wide_character_into_exactly_its_own_room() {
         g::TRUE,
         "the whole of what is there still converts"
     );
-    assert_eq!(rt.cpu.mem.read_u16(wide).unwrap(), 0x5f00, "the wide character");
+    assert_eq!(
+        rt.cpu.mem.read_u16(wide).unwrap(),
+        0xfffd,
+        "the same one unit, and the half a caller did not send stays unwritten"
+    );
     assert_eq!(
         rt.cpu.mem.read_u16(wide + 2).unwrap(),
         0x0007,
@@ -15996,8 +17403,10 @@ fn a_wide_string_compresses_into_the_bytes_the_caller_counted() {
     let mut rt = Runtime::new();
     let compress = abi::helper_id(abi::offset_of("AEEHelperFuncs", "wstrcompress").unwrap());
     let expand = abi::helper_id(abi::offset_of("AEEHelperFuncs", "strexpand").unwrap());
-    // "Zoo" plus one character above 127, which is the case the documentation leaves out.
-    let units = [0x5a, 0x6f, 0x6f, 0x4e_2d];
+    // "Zoo" plus one character above 127, which is the case the documentation leaves out. The
+    // fourth unit is the in-memory word for 中: its bytes are `92 86`, so the little-endian unit
+    // is 0x8692. An `AECHAR` carries the device's bytes in memory order.
+    let units = [0x5a, 0x6f, 0x6f, 0x86_92];
     let src = rt.cpu.mem.alloc(12, 2).unwrap();
     rt.cpu.mem.write_u16str(src, &units).unwrap();
     let dst = rt.cpu.mem.alloc(8, 1).unwrap();
@@ -16044,8 +17453,8 @@ fn a_wide_string_compresses_into_the_bytes_the_caller_counted() {
         .collect::<Vec<_>>();
     assert_eq!(
         back,
-        vec![0x30c6, 0x5a],
-        "テ and Z, the characters the bytes name"
+        vec![0x6583, 0x5a],
+        "テ and Z, as the words the handset stores"
     );
 
     let again = rt.cpu.mem.alloc(8, 1).unwrap();
@@ -16083,7 +17492,7 @@ fn the_font_an_applet_installs_is_the_one_the_display_draws_with() {
     let refs_off = rt.cpu.mem.read_u32(font + 4).unwrap();
     // The designator does not stand empty. `IDisplay_SetFont` documents its return as "if
     // successful, the old IFont associated with nFont" and keeps `NULL` for failure, so a host
-    // that answers 0 for a face it can draw with is reporting a failed install — and a shipped
+    // that answers 0 for a face it can draw with is reporting a failed install — and a reference
     // app that saves the old face out takes that as its cue to abandon its own start-up.
     let bound = call_many(&mut rt, set, disp, &[g::AEE_FONT_NORMAL, font]).unwrap();
     assert_ne!(bound, 0, "the swap hands back the face that stood there");
@@ -16174,6 +17583,15 @@ fn every_predefined_font_class_answers_getinfo_with_its_nearest_face() {
         g::AEECLSID_FONT_STANDARD18B,
         g::AEECLSID_FONT_STANDARD23,
         g::AEECLSID_FONT_STANDARD23B,
+        // The carrier's 12x12 (extra small) and 16x16 (small) cells take the normal face; the
+        // installed normal is 16 pixels, which is an exact match for the latter.
+        g::KDDI_FONT_FIXED12X12,
+        g::KDDI_FONT_FIXED12X12B,
+        g::KDDI_FONT_FIXED16X16,
+        g::KDDI_FONT_FIXED16X16B,
+        // Italic is answered upright at the same size and weight.
+        g::AEECLSID_FONTSYSITALIC,
+        g::AEECLSID_FONTSYSBOLDITALIC,
     ] {
         assert_eq!(asked(&mut rt, cls), small, "{cls:#010x} is the small face");
     }
@@ -16182,6 +17600,12 @@ fn every_predefined_font_class_answers_getinfo_with_its_nearest_face() {
         g::AEECLSID_FONT_STANDARD26,
         g::AEECLSID_FONT_STANDARD26B,
         g::AEECLSID_FONT_STANDARD36,
+        // Twenty-four and thirty-two are the large role; this host's large face is 32 pixels, so
+        // the 32x32 spellings are exact and the 24x24B spelling keeps the size and loses the weight.
+        g::KDDI_FONT_FIXED24X24B,
+        g::KDDI_FONT_FIXED32X32,
+        g::KDDI_FONT_FIXED32X32B,
+        g::AEECLSID_FONTSYSLARGEITALIC,
     ] {
         assert_eq!(asked(&mut rt, cls), large, "{cls:#010x} is the 2x face");
     }
@@ -16287,6 +17711,40 @@ fn a_va_list_is_the_word_array_its_pointer_points_at() {
     rt.cpu.mem.write_u32(stack, word).unwrap();
     assert_eq!(call_many(&mut rt, s, buf, &[64, fmt, 42, word]).unwrap(), 9);
     assert_eq!(rt.cstring(buf).unwrap(), "n=42 s=hi");
+}
+
+/// A `%s` argument is bytes in the pack's own encoding, not UTF-8. `sprintf` has to hand back the
+/// same bytes: a pack sizes its destination with `strlen` of that argument, so a lossy decode that
+/// expands invalid UTF-8 overruns it — a Shift-JIS premium title did exactly that, and the extra
+/// bytes landed in the next heap node's size word.
+#[test]
+fn sprintf_copies_a_non_utf8_string_byte_for_byte() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let fmt = put_cstr(&mut rt, "%s");
+    let raw: &[u8] = &[0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea, 0x82, 0xcc];
+    let src = rt.cpu.mem.alloc(raw.len() as u32 + 1, 4).unwrap();
+    rt.cpu.mem.write_bytes(src, raw).unwrap();
+    rt.cpu.mem.write_u8(src + raw.len() as u32, 0).unwrap();
+    let buf = rt.cpu.mem.alloc(64, 4).unwrap();
+    let s = abi::helper_id(abi::offset_of("AEEHelperFuncs", "sprintf").unwrap());
+    assert_eq!(
+        call_many(&mut rt, s, buf, &[fmt, src]).unwrap(),
+        raw.len() as u32
+    );
+    assert_eq!(rt.cpu.mem.read_bytes(buf, raw.len()).unwrap(), raw);
+    assert_eq!(rt.cpu.mem.read_u8(buf + raw.len() as u32).unwrap(), 0);
+
+    // Valid UTF-8 must come back byte for byte too: the raw path never decodes, so a multibyte
+    // character keeps its UTF-8 bytes instead of being narrowed to one Latin-1 byte.
+    let utf8 = "日本語".as_bytes();
+    rt.cpu.mem.write_bytes(src, utf8).unwrap();
+    rt.cpu.mem.write_u8(src + utf8.len() as u32, 0).unwrap();
+    assert_eq!(
+        call_many(&mut rt, s, buf, &[fmt, src]).unwrap(),
+        utf8.len() as u32
+    );
+    assert_eq!(rt.cpu.mem.read_bytes(buf, utf8.len()).unwrap(), utf8);
 }
 
 #[test]
@@ -16530,7 +17988,7 @@ fn the_file_manager_answers_its_second_round_of_questions_from_the_volume_itself
     // `GetFreeSpaceEx` — both numbers in parameters; the path decides only whether the question is
     // about something this volume has. ⚠ This slot has **no delivered body in this box** —
     // `who_defines.py CFileMgr_GetFreeSpaceEx` scans 235 members and finds 0 definitions and 0
-    // references — so the shape here is the header's and this host's; what *is* witnessable is that
+    // references — so the shape here is the header's and this host's; what *is* observable is that
     // the two numbers answer from the same source `GetFreeSpace` does, so the two slots must agree.
     let free_ex = abi::method_of("IFileMgr", "GetFreeSpaceEx").unwrap();
     let total = rt.cpu.mem.alloc(4, 4).unwrap();
@@ -16785,7 +18243,7 @@ fn a_description_comes_back_and_use_holds_a_file_from_being_removed() {
 /// error set, and what a null buffer means on each face — so it was a slot this host could answer,
 /// and it now does. It is `Obsolete` from here on, and that one is picked to stay: the header gives
 /// it a vtable slot () and **nothing else** — no `ISHELL_Obsolete` macro anywhere in the file,
-/// no section in its documentation half, no second mention in the SDK — so with no witness to read it
+/// no section in its documentation half, no second mention in the platform — so with no record to read it
 /// is the one `IShell` gap this host means to keep.
 #[test]
 fn a_slot_the_host_has_not_answered_is_named_and_not_guessed_at() {
@@ -16794,7 +18252,7 @@ fn a_slot_the_host_has_not_answered_is_named_and_not_guessed_at() {
     let shell = rt.shell;
     // `IShell::Obsolete` is not a door the runtime built. The published `IShell` vtable has no
     // body for it at all: slot 46 — where `Obsolete` sits in `spec/brew_abi.json` — answers
-    // `AEE_EUNSUPPORTED`, so the shipped answer to this slot is **20**, and a host that stops the
+    // `AEE_EUNSUPPORTED`, so the reference answer to this slot is **20**, and a host that stops the
     // run here is inventing a failure the runtime does not produce. (The other doors of that kind are `IRegistry`/`ICamera`/`IVocoder`: the
     // runtime ships them, this host has no class registered, so they stay 0.)
     let gap = abi::method_of("IShell", "Obsolete").unwrap();
@@ -16934,7 +18392,7 @@ fn the_file_system_view_agrees_with_the_file_manager_about_one_volume() {
 /// `IDisplay::CreateDIBitmapEx` — the same off-screen bitmap as `CreateDIBitmap`, with the palette
 /// size and the extra bytes named separately.
 ///
-/// ⚠ The half of this arm that *says* what it did not take has no automatic witness: the notes list
+/// ⚠ The half of this arm that *says* what it did not take has no automatic record: the notes list
 /// is private to `display.rs`, so a test outside it can read the bitmap back and not the sentence.
 /// That is the same gap the report's folding text has, and it is named here
 /// rather than papered over.
@@ -17960,7 +19418,7 @@ fn the_font_paints_into_the_bitmap_it_is_given_and_reads_the_flags() {
 /// registered behind the pack's back.
 ///
 /// What cannot be asserted is the forward itself: there is no object here to call, so the branch the
-/// shipped body takes on hardware is unreachable, and that is said rather than faked.
+/// documented behaviour takes on hardware is unreachable, and that is said rather than faked.
 #[test]
 fn the_display_notify_enable_answers_the_two_branches_the_delivered_body_has() {
     let mut rt = Runtime::new();
@@ -18382,7 +19840,7 @@ fn the_shell_arms_alarms_in_minutes_where_the_manager_counts_seconds() {
         "and the manager is still the one that refuses an unknown class"
     );
 
-    // The shipped body **replaces** a record with the same class and code: it walks the table,
+    // The documented behaviour **replaces** a record with the same class and code: it walks the table,
     // memmoves the tail over the match, and appends the new record. Different codes coexist —
     // that is the "more than one simultaneously active alarm" the header names.
     assert_eq!(
@@ -18440,7 +19898,7 @@ fn the_shell_arms_alarms_in_minutes_where_the_manager_counts_seconds() {
         g::AEE_EFAILED
     );
     // A class outside the caller's group is refused before the lookup: `AEE_AppIsInGroup(cls)` is
-    // false, and the shipped slot answers EPRIVLEVEL(21).
+    // false, and the reference slot answers EPRIVLEVEL(21).
     assert_eq!(
         call_many(&mut rt, cancel, shell, &[0xdead_beef, 9]).unwrap(),
         g::AEE_EPRIVLEVEL
@@ -18538,6 +19996,49 @@ fn the_shell_walks_the_one_applet_it_has_and_says_when_the_walk_ends() {
     );
 }
 
+/// A module that enumerates the applet table **from inside its own constructor** is looking for
+/// itself. Nothing has been adopted at that moment, so `app_cls` is 0 and the walk used to answer
+/// "the list is empty" — which is what made `mh_ez` give up without ever building its applet
+/// (`0x10000234` walks `EnumAppletInit`/`EnumNextApplet` and compares the record's `cls` against
+/// the class it was handed). The class the probe is constructing is the entry such a module looks
+/// for, and it is the same class `IShell::QueryClass` already describes.
+#[test]
+fn the_applet_walk_lists_the_class_being_constructed_before_anything_is_adopted() {
+    let mut rt = Runtime::new();
+    let f = fake_module(&mut rt);
+    let init = abi::method_of("IShell", "EnumAppletInit").unwrap();
+    let next = abi::method_of("IShell", "EnumNextApplet").unwrap();
+    let at = |field: &str| abi::offset_of("AEEAppInfo", field).unwrap();
+    let shell = rt.shell;
+    let info = rt.cpu.mem.alloc(20, 4).unwrap();
+
+    // With nothing running and nothing being constructed the walk stays empty: an idle machine has
+    // no installed applet to list, and inventing one would have every pack see a phantom.
+    assert_eq!(call_many(&mut rt, init, shell, &[]).unwrap(), 0);
+    assert_eq!(
+        call_many(&mut rt, next, shell, &[info]).unwrap(),
+        0,
+        "an idle machine lists no applet"
+    );
+
+    // Inside a constructor the class under construction is the one entry the walk must show.
+    rt.creating.push(f.cls);
+    assert_eq!(call_many(&mut rt, init, shell, &[]).unwrap(), 0);
+    assert_eq!(
+        call_many(&mut rt, next, shell, &[info]).unwrap(),
+        f.cls,
+        "the class being constructed is the entry a constructor looks for"
+    );
+    assert_eq!(rt.cpu.mem.read_u32(info + at("cls")).unwrap(), f.cls);
+    // …and the walk still ends after that one entry.
+    assert_eq!(
+        call_many(&mut rt, next, shell, &[info]).unwrap(),
+        0,
+        "one entry, then the walk ends"
+    );
+    rt.creating.pop();
+}
+
 /// `IShell::RegisterSystemCallback` and `IShell::GetPosition`.
 ///
 /// Both are slots whose point is what happens **later** — a system callback fires when the system has
@@ -18545,7 +20046,7 @@ fn the_shell_walks_the_one_applet_it_has_and_says_when_the_walk_ends() {
 /// judgement is that the first fires for the one event this host produces (`AEE_SCB_APP_CLOSED`, which
 /// `App_Stop` issues), does **not** fire for `AEE_SCB_AEE_EXIT` or for the conditions a handset has,
 /// that every registration is cancelled as the applet goes, and that the second asks the service it
-/// makes and passes that service's refusal out — the shipped door calls nobody back when there is no
+/// makes and passes that service's refusal out — the reference door calls nobody back when there is no
 /// fix to deliver.
 #[test]
 fn the_shell_fires_the_system_callback_it_can_and_refuses_to_invent_a_position() {
@@ -18679,7 +20180,7 @@ fn the_shell_fires_the_system_callback_it_can_and_refuses_to_invent_a_position()
 
     // The gate first, while the shell still holds none of its own static storage. Both halves of the
     // callback are required, and a missing one is a *refused request*: `AEE_EFAILED`, nobody called back,
-    // and the service never asked. The storage is what witnesses that last part — the shipped body's
+    // and the service never asked. The storage is what records that last part — the documented behaviour's
     // `AEEGPSInfo` and `AEECallback` sit in `.bss` and are only touched once the request is accepted, so
     // a door that refused on the gate leaves both addresses zero. Counting notes would not show it:
     // `Display::note` keeps one copy of a string, and the service's refusal is the same string each time.
@@ -18827,7 +20328,7 @@ fn the_shell_answers_group_membership_from_the_applet_it_runs() {
 }
 
 /// `IShell::Obsolete` is answered with the code the platform's own slot returns, and the point of the
-/// assertion is that the call *returns* at all: an unanswered slot ends the run, while the shipped
+/// assertion is that the call *returns* at all: an unanswered slot ends the run, while the reference
 /// body is one instruction.
 #[test]
 fn the_obsolete_door_answers_with_the_code_the_shipped_slot_returns() {
@@ -19106,7 +20607,7 @@ fn only_the_device_bitmap_answers_for_the_device_bitmap_face() {
         "and the slot is nulled"
     );
 
-    // The three slots. `Update` reaches the shipped body's last line — `SUCCESS` having copied nothing —
+    // The three slots. `Update` reaches the documented behaviour's last line — `SUCCESS` having copied nothing —
     // because this host's device bitmap has neither a display device nor a parent; `IsEnabled` is `TRUE`
     // for a display that is always enabled; `NotifyEnable` is `IDisplay_NotifyEnable` (one body, because
     // `IDisplay`'s vtable starts with this one's) and stores nothing — see the two numbers below.
@@ -19430,7 +20931,7 @@ fn a_registered_event_name_keeps_its_code_and_counts_its_attempts() {
     );
 }
 
-/// `IShell::SetProperty`/`GetProperty` are one store with two faces, and the shipped chain —
+/// `IShell::SetProperty`/`GetProperty` are one store with two faces, and the reference chain —
 /// `CShell_GetProperty` → `Mod_GetProperty` → `MIFProp_Set` — fixes what each half does: the size
 /// cell is a **`uint16`** and is cleared before anything is looked up; the length reported is the
 /// **padded** size of the stored node (`4 * ((size + 3) >> 2)`), so three bytes answer four; the fill
@@ -19474,7 +20975,7 @@ fn a_property_round_trips_at_the_width_and_codes_the_shipped_slot_uses() {
         "the low half carries the size and the high half is still the caller's own ones"
     );
 
-    // Three bytes of room against a four-byte node: the shipped chain moves nothing and answers 2.
+    // Three bytes of room against a four-byte node: the reference chain moves nothing and answers 2.
     rt.cpu.mem.write_u16(size, 3).unwrap();
     rt.cpu.mem.write_bytes(small, b"----").unwrap();
     assert_eq!(
@@ -19503,7 +21004,7 @@ fn a_property_round_trips_at_the_width_and_codes_the_shipped_slot_uses() {
     assert_eq!(rt.cpu.mem.read_bytes(small, 4).unwrap(), b"abcd");
 
     // A property the store does not hold is a refusal, not a success with an empty answer: the
-    // shipped chain reads a length of zero and `CShell_GetProperty` turns that into 1, leaving the
+    // reference chain reads a length of zero and `CShell_GetProperty` turns that into 1, leaving the
     // size word cleared — which is exactly why a caller can read a zero size as "there is nothing".
     rt.cpu.mem.write_u32(size, 0xffff_ffff).unwrap();
     assert_eq!(
@@ -19795,7 +21296,7 @@ fn a_dialog_this_host_cannot_drive_gets_the_headers_own_nothing() {
 /// this host is not and cannot do. The refusal is named — `EUNSUPPORTED`, the same answer this
 /// repository gives for other things a handset has and a host does not — rather than answered SUCCESS,
 /// which would report a restart that never happened. The note records *which* reset was asked for, and
-/// a type this SDK does not define is the header's own `EBADPARM` ().
+/// a type this platform does not define is the header's own `EBADPARM` ().
 #[test]
 fn a_reset_is_refused_by_name_rather_than_reported_as_a_restart() {
     let mut rt = Runtime::new();
@@ -19825,7 +21326,7 @@ fn a_reset_is_refused_by_name_rather_than_reported_as_a_restart() {
     assert_eq!(
         call_many(&mut rt, reset, shell, &[0x7fff]).unwrap(),
         g::AEE_EBADPARM,
-        "a reset type this SDK does not define is the header's own EBADPARM"
+        "a reset type this platform does not define is the header's own EBADPARM"
     );
 }
 
@@ -20057,7 +21558,7 @@ fn grey_png(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// The file the pack under measurement holds its pictures in, reached the only corpus-free way
+/// The file the pack under measurement holds its pictures in, reached the only sample-free way
 /// this host's resource lookup can be pointed at: bytes the run itself wrote.
 fn put_picture(rt: &mut Runtime, name: &str, bytes: &[u8]) -> u32 {
     let mut f = rt.volume.open(name, g::_OFM_CREATE).unwrap();
@@ -20252,7 +21753,7 @@ fn a_refused_class_is_recorded_as_a_refused_class_and_not_as_a_missing_resource(
     // Present resource, refused class. A pointer has no room for an error code, and inventing one
     // is worse than a null — the caller that does not read the return jumps through a vtable read
     // out of address three — so the answer stays null and the *record* says which of the two it
-    // was, naming the class in the words the SDK uses.
+    // was, naming the class in the words the platform uses.
     for (cls, word) in [
         (g::HTYPE_BROWSE, "HTYPE_BROWSE"),
         (g::AEECLSID_BATTERY, "AEECLSID_BATTERY"),
@@ -20407,7 +21908,7 @@ fn detect_type_answers_only_with_a_format_the_host_then_decodes() {
         // The in/out half of `pdwSize`: the header promises the out half **only on ENEEDMORE**
         // ("*pdwSize contains the required number of additional bytes") and its own sample never
         // reads the word again, so a success leaves the caller's length standing — which is what
-        // the one caller in the shipped pk source that re-reads it depends on.
+        // the one caller in the reference pk source that re-reads it depends on.
         assert_eq!(
             rt.cpu.mem.read_u32(psize).unwrap(),
             picture.len() as u32,
@@ -20449,6 +21950,18 @@ fn detect_type_answers_only_with_a_format_the_host_then_decodes() {
         audio::clip_length_ms(&score).is_some(),
         "and the bytes behind the name have a length the runtime can arm a callback from"
     );
+    // The same score through the window the documented media probe offers: the caller asks how
+    // many bytes detection needs and hands exactly that many, so the buffer stops inside the
+    // track. The name has to survive that; a parse of the whole file cannot.
+    let window = &score[..score.len().min(crate::runtime::TYPE_DETECT_WINDOW as usize)];
+    let (buf, psize) = put_payload(&mut rt, window);
+    let pmime = put_word(&mut rt, SENTINEL);
+    assert_eq!(
+        detect(&mut rt, buf, psize, 0, pmime).unwrap(),
+        g::AEE_SUCCESS,
+        "a score cut at the detection window is still named"
+    );
+    assert_eq!(mime_at(&rt, pmime), audio::MIME_MIDI);
 
     // The header: the buffer takes precedence over the name, and is followed by the name only
     // when the bytes said nothing. A name pointing at a format with no decoder must not drag a
@@ -20552,7 +22065,7 @@ fn a_name_without_bytes_is_answered_by_a_suffix_the_decoder_would_take() {
         ("theme.mid", Some(audio::MIME_MIDI), score.as_slice()),
         ("THEME.MID", Some(audio::MIME_MIDI), score.as_slice()),
         // The header's table spells the MIDI extension `mid`, so this is a real file name the host
-        // has no *witness* for — and a suffix rule that guessed past the spelled list would be a
+        // has no *record* for — and a suffix rule that guessed past the spelled list would be a
         // second, divergent list of what this host serves.
         ("song.midi", None, nothing),
         // `.jpg` is the short spelling of a format this host now decodes, so it answers — and the answer
@@ -20702,11 +22215,11 @@ fn a_probe_that_names_no_out_pointer_and_no_input_is_answered_not_faced() {
 /// hands back a display *it implemented itself* — an off-screen surface whose own `BitBlt` slot is
 /// the only thing that clears the status word the pack then reads to decide whether its picture
 /// loaded — so a blit that always lands on this host's screen silently fails the caller's question.
-/// The downcall also has to reach the slot through the layout the shipped object actually uses: a
+/// The downcall also has to reach the slot through the layout the reference object actually uses: a
 /// vptr that names the inline slot list following it in the same block.
 #[test]
 fn an_image_answers_start_stop_and_notify_instead_of_ending_the_run() {
-    // All three are `void` in the header, and the shipped bodies store what the caller named
+    // All three are `void` in the header, and the platform's own routines store what the caller named
     // (`AEEImage_Start` writes the corner, `AEEImage_Notify` the pair, `Stop` cancels). This host
     // runs no animation timer and has the picture before `SetStream` returns, so the state is kept
     // and nothing fires — but the call used to end the whole run on an unimplemented door.
@@ -20967,7 +22480,7 @@ fn the_dns_configuration_keeps_one_network_and_three_servers() {
     assert_eq!(rt.cpu.mem.read_u16(count).unwrap(), 0);
 }
 
-/// A guest `ModelListener`/`AEECallback` node: the six words the shipped bodies touch, with the
+/// A guest `ModelListener`/`AEECallback` node: the six words the platform's own routines touch, with the
 /// callback pair filled in and the two cancel fields left as the caller would find them.
 fn put_listener(rt: &mut Runtime, pfn: u32, user: u32, cancel: u32) -> u32 {
     let node = rt.cpu.mem.alloc_zeroed(0x18).unwrap();
@@ -20995,7 +22508,7 @@ fn counting_site(rt: &mut Runtime, counter: u32) -> u32 {
 
 /// The header is a state machine around the platform's own network object. The constructor is
 /// self-contained, so the class is creatable here; every state change is an `AEENet_*` call, which
-/// this box has no witness for. What a caller can still see is exactly what the shipped bodies answer
+/// this box has no record for. What a caller can still see is exactly what the platform's own routines answer
 /// without a network: the parameter refusals, `AEE_EBADSTATE` for the unreachable states,
 /// `AEE_QOS_STATUS_NOT_AVAILABLE` from `GetStatus`, and the two `AEE_EUNSUPPORTED` slots that answer
 /// without looking at anything.
@@ -21047,7 +22560,7 @@ fn a_qos_session_answers_the_gates_of_a_machine_with_no_network() {
     assert_eq!(
         call(&mut rt, "IQoSSession", "Open", &[0x4000_0010]),
         g::AEE_EFAILED,
-        "the shipped body reaches `SelectNetwork(0)` first, and that is where it stops here"
+        "the documented behaviour reaches `SelectNetwork(0)` first, and that is where it stops here"
     );
     assert_eq!(
         call(&mut rt, "IQoSSession", "Modify", &[0]),
@@ -21088,7 +22601,7 @@ fn a_qos_session_answers_the_gates_of_a_machine_with_no_network() {
         g::AEE_EUNSUPPORTED
     );
 
-    // `AddRetryCB` is bookkeeping, and the shipped `CALLBACK_Cancel` it calls first *invokes* a
+    // `AddRetryCB` is bookkeeping, and the reference `CALLBACK_Cancel` it calls first *invokes* a
     // registered callback rather than clearing it.
     let counter = rt.cpu.mem.alloc_zeroed(4).unwrap();
     let pcb = put_listener(&mut rt, 0, 0, 0);
@@ -21118,7 +22631,7 @@ fn a_qos_session_answers_the_gates_of_a_machine_with_no_network() {
     );
 
     // `Close` from a state this host cannot reach on its own, because reaching it is an `AEENet` call.
-    // The shipped body drops the release failure on the floor: whatever `AEENet_ReleaseQoS` answers,
+    // The documented behaviour drops the release failure on the floor: whatever `AEENet_ReleaseQoS` answers,
     // the session returns to the null state and the slot answers SUCCESS.
     rt.qos_sessions.entry(session).or_default().state = 3;
     assert_eq!(
@@ -21256,7 +22769,7 @@ fn the_qos_listener_list_is_the_shipped_one_including_its_quirk() {
     );
 
     // A node that arrives carrying a `pfnCancel` is unregistered from wherever it was by calling it —
-    // the shipped body's first move, and the one part of the list the host cannot stand in for by
+    // the documented behaviour's first move, and the one part of the list the host cannot stand in for by
     // itself (it has no C entry a guest could `blx`).
     let cancelled = rt.cpu.mem.alloc_zeroed(4).unwrap();
     let cancel_pfn = counting_site(&mut rt, cancelled);
@@ -21269,7 +22782,7 @@ fn the_qos_listener_list_is_the_shipped_one_including_its_quirk() {
     );
 }
 
-/// `IQoSList` is the one QoS object every slot of which this host can answer: the shipped body is a
+/// `IQoSList` is the one QoS object every slot of which this host can answer: the documented behaviour is a
 /// chain of eight-byte nodes plus a count and nothing in it asks for a network. Two
 /// shapes are the point rather than incidental. `AddAt` **clamps** an index at or past the end, which
 /// is how `Add` reaches the end of the list at all — while `GetAt` and `RemoveAt` refuse the same
@@ -21315,7 +22828,7 @@ fn the_qos_list_holds_gives_back_and_refuses_what_its_body_does() {
     assert_eq!(
         call(&mut rt, "GetAt", &[5, out]),
         g::AEE_EBADPARM,
-        "the range refusal the shipped body returns before it walks the chain"
+        "the range refusal the documented behaviour returns before it walks the chain"
     );
     assert_eq!(
         rt.cpu.mem.read_u32(out).unwrap(),
@@ -21327,7 +22840,7 @@ fn the_qos_list_holds_gives_back_and_refuses_what_its_body_does() {
     assert_eq!(
         call(&mut rt, "GetAt", &[0, 0]),
         g::AEE_EMEMPTR,
-        "the pointer is checked first, as in the shipped body"
+        "the pointer is checked first, as in the documented behaviour"
     );
 
     // `Find` answers the index of the element, or -1 for anything the chain does not hold.
@@ -21344,7 +22857,7 @@ fn the_qos_list_holds_gives_back_and_refuses_what_its_body_does() {
     assert_eq!(call(&mut rt, "Remove", &[second]), g::AEE_EBADPARM);
     assert_eq!(call(&mut rt, "RemoveAt", &[0]), g::AEE_EBADPARM);
 
-    // `Add` a third time, then `Clear`: the shipped `Release` calls `Clear` at zero references, so
+    // `Add` a third time, then `Clear`: the reference `Release` calls `Clear` at zero references, so
     // giving up the list is what releases what it holds.
     let third = service(&mut rt, g::AEECLSID_QOSLIST);
     assert_eq!(call(&mut rt, "Add", &[third]), g::AEE_SUCCESS);
@@ -21371,13 +22884,13 @@ fn the_qos_list_holds_gives_back_and_refuses_what_its_body_does() {
     assert_eq!(
         call_many(&mut rt, qi, list, &[g::AEECLSID_QOSLIST, 0]).unwrap(),
         g::AEE_EMEMPTR,
-        "the shipped body validates the pointer before it compares anything"
+        "the documented behaviour validates the pointer before it compares anything"
     );
 
     // The whole of it answers `AEE_EUNSUPPORTED`.
     assert_eq!(call(&mut rt, "ExtFunc", &[0, 0]), g::AEE_EUNSUPPORTED);
 
-    // Releasing the list is what gives up the chain, and the shipped `Release` calls its own `Clear`
+    // Releasing the list is what gives up the chain, and the reference `Release` calls its own `Clear`
     // at zero references. The accounting is on purpose: the caller holds one reference (what
     // `CreateInstance` gave it) and `QueryInterface` above handed out a second.
     let release = abi::method_of("IQoSList", "Release").unwrap();
@@ -21396,7 +22909,7 @@ fn the_qos_list_holds_gives_back_and_refuses_what_its_body_does() {
 /// one-line forward, exactly like the two SMS records. What makes them different objects is the
 /// whitelist sitting in front of `AddOpt`, which the SMS bodies do not have: a null array is
 /// `AEE_EMEMPTR`, an id the class does not name, or one the list already holds, refuses the **whole
-/// call** with `AEE_EBADITEM`, because the shipped walk checks every element before it ever reaches
+/// call** with `AEE_EBADITEM`, because the reference walk checks every element before it ever reaches
 /// `WebOptMgr_AddOptV`. The filter adds one rule of its own — `IP_VERSION` is only accepted carrying 4.
 #[test]
 fn the_qos_option_records_refuse_the_options_their_bodies_refuse() {
@@ -21473,7 +22986,7 @@ fn the_qos_option_records_refuse_the_options_their_bodies_refuse() {
         "and a refused call adds nothing, whichever element it stopped at"
     );
 
-    // An id the list already holds is refused the same way: the shipped walk asks the manager for the
+    // An id the list already holds is refused the same way: the reference walk asks the manager for the
     // id before it hands the array over, so a second `IP_TRAFFIC_CLASS` does not stack up.
     assert_eq!(
         add(&mut rt, flow, "IQoSFlow", &[(g::WEBOPT_32BIT, 6)]),
@@ -21586,12 +23099,12 @@ fn the_qos_option_records_refuse_the_options_their_bodies_refuse() {
 
 /// The database manager, and the two objects behind it.
 ///
-/// `AEEDBMgr_New` touches no OEM state, but `OpenDatabase` is where the shipped
+/// `AEEDBMgr_New` touches no OEM state, but `OpenDatabase` is where the reference
 /// body reaches `OEM_DBOpenEx`/`OEM_DBCreate` () — and that layer lived in the handset's
 /// firmware. This host stands one up in the app's own volume ([`crate::db`]), because a NULL from
 /// this call is not a missing feature to the packs that use it: `chess_240x320_556` reads one as
 /// "not enough memory", and refuses to open its board.
-/// `IDBMgr` still has no `QueryInterface` slot — the shipped vtable is five entries, the header.
+/// `IDBMgr` still has no `QueryInterface` slot — the reference vtable is five entries, the header.
 #[test]
 fn the_database_manager_opens_creates_and_removes_a_database_file() {
     let mut rt = Runtime::new();
@@ -21608,7 +23121,7 @@ fn the_database_manager_opens_creates_and_removes_a_database_file() {
     );
     let db = call_many(&mut rt, open, mgr, &[name, 1, 0x1000, 0x10]).unwrap();
     assert_ne!(db, 0, "create: a database file and an object over it");
-    // The shipped `oemdb_header`: zero live records, no id assigned, and the
+    // The reference `oemdb_header`: zero live records, no id assigned, and the
     // index starting at offset 8. Writing the real layout is what makes this file readable by a
     // handset, and it is what the pack's next run finds in its own volume.
     let file = rt.volume.open("highscores.db", g::_OFM_READ).unwrap();
@@ -21622,7 +23135,7 @@ fn the_database_manager_opens_creates_and_removes_a_database_file() {
     assert_eq!(&bytes[8..12], &[0; 4], "an empty index header");
     assert_eq!(bytes.len(), 12, "and no records under it");
 
-    // A second open is a second object over the same store — the shipped body calls the OEM open
+    // A second open is a second object over the same store — the documented behaviour calls the OEM open
     // again rather than answering the handle it already had.
     let again = call_many(&mut rt, open, mgr, &[name, 0, 0, 0]).unwrap();
     assert_ne!(
@@ -21670,7 +23183,7 @@ fn the_database_manager_opens_creates_and_removes_a_database_file() {
 
 /// `bCreate` means "make a missing file", not "replace one that is there". `AEEDBMgr_OpenDatabase`
 /// only reaches `OEM_DBCreate` on `AEE_DB_ERR_NOT_EXIST`; a file whose header
-/// cannot be read answers `BAD_STATE`, and the shipped body deletes it *and still returns NULL*
+/// cannot be read answers `BAD_STATE`, and the documented behaviour deletes it *and still returns NULL*
 /// because `OEM_DBDelete` writes `NO_ERR` into the same error word. The next
 /// open is the one that finds the file gone and creates it. This matters more here than on a
 /// handset: the host's container is its own format, so an undecodable file may be a preloaded
@@ -21862,7 +23375,7 @@ fn a_record_created_through_the_interface_walks_and_updates_like_a_handset_one()
     assert_eq!(
         call_many(&mut rt, next, rec, &[pname, plen]).unwrap(),
         2,
-        "the shipped body parks the cursor at zero, so the next walk starts over"
+        "the documented behaviour parks the cursor at zero, so the next walk starts over"
     );
 
     // The body's error order: a missing out-parameter, a null field list, a non-positive count.
@@ -22145,7 +23658,7 @@ fn a_registered_handler_is_the_class_get_handler_answers() {
 ///
 /// A handset's registry is not empty at start-up, and a media browser reads it before it lists a
 /// file: `ISHELL_GetHandler(AEECLSID_MEDIA, mime)` answering 0 is the phone saying nothing on it
-/// opens that format, which is how a shipped applet ends up hiding a
+/// opens that format, which is how a reference applet ends up hiding a
 /// song it could have played. So the seed is the difference between "the host has no opinions" and
 /// "the host has the one opinion it can stand behind" — and the row count is the claim under test.
 ///
@@ -22215,7 +23728,7 @@ fn the_host_ships_only_the_handlers_it_can_stand_behind() {
         "raw AAC/ADTS has the same decoder-backed row"
     );
 
-    // The way the shipped applet actually builds its question: the header documents the
+    // The way the reference applet actually builds its question: the header documents the
     // chain, but the delivered player does not use a declared MIME or a sniff — it
     // pastes `AUDIO_MIME_BASE` in front of the **file extension**
     // (`MIDI_EXTENSION`,) and looks *that* up. Pinned here from the two header
@@ -22237,10 +23750,10 @@ fn the_host_ships_only_the_handlers_it_can_stand_behind() {
     // `audio/midi` is the interesting one of these: it is **not** a spelling any local header
     // has (the published table gives `mid`, `snd/midi` and `audio/mid`; nothing in the tables or in
     // the overlay spells `audio/midi`),
-    // yet one real container record in the system corpus declares it — so the ask is not
+    // yet one real container record in the sample set declares it — so the ask is not
     // hypothetical. It stays 0 anyway, for the reason the repo has a rule about: a row has to
     // come from a document, not from one file. The ask that reaches us is the extension-shaped
-    // one above, and no `.midi` file exists in the classic corpus at all (9 audio files, all
+    // one above, and no `.midi` file exists in the classic sample set at all (9 audio files, all
     // `.mid`, all parseable as SMF).
     for mime in ["audio/wav", "audio/midi", "video/pmd"] {
         assert_eq!(
@@ -22281,15 +23794,22 @@ fn the_host_ships_only_the_handlers_it_can_stand_behind() {
     // and no step in either body trims it, so a question with spaces is a different string.
     let padded = ask(&mut rt, g::HTYPE_VIEWER, "  image/png  ");
     assert_eq!(padded, 0, "neither door trims the name it is handed");
-    // `image/bmp` is the interesting zero, and the reason is *which door* a handler answer feeds:
-    // `resource::DECODABLE` decodes a BMP and `resource::sniff` names it, so a table edit could claim
-    // support — but a caller takes the answer to `IShell::CreateInstance`, and this host builds no
-    // object there for `AEECLSID_WINBMP`/`AEECLSID_NATIVEBMP` (no `HOST_SERVICES` row; both are system
-    // classes the shell refuses). `IShell::LoadResObject` does accept those ids and build an `IImage`
-    // under them, which is why this says "cannot be created" and not "no BMP support": the caller would
-    // get a class id and take `ECLASSNOTSUPPORT` where it expected a picture — worse than the honest 0.
-    // Same reasoning keeps GIF and JPEG out.
-    for mime in ["image/bmp", "image/gif", "image/jpeg"] {
+    // `image/bmp` is the row that closed a real loop: `resource::DECODABLE` decodes a BMP and
+    // `resource::sniff` names it, and `HOST_SERVICES` now creates `AEECLSID_WINBMP` as the same
+    // `IImage`, so the answer survives the trip to `IShell::CreateInstance` — the door a handler
+    // lookup feeds. A carrier premium check resolves this row from a 286-byte BMP and creates the
+    // answer; before the row it took the honest zero into `CreateInstance(0)` and read the refusal
+    // as a failed authorisation.
+    let bmp_cls = ask(&mut rt, g::HTYPE_VIEWER, crate::resource::MIME_BMP);
+    assert_eq!(bmp_cls, g::AEECLSID_WINBMP);
+    assert_ne!(
+        new_service(&mut rt, bmp_cls),
+        0,
+        "and the class the row names is one the shell builds an object for"
+    );
+    // GIF and JPEG stay out for the same reason BMP was out before the row: no `HOST_SERVICES`
+    // entry exists for either, so naming one would hand the caller a refusal one step later.
+    for mime in ["image/gif", "image/jpeg"] {
         assert_eq!(
             ask(&mut rt, g::HTYPE_VIEWER, mime),
             0,
@@ -22462,10 +23982,10 @@ fn a_viewer_with_no_stream_answers_get_info_instead_of_ignoring_it() {
 }
 
 /// `AEECLSID_BCI` is 3.1.2's broadcast-channel viewer: the reference class table registers it with
-/// `BCIViewer_New` and the shipped vtable is `IImage`'s eleven slots, name for
+/// `BCIViewer_New` and the reference vtable is `IImage`'s eleven slots, name for
 /// name — there is no `IBCI` interface to answer with. So the host hands out the one `IImage` it has,
 /// and what is worth pinning is what that object must not claim: with no channel behind it there is no
-/// picture to measure, and its `HandleEvent` consumes the event the way the shipped four-byte body does.
+/// picture to measure, and its `HandleEvent` consumes the event the way the reference four-byte body does.
 #[test]
 fn the_broadcast_channel_viewer_is_an_image_that_measures_nothing_yet() {
     let mut rt = Runtime::new();
@@ -22493,7 +24013,7 @@ fn the_broadcast_channel_viewer_is_an_image_that_measures_nothing_yet() {
     assert_eq!(
         call(&mut rt, "HandleEvent", &[0]),
         0,
-        "FALSE: the shipped body never claims it"
+        "FALSE: the documented behaviour never claims it"
     );
 
     // `Start(x, y)`/`Stop()` keep the corner the caller named and answer nothing.
@@ -22557,7 +24077,7 @@ fn start_thread(rt: &mut Runtime, th: u32, stack: u32, body: u32, ctx: u32) -> R
 #[test]
 fn the_thread_function_is_entered_the_way_its_typedef_declares_it() {
     // `PFNTHREAD` is `int (*)(IThread *piThread, void *pvCxt)` — the thread first, its context
-    // second. A shipped title whose thread body reads `r1` for its own applet is the reason
+    // second. A reference title whose thread body reads `r1` for its own applet is the reason
     // this is worth pinning as words rather than left to the typedef: a host that passed the pair
     // in the other order would hand that pack a garbage pointer and take the blame for it.
     let mut rt = Runtime::new();
@@ -22577,14 +24097,16 @@ fn the_thread_function_is_entered_the_way_its_typedef_declares_it() {
         start_thread(&mut rt, th, 4096, body, marks).unwrap(),
         g::AEE_SUCCESS
     );
+    // `Start` only queues the thread's resume callback — the delivered body calls `IShell::Resume`
+    // on its own record — so the body is entered on the dispatcher's next turn, not inside `Start`.
+    rt.pump(0).unwrap();
     assert_eq!(rt.cpu.mem.read_u32(marks).unwrap(), th, "r0 is the thread");
     assert_eq!(
         rt.cpu.mem.read_u32(marks + 4).unwrap(),
         marks,
         "r1 is pvCxt"
     );
-    // It also ran *before* `Start` answered, which is the cooperative half of the contract: the
-    // starter does not get the machine back until the thread blocks or ends.
+    // And the turn was the dispatcher's: the callback `Start` handed it is what entered `pfStart`.
     assert_eq!(rt.threads.len(), 1);
     assert_eq!(rt.threads[0].state, ThreadState::Ended(7));
 }
@@ -22643,6 +24165,7 @@ fn a_threads_static_pointers_are_its_own_and_not_the_ones_that_started_it() {
     );
     let th = service(&mut rt, g::AEECLSID_THREAD);
     start_thread(&mut rt, th, 4096, body, block).unwrap();
+    rt.pump(0).unwrap();
     assert_eq!(
         rt.cpu.mem.read_u32(block).unwrap(),
         0,
@@ -22720,6 +24243,7 @@ fn a_wake_up_asked_through_ishell_resume_runs_when_the_shell_gets_control_back()
     );
     let th = service(&mut rt, g::AEECLSID_THREAD);
     start_thread(&mut rt, th, 4096, body, block).unwrap();
+    rt.pump(0).unwrap();
     assert_eq!(
         rt.cpu.mem.read_u32(block).unwrap(),
         0,
@@ -22790,6 +24314,7 @@ fn a_suspended_thread_gives_the_machine_back_and_its_resume_callback_takes_it_ag
     let marks = rt.cpu.mem.alloc(4, 4).unwrap();
     let th = service(&mut rt, g::AEECLSID_THREAD);
     start_thread(&mut rt, th, 4096, body, marks).unwrap();
+    rt.pump(0).unwrap();
     assert_eq!(
         rt.hle.block_size(rt.threads[0].stack).unwrap(),
         (4096 + 0x803) & !3,
@@ -22862,6 +24387,68 @@ fn a_suspended_thread_gives_the_machine_back_and_its_resume_callback_takes_it_ag
     assert_eq!(rt.threads[0].state, ThreadState::Ended(9));
 }
 
+/// The platform's blocking helpers (`AEETU_Sleep.c`, `AEETU_Yield.c`) arm a thread's resume record
+/// through `IShell::SetTimerEx`: `GetResumeCBK`, then the timer, then `Suspend`. The host's record
+/// carries a zero `pfnNotify` and is recognised by address, so the timer slot has to accept it —
+/// otherwise every `IThread_Sleep` answers `EBADPARM` and the thread never wakes.
+#[test]
+fn a_thread_sleeps_through_set_timer_ex_and_the_safe_point_wakes_it() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let site = trap_site(&mut rt, abi::method_of("IThread", "Suspend").unwrap());
+    let block = rt.cpu.mem.alloc(12, 4).unwrap();
+    rt.cpu.mem.write_u32(block + 4, site).unwrap();
+    rt.cpu.mem.write_u32(block + 8, layout::HALT).unwrap();
+    let body = arm_code(
+        &mut rt,
+        &[
+            0xe1a0_4001, // mov r4, r1          the block
+            0xe1a0_5000, // mov r5, r0          keep the thread
+            0xe594_3004, // ldr r3, [r4, #4]    the Suspend trap
+            0xe1a0_0005, // mov r0, r5
+            0xe12f_ff33, // blx r3              sleep
+            0xe3a0_c001, // mov ip, #1          reached after the timer fires
+            0xe584_c000, // str ip, [r4]
+            0xe594_e008, // ldr lr, [r4, #8]
+            0xe12f_ff1e, // bx lr
+        ],
+    );
+    let th = service(&mut rt, g::AEECLSID_THREAD);
+    start_thread(&mut rt, th, 4096, body, block).unwrap();
+    rt.pump(0).unwrap();
+    assert_eq!(rt.threads[0].state, ThreadState::Suspended);
+    let pcb = call(
+        &mut rt,
+        abi::method_of("IThread", "GetResumeCBK").unwrap(),
+        th,
+    )
+    .unwrap();
+    // `ISHELL_SetTimerEx(psh, ms, pcb)` is this slot with the same word in both arguments.
+    let shell = rt.shell;
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::method_of("IShell", "SetTimer").unwrap(),
+            shell,
+            &[1, pcb, pcb],
+        )
+        .unwrap(),
+        g::AEE_SUCCESS,
+        "a resume record with a zero notify is this host's marker, not an uninitialised block"
+    );
+    // One virtual millisecond of guest execution is the safe point that turns the timer due.
+    rt.cpu.steps = rt.cpu.steps.saturating_add(INSTR_PER_MS);
+    let clock = abi::helper_id(abi::offset_of("AEEHelperFuncs", "aee_GetUpTimeMS").unwrap());
+    rt.dispatch(clock, 0).unwrap();
+    assert_eq!(
+        rt.cpu.mem.read_u32(block).unwrap(),
+        1,
+        "the thread woke on its own timer"
+    );
+    assert_eq!(rt.threads[0].state, ThreadState::Ended(0));
+    assert_eq!(rt.clock_ms, 1, "the executed millisecond is on the clock");
+}
+
 #[test]
 fn a_thread_is_started_once_and_join_hears_what_it_returned() {
     let mut rt = Runtime::new();
@@ -22873,6 +24460,7 @@ fn a_thread_is_started_once_and_join_hears_what_it_returned() {
     // never started, `EALREADY` for one that has already stopped.
     assert_eq!(call_many(&mut rt, exit, th, &[0]).unwrap(), g::AEE_EFAILED);
     start_thread(&mut rt, th, 4096, body, 0).unwrap();
+    rt.pump(0).unwrap();
     assert_eq!(
         start_thread(&mut rt, th, 4096, body, 0).unwrap(),
         g::AEE_EALREADY,
@@ -22913,6 +24501,7 @@ fn a_thread_runs_on_a_stack_of_its_own_and_leaves_the_caller_alone() {
     );
     let th = service(&mut rt, g::AEECLSID_THREAD);
     start_thread(&mut rt, th, 8192, body, 0x1111).unwrap();
+    rt.pump(0).unwrap();
     let t = &rt.threads[0];
     // The stack is gone by now — the thread ended, and what it ended takes the bytes with it — but
     // the last `sp` it ran on is the record of where that stack was.
@@ -23156,7 +24745,10 @@ fn a_thread_that_never_yields_ends_the_run_saying_it_never_finished() {
     rt.session_ceiling = rt.cpu.steps + 20_000;
     let spin = arm_code(&mut rt, &[0xeaff_fffe]); // b .
     let th = service(&mut rt, g::AEECLSID_THREAD);
-    let err = start_thread(&mut rt, th, 4096, spin, 0).unwrap_err();
+    start_thread(&mut rt, th, 4096, spin, 0).unwrap();
+    // `Start` only queues the thread, so the spin is the dispatcher's to run — and the budget that
+    // names it is the same one a long guest function trips.
+    let err = rt.pump(0).unwrap_err();
     assert!(
         matches!(&err, Error::Hle(HleError::NoReturn { spun: true, .. })),
         "{err}"
@@ -23179,7 +24771,8 @@ fn a_fault_on_a_guest_thread_names_its_instruction_too() {
     );
     let wild = 0x8874_c574;
     let th = service(&mut rt, g::AEECLSID_THREAD);
-    let err = start_thread(&mut rt, th, 4096, body, wild).unwrap_err();
+    start_thread(&mut rt, th, 4096, body, wild).unwrap();
+    let err = rt.pump(0).unwrap_err();
     let crash = rt
         .crash
         .expect("a thread fault copies the machine as loudly as a main one");
@@ -23223,7 +24816,7 @@ fn a_pad(rt: &mut Runtime) -> (u32, u32) {
     let ihid = service(rt, g::AEECLSID_HID);
     let count = rt.cpu.mem.alloc(4, 4).unwrap();
     let next = abi::method_of("IHID", "GetConnectedDevices").unwrap();
-    // The sizing pass first, exactly as the SDK's own gamepad layer does it: no array, just "how
+    // The sizing pass first, exactly as the platform's own gamepad layer does it: no array, just "how
     // many". Answering that as a failure is how a client ends up with no pad at all.
     assert_eq!(
         call_many(
@@ -23381,7 +24974,7 @@ fn a_pad_with_no_motor_refuses_rumble_by_name_instead_of_ending_the_run() {
 
 #[test]
 fn a_press_becomes_one_event_carrying_the_uid_the_pack_recognises() {
-    // The SDK's own handler branches on `nState == TRUE` / `== FALSE` — literals, not "nonzero" —
+    // The platform's own handler branches on `nState == TRUE` / `== FALSE` — literals, not "nonzero" —
     // and one title identifies the button it watches by `nButtonUID`, never by `nButtonID`. So both
     // have to be right, and a repeat of a state already held must not queue a second event.
     let mut rt = Runtime::new();
@@ -23840,7 +25433,7 @@ fn a_copyright_notice_closes_itself_and_reports_the_end() {
     // is sent from the dismissal, and `ADialog_Release` answers `m_bCopyright ? EVT_COPYRIGHT_END :
     // EVT_DIALOG_END` with the dialog's own id and pointer.
     //
-    // A host that answered this call with a note and no more left the one shipped pack that waits for
+    // A host that answered this call with a note and no more left the one guest pack that waits for
     // that end sitting idle for the whole run: 486 instructions, one turn, no drawing at all. So both
     // halves are asserted here — the wait, and the event.
     let mut rt = Runtime::new();
@@ -23903,7 +25496,7 @@ fn a_key_closes_the_copyright_notice_rather_than_reaching_the_applet() {
     );
     assert_eq!(rt.cpu.mem.read_u32(f.log + 8).unwrap(), notice);
     assert!(rt.copyright.is_none());
-    // A pen tap is the applet's: the notice holds no control for it to hit, and the shipped body
+    // A pen tap is the applet's: the notice holds no control for it to hit, and the documented behaviour
     // falls through to the owner. A second notice is shown first, because the key above ended the
     // first one.
     call_many(&mut rt, prompt, shell, &[0]).unwrap();
@@ -23995,6 +25588,18 @@ fn a_full_debug_list_still_names_the_last_thing_the_module_said() {
     );
 }
 
+/// A report's `%s` is bytes in the pack's own encoding, not UTF-8. On a Japanese handset the two
+/// Shift-JIS bytes of は are one word in the line, not two replacement characters.
+#[test]
+fn a_narrow_argument_in_a_report_is_read_in_the_devices_encoding() {
+    let mut rt = Runtime::new();
+    let src = rt.cpu.mem.alloc(3, 1).unwrap();
+    rt.cpu.mem.write_bytes(src, &[0x82, 0xcd, 0]).unwrap();
+    rt.cpu.r[1] = src;
+    let mut next = 1;
+    assert_eq!(rt.format("%s", &mut next, 0).unwrap(), "は");
+}
+
 /// A line already in the list is not a new line, and that is a separate promise from the cap.
 #[test]
 fn a_module_saying_the_same_thing_twice_is_recorded_once() {
@@ -24013,7 +25618,13 @@ fn a_module_saying_the_same_thing_twice_is_recorded_once() {
 /// `ScriptRunner-Command(N):%S` lines around a fault, and every one of them needs the conversion.
 #[test]
 fn a_wide_string_argument_is_printed_as_text() {
-    let mut rt = Runtime::new();
+    // The units below are code points, so the device has to be the one that carries them. On the
+    // sample set's Japanese handsets the same buffer would hold Shift-JIS units, and `wide_text`
+    // decodes with whatever `wEncoding` names.
+    let mut rt = Runtime::with_device(DeviceProfile {
+        encoding: g::AEE_ENC_UNICODE as u16,
+        ..DeviceProfile::standard()
+    });
     let put = |rt: &mut Runtime, text: &str| -> u32 {
         let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
         let at = rt.cpu.mem.alloc((units.len() * 2) as u32, 2).unwrap();
@@ -24069,7 +25680,7 @@ fn a_report_keeps_its_text_while_a_guest_call_still_gets_an_error() {
     // An unmapped `va_list`: the very first argument word cannot be read.
     let mut out = String::new();
     let mut next = 1;
-    let err = rt.format_into("fileName %s here", &mut next, 0x1_0000, &mut out);
+    let err = rt.format_into("fileName %s here", &mut next, 0x1_0000, &mut out, false);
     assert!(err.is_err(), "an unreadable argument is still an error");
     assert_eq!(
         out, "fileName ",
@@ -24362,7 +25973,7 @@ fn rgb_png(w: u32, h: u32, at: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
 
 /// Load `bytes` as a file in the app's own volume and hand back the `IImage` the resource load makes.
 ///
-/// Through the volume rather than `IImage::SetStream` because that is the route a shipped container
+/// Through the volume rather than `IImage::SetStream` because that is the route a reference container
 /// takes — `IShell::LoadResObject(…, HTYPE_VIEWER)` — and the object it hands out is the one whose
 /// drawing is under test here.
 fn image_of(rt: &mut Runtime, name: &str, bytes: &[u8]) -> u32 {
@@ -24479,7 +26090,7 @@ fn a_clip_with_dirty_padding_still_clips() {
 
     // A circle is accepted too: `convertCircleToRect` turns it into a `2r + 1` box, the body walks the
     // ellipse inscribed there into its per-scanline spans, and the slot answers TRUE. The bounding
-    // box's corner is the witness — inside the box, outside the figure.
+    // box's corner is the record — inside the box, outside the figure.
     let disc = rt.cpu.mem.alloc(12, 4).unwrap();
     rt.cpu.mem.write_u8(disc, g::CLIPPING_CIRCLE as u8).unwrap();
     for (off, v) in [(4u32, 6i16), (6, 6), (8, 4)] {
@@ -24976,7 +26587,7 @@ fn a_clip_can_clear_or_fill_the_region_as_it_is_set() {
 /// animation" — a PNG among them. Binding the frame index to `_frame` and drawing frame 0 for every
 /// caller turns an animated sprite into a still one. No pack in the sweep reaches either half of
 /// this protocol (0 `DrawFrame` in a whole-run census of three builds of one pack), so the test is
-/// the only witness it has.
+/// the only record it has.
 ///
 /// The last block is the honest-negative half: a caller that never named a frame width gets frame 0
 /// whatever index it passes, rather than a stride this host guessed.
@@ -25113,7 +26724,7 @@ fn an_image_frame_is_the_width_the_caller_named() {
 /// `IDisplay::GetSymbol(sym, fnt)` — and the one thing its page promises for a symbol this device has no
 /// glyph for: "If the symbol does not exist on the device a space character will be returned `(AECHAR)' '`".
 ///
-/// The SDK defines the symbol **values** (`AEE_SYM_*`, 22 of them) but not their characters: the mapping
+/// The platform defines the symbol **values** (`AEE_SYM_*`, 22 of them) but not their characters: the mapping
 /// from a symbol to a character is a property of the device's font, and this host's font is the pack's own
 /// resource. So there is no symbol this device has, and the header's own answer for that is what comes back
 /// — for every reported symbol, and whatever font is named, which is why the loop walks all 22.
@@ -25138,16 +26749,44 @@ fn an_unsupported_display_setting_and_an_unsupported_op_say_so() {
     let mut rt = Runtime::new();
     let disp = new_display(&mut rt);
     let prefs = abi::method_of("IDisplay", "SetPrefs").unwrap();
-    let s = rt.cpu.mem.alloc(8, 1).unwrap();
-    rt.cpu.mem.write_bytes(s, b"w:120,h:").unwrap();
-    // "EUNSUPPORTED if the destination is not a device bitmap or the display does not support
-    // display settings." This host supports none of the four names the header lists.
+    let s = rt.cpu.mem.alloc(16, 1).unwrap();
+    let screen = rt
+        .display
+        .bitmap(rt.display.device_bitmap())
+        .map(|b| (b.width, b.height))
+        .expect("the runtime's screen is a bitmap the host knows");
+    rt.cpu.mem.write_bytes(s, b"h:300,a:1").unwrap();
+    // `a` is whether annunciators are shown at all, and this host draws no annunciator bar, so the
+    // name has no state to set. The refusal is the whole list's: the `h` ahead of it must not have
+    // been applied, or the caller would believe a screen it never got.
     assert_eq!(
-        call_many(&mut rt, prefs, disp, &[s, 6]).unwrap(),
+        call_many(&mut rt, prefs, disp, &[s, 9]).unwrap(),
         g::AEE_EUNSUPPORTED,
         "the string is still recorded for the report, but the answer is the honest one"
     );
-    assert_eq!(rt.display_prefs, vec!["w:120,".to_string()]);
+    assert_eq!(rt.display_prefs, vec!["h:300,a:1".to_string()]);
+    assert_eq!(
+        rt.display
+            .bitmap(rt.display.device_bitmap())
+            .map(|b| (b.width, b.height)),
+        Some(screen),
+        "a refused list changes nothing"
+    );
+
+    // The height is the name with behaviour, and it has to arrive through the slot: the pack that
+    // needs it asks here and then clears the frame it asked for without reading the answer.
+    rt.cpu.mem.write_bytes(s, b"h:300,").unwrap();
+    assert_eq!(
+        call_many(&mut rt, prefs, disp, &[s, 6]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.display
+            .bitmap(rt.display.device_bitmap())
+            .map(|b| (b.width, b.height)),
+        Some((screen.0, 300)),
+        "the screen is the size the pack asked for, at the width it already had"
+    );
 
     // `IGraphics::StretchBlt` ends in a per-pixel write that cannot report, so the op has to be
     // asked about once up front — otherwise an unsupported op is ten thousand discarded errors.
@@ -25364,7 +27003,7 @@ fn the_graphics_update_is_the_display_s_own_update_with_true() {
     // — which is slot 7 of the `IDisplay` the object was made from, with `TRUE`, and that call's answer.
     // The header's paragraph about a missing back buffer describes the device's own policy; there is no
     // "has no effect" branch in this member for the host to keep itself honest with. So what the slot
-    // does is present, and the witness is the display's own counter.
+    // does is present, and the record is the display's own counter.
     let mut rt = Runtime::new();
     fake_module(&mut rt);
     let ig = new_service(&mut rt, g::AEECLSID_GRAPHICS);
@@ -25378,7 +27017,7 @@ fn the_graphics_update_is_the_display_s_own_update_with_true() {
     );
     // The forwarding is one line deep, so what the display does with the message is what this slot
     // does — and `IDisplay::Update` *posts* a refresh rather than taking one (see the test above,
-    // which is that slot's own witness). Expecting the count to move on the call would make this arm
+    // which is that slot's own record). Expecting the count to move on the call would make this arm
     // disagree with the arm it forwards to.
     assert_eq!(
         rt.display.presentations, before,
@@ -25407,7 +27046,7 @@ fn resource_dir(tag: &str, records: &[(u16, u16, &[u8])]) -> std::path::PathBuf 
     dir
 }
 
-/// `IShell::LoadResString`'s `nSize` is the buffer's size in bytes, and the shipped body keeps one
+/// `IShell::LoadResString`'s `nSize` is the buffer's size in bytes, and the documented behaviour keeps one
 /// character of it for the terminator: `CShell_LoadResString` bounds the copy at `(nSize >> 1) - 1`.
 /// Reading the word as a character count writes two bytes per character into a buffer sized in
 /// bytes — twice the caller's memory — which is what this asserts has stopped.
@@ -25422,7 +27061,7 @@ fn a_resource_string_is_bounded_by_the_byte_size_the_caller_named() {
         "the container should be the app's own, got {mounted:?}"
     );
     let buf = rt.cpu.mem.alloc(16, 2).unwrap();
-    // A witness past the eight bytes the caller owns: it must still be there afterwards.
+    // A record past the eight bytes the caller owns: it must still be there afterwards.
     rt.cpu.mem.write_u16(buf + 8, 0xbeef).unwrap();
 
     let load = abi::method_of("IShell", "LoadResString").unwrap();
@@ -25444,6 +27083,55 @@ fn a_resource_string_is_bounded_by_the_byte_size_the_caller_named() {
         0xbeef,
         "and not one byte past the size the caller named"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resource string is decoded from the container's bytes and then written back in the device's
+/// own units: the buffer a pack reads is the same kind of string it would have built itself.
+#[test]
+fn a_resource_string_reaches_the_guest_in_the_devices_units() {
+    // A carrier container marker (S_JIS) followed by はじから.
+    let body = [0xfd, 0xfe, 0x82, 0xcd, 0x82, 0xb6, 0x82, 0xa9, 0x82, 0xe7];
+    let dir = resource_dir(
+        "string-sjis",
+        &[(crate::resource::RESTYPE_STRING, 8, &body)],
+    );
+    let load = abi::method_of("IShell", "LoadResString").unwrap();
+
+    let read = |rt: &Runtime, buf: u32, n: usize| -> Vec<u32> {
+        (0..=n)
+            .map(|i| rt.cpu.mem.read_u16(buf + i as u32 * 2).unwrap())
+            .collect()
+    };
+
+    // The default handset advertises S_JIS, so the buffer holds packed Shift-JIS units.
+    let mut sjis = Runtime::new();
+    let shell = sjis.shell;
+    sjis.resources.mount_beside(&dir.join("probe.mod"));
+    let buf = sjis.cpu.mem.alloc(32, 2).unwrap();
+    assert_eq!(
+        call_many(&mut sjis, load, shell, &[0, 8, buf, 32]).unwrap(),
+        4
+    );
+    assert_eq!(read(&sjis, buf, 4), vec![0xcd82, 0xb682, 0xa982, 0xe782, 0]);
+
+    // The same container on a device that advertises UNICODE gives the code points instead.
+    let mut unicode = Runtime::with_device(DeviceProfile {
+        encoding: g::AEE_ENC_UNICODE as u16,
+        ..DeviceProfile::standard()
+    });
+    let shell = unicode.shell;
+    unicode.resources.mount_beside(&dir.join("probe.mod"));
+    let buf = unicode.cpu.mem.alloc(32, 2).unwrap();
+    assert_eq!(
+        call_many(&mut unicode, load, shell, &[0, 8, buf, 32]).unwrap(),
+        4
+    );
+    assert_eq!(
+        read(&unicode, buf, 4),
+        vec![0x306f, 0x3058, 0x304b, 0x3089, 0]
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -25485,7 +27173,7 @@ fn a_size_only_resource_query_answers_minus_one_and_the_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An image record is valid only when a handler exists for it: the shipped `ResFile_Check` reads the
+/// An image record is valid only when a handler exists for it: the reference `ResFile_Check` reads the
 /// record's MIME, asks `Reg_GetHandler(ht, mime)` and answers FALSE when nothing is registered. This
 /// host's registry of handlers is its decoders, so a record no decoder takes is the case that answer
 /// excludes — and answering TRUE sends the caller into a `LoadResObject` that returns NULL. The same
@@ -25534,7 +27222,7 @@ fn an_image_record_no_decoder_takes_is_not_a_valid_resource() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `ISHELL_LoadResSound` is `LoadResObject(..., HTYPE_SOUND)`. The shipped body builds the class the
+/// `ISHELL_LoadResSound` is `LoadResObject(..., HTYPE_SOUND)`. The documented behaviour builds the class the
 /// record's MIME names and calls its `SetStream`; this host has no audio stream sink, so the same
 /// bytes reach the player as an `SDT_BUFFER` naming — and the player owns that copy, so releasing it
 /// is what takes the buffer back. The slot used to refuse every sound ask outright, which is a NULL
@@ -25712,7 +27400,7 @@ fn every_refused_map_says_which_condition_it_failed() {
     said(&rt, "only a const file can be mapped");
 
     // Two refusals the flag fields hide: `FIXED` asks for an address to place the mapping at, which
-    // contradicts the `pStart` that must be 0, and `PRIVATE` is the other bit the shipped mask refuses.
+    // contradicts the `pStart` that must be 0, and `PRIVATE` is the other bit the reference mask refuses.
     // Both pass the write test above, so without their own arm they would "succeed" silently.
     assert_eq!(
         call_many(
@@ -25728,7 +27416,7 @@ fn every_refused_map_says_which_condition_it_failed() {
     said(&rt, "AEE_FMAP_FIXED");
     // `PROT_NONE` is **not** a gate. `CFile_Map` tests the protections exactly once, with
     // `if ((a4 & 4) != 0) return 0`, so no access at all, execute alone and read alone are one answer
-    // to the shipped member and the shared flag is what decides: the mapping is handed out. A refusal
+    // to the reference member and the shared flag is what decides: the mapping is handed out. A refusal
     // here would be a rule the body does not have.
     let none = call_many(
         &mut rt,
@@ -25746,7 +27434,7 @@ fn every_refused_map_says_which_condition_it_failed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Open a file the pack shipped, and hand back the manager and the handle.
+/// Open a file the pack provides, and hand back the manager and the handle.
 fn open_shipped_file(rt: &mut Runtime, name: &str) -> (u32, u32) {
     let shell = rt.shell;
     let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
@@ -26112,7 +27800,7 @@ fn alpha_art_keeps_a_magenta_pixel_the_file_never_called_transparent() {
 }
 
 /// The colour key a *file* names reaches the blitter the same way the indexed `tRNS` entries do - as a
-/// coverage table - and this is that route's own drawing-layer witness.
+/// coverage table - and this is that route's own drawing-layer record.
 ///
 /// Two things are at stake in one picture. The keyed colour must be the only pixel that leaves the
 /// screen alone, and the magenta pixel beside it must still paint: choosing `AEE_RO_TRANSPARENT` as the
@@ -27651,7 +29339,7 @@ fn the_ringer_manager_enumerates_the_directory_its_own_body_names() {
 
     // Categories: `CRingerMgr_New` starts the cursor at `AEE_RINGER_CATEGORY_NONE`, which is past
     // `CAT_MAX`, so a caller that never ran `EnumCategoryInit` gets FALSE — after the record was
-    // zeroed, because the shipped `MEMSET` runs before that gate.
+    // zeroed, because the reference `MEMSET` runs before that gate.
     let cat_at = |field: &str| abi::offset_of("AEERingerCat", field).unwrap();
     let cat = rt.cpu.mem.alloc(72, 4).unwrap();
     rt.cpu.mem.write_bytes(cat, &[0xa5u8; 72]).unwrap();
@@ -27803,7 +29491,7 @@ fn the_ringer_manager_enumerates_the_directory_its_own_body_names() {
         "and the Personal row reports the choice back"
     );
 
-    // The event door is one slot for the whole manager, and it is a guest address: the shipped
+    // The event door is one slot for the whole manager, and it is a guest address: the reference
     // `CRingerMgr_Notify` calls it with `(pUser, evt, dwParm, nErr)`.
     assert_eq!(
         call_many(&mut rt, slot("RegisterNotify"), mgr, &[0x1234, 0x5678]).unwrap(),
@@ -28205,7 +29893,7 @@ fn the_ringer_manager_holds_its_own_player_and_reports_the_pass() {
 }
 
 /// `CRingerMgr_Release` runs `Stop`, and `Stop` reports `ARE_PLAY` — so the pack's event handler runs
-/// while the manager is being torn down. That is what the shipped `m_bInRelease` latch is for: the
+/// while the manager is being torn down. That is what the reference `m_bInRelease` latch is for: the
 /// `Release` a notification makes returns at the latch instead of tearing down again, so a handler that
 /// starts a pass of its own on the way out is dropped with the `MEMSET` (leaked, exactly as on a
 /// handset) and the pack hears **one** event rather than a second one for the pass it made itself.
@@ -28830,7 +30518,7 @@ fn changing_tempo_mid_pass_retimes_the_remaining_window() {
 
 #[test]
 fn the_command_data_block_is_wiped_between_reports_of_different_widths() {
-    // One block serves every report an object makes, because that is what the shipped member does
+    // One block serves every report an object makes, because that is what the reference member does
     // (`AEESoundPlayer_SoundCB` memsets `bss$2` before it fills one member). The reusing is only
     // safe with the wiping: on the player channel a four-byte `dwElapsedTime` and a two-byte
     // `wVolume` are written at the same address, so without the memset the volume answer reads back
@@ -29008,7 +30696,7 @@ fn a_handler_that_stops_its_tone_is_not_overruled_by_the_report_it_answered() {
     );
 }
 /// A `DialogInfo` laid out the way `AEEDialog_Load` walks it: the 20-byte head, then one control.
-/// With no items the shipped stride rule makes that control 24 bytes and not 36 —
+/// With no items the reference stride rule makes that control 24 bytes and not 36 —
 /// `sizeof(DialogItem) - sizeof(DListItem)` when `nItems` is zero.
 fn dialog_record(rt: &mut Runtime, id: u16, focus: u16, ctl_id: u16, props: u32) -> u32 {
     let at = rt.cpu.mem.alloc(44, 4).unwrap();
@@ -29045,7 +30733,7 @@ fn dialog_record(rt: &mut Runtime, id: u16, focus: u16, ctl_id: u16, props: u32)
 #[test]
 fn a_dialog_record_makes_its_controls_and_leaves_them_placed() {
     // Nothing here needs a pack: the record is the one a `CreateDialog` caller assembles, and every
-    // number asserted is arithmetic the shipped loader does — `ADialog_GetSize`'s border inset,
+    // number asserted is arithmetic the reference loader does — `ADialog_GetSize`'s border inset,
     // `AdjustControlRect`'s offset and clip, the focus fallback, and `IDialog_Redraw`'s rule that the
     // control in focus is the one holding the active state.
     let mut rt = Runtime::new();
@@ -29057,7 +30745,7 @@ fn a_dialog_record_makes_its_controls_and_leaves_them_placed() {
     // `CShell_CreateDialog` is the body, whose only local `v8` never reaches the caller — so
     // the dialog a pack can reach afterwards is the one `GetActiveDialog` names.
     assert_eq!(call_many(&mut rt, get, shell, &[]).unwrap(), 0);
-    // No applet is running, which is the shipped `if(pae && …)` guard: with no owner the handshake
+    // No applet is running, which is the reference `if(pae && …)` guard: with no owner the handshake
     // events are not sent at all, so the load cannot be refused and the dialog opens.
     assert_eq!(
         call_many(&mut rt, create, shell, &[0, 0, info]).unwrap(),
@@ -29077,7 +30765,7 @@ fn a_dialog_record_makes_its_controls_and_leaves_them_placed() {
         call_many(&mut rt, get_props, dialog, &[]).unwrap(),
         g::CP_BORDER
     );
-    // `IDIALOG_SetProperties` ORs rather than replaces, which is the shipped body's `|=`.
+    // `IDIALOG_SetProperties` ORs rather than replaces, which is the documented behaviour's `|=`.
     let set_props = abi::method_of("IDialog", "SetProperties").unwrap();
     call_many(&mut rt, set_props, dialog, &[0x100]).unwrap();
     assert_eq!(
@@ -29254,7 +30942,7 @@ fn a_dialog_record_with_items_walks_both_controls() {
     let ctl_head =
         |f: &str| abi::offset_of("DialogItemHead", f).expect("DialogItemHead is in the tables");
     let item = |f: &str| abi::offset_of("DListItem", f).expect("DListItem is in the tables");
-    // Laid out by the shipped arithmetic, in bytes: 20 of head, then a 48-byte menu, then a 24-byte
+    // Laid out by the reference arithmetic, in bytes: 20 of head, then a 48-byte menu, then a 24-byte
     // static.
     let info = rt.cpu.mem.alloc(20 + 48 + 24, 4).unwrap();
     let menu = info + 20;
@@ -29336,7 +31024,7 @@ fn a_dialog_record_with_items_walks_both_controls() {
     assert!(rt.widgets.rect_at(b).is_err());
 }
 
-/// A record with `ids.len()` zero-item controls, laid out by the shipped stride: 20 of head, then 24
+/// A record with `ids.len()` zero-item controls, laid out by the reference stride: 20 of head, then 24
 /// bytes each (`DialogItem` minus the tail `DListItem` an empty control does not have).
 fn dialog_controls(rt: &mut Runtime, id: u16, focus: u16, ids: &[u16], props: u32) -> u32 {
     let at = rt.cpu.mem.alloc(20 + 24 * ids.len() as u32, 4).unwrap();
@@ -29389,7 +31077,7 @@ fn a_ready_dialog_offers_its_handler_what_no_control_took_and_the_applet_never_s
         dialog, 0,
         "the applet accepted EVT_DIALOG_START, so the dialog is on the stack"
     );
-    // The handler is guest code, because the shipped door is a function pointer the app owns: it
+    // The handler is guest code, because the reference door is a function pointer the app owns: it
     // records the event it was given, counts the calls, and answers TRUE. `r0` is `m_pUserEvent`.
     let user = rt.cpu.mem.alloc(8, 4).unwrap();
     let pfn = arm_code(
@@ -29428,7 +31116,7 @@ fn a_ready_dialog_offers_its_handler_what_no_control_took_and_the_applet_never_s
 fn a_tab_moves_focus_round_the_dialogs_own_list_without_reaching_the_applet() {
     // `EVT_CTL_TAB` is the one event the router answers by itself: forward is the focus node's `pNext`,
     // wrapping to the head; backward is the node before it, and when focus is already the head the
-    // shipped's second loop walks to the **last** node. The answer is TRUE whether or not the control
+    // reference's second loop walks to the **last** node. The answer is TRUE whether or not the control
     // took the focus. `wParam` is the direction.
     //
     // Three controls, because two cannot tell the two wraps apart: the loader links each new node at
@@ -29457,7 +31145,7 @@ fn a_tab_moves_focus_round_the_dialogs_own_list_without_reaching_the_applet() {
     assert_eq!(lit(&mut rt, ctl[2]), 0);
     let asked = rt.hle.downcall_count(f.handle);
 
-    // Forward from the **tail**: `pNext` is null, so the shipped takes `m_pControls` — the head, which
+    // Forward from the **tail**: `pNext` is null, so the reference takes `m_pControls` — the head, which
     // is the record's *last* control. Predecessor logic would have answered 2, not 3.
     assert_eq!(
         rt.dispatch_event(g::EVT_CTL_TAB, 1, 0).unwrap(),
@@ -29570,7 +31258,7 @@ fn the_dialogs_broadcast_starts_at_the_head_of_its_list_not_at_the_focused_contr
     assert_ne!(first, 0);
     assert_ne!(head, 0);
     // `EVT_CTL_SET_TEXT` with `wParam == 0` is the "dwParam is already the text" reading, and taking it
-    // is how a static answers that code (the header's rule, shared by the shipped controls).
+    // is how a static answers that code (the header's rule, shared by the reference controls).
     let text = rt.cpu.mem.alloc(6, 2).unwrap();
     rt.cpu.mem.write_u16(text, u32::from('H' as u16)).unwrap();
     rt.cpu
@@ -29643,7 +31331,7 @@ fn a_pen_event_the_dialog_cannot_place_is_answered_by_the_applet() {
         asked + 3,
         "all three reached the applet — a dialog that refuses a pen event must not report it taken"
     );
-    // ⚠ What this host cannot witness: the branch where a control *takes* a pen event and the dialog
+    // ⚠ What this host cannot record: the branch where a control *takes* a pen event and the dialog
     // then answers TRUE even though its handler says FALSE. No control this host makes takes a pen
     // event, and a module's own control needs a pack to hand one out, so that line rests on
     // The header alone.
@@ -29685,7 +31373,7 @@ fn the_picture_control_holds_the_picture_it_was_given() {
 
     // `SetRedraw(pfn, pUser)` stores both words first, whatever they are, because passing 0 is how a
     // caller un-installs the callback. It has no visible answer, and the
-    // half that *is* visible -- the `IIMAGE_SetParm(IPARM_REDRAW, …)` the shipped body makes when a
+    // half that *is* visible -- the `IIMAGE_SetParm(IPARM_REDRAW, …)` the documented behaviour makes when a
     // picture is bound -- is registered as not copied.
     assert_eq!(call_many(&mut rt, set_redraw, pic, &[0, 0]).unwrap(), 0);
 }
@@ -29816,7 +31504,7 @@ fn the_time_control_is_three_classes_answering_one_interface() {
 #[test]
 fn a_control_starts_with_the_faces_its_own_constructor_mounts() {
     // What `GetFont` answers before anybody has called `SetFont` is not the zero-substitution in the
-    // setter: the shipped constructors write both faces themselves. `TimeCtl_New` names
+    // setter: the reference constructors write both faces themselves. `TimeCtl_New` names
     // `AEE_FONT_LARGE` digits under a `AEE_FONT_BOLD` letter and `DateCtl_New`
     // a `AEE_FONT_NORMAL` body under a `AEE_FONT_BOLD` title — two different
     // pairs, so a single host-wide default is wrong for one of them whatever it is.
@@ -29880,7 +31568,7 @@ fn a_control_starts_with_the_faces_its_own_constructor_mounts() {
 
 #[test]
 fn a_font_answers_a_wrong_sized_record_and_a_negative_budget_the_shipped_way() {
-    // Two contracts this host had backwards, each with two shipped witnesses.
+    // Two contracts this host had backwards, each with two reference records.
     //
     // `IFont::GetInfo(pInfo, nSize)` compares the caller's size for **equality** and answers
     // `EUNSUPPORTED`: the header and the header both read
@@ -29973,7 +31661,7 @@ fn a_font_answers_a_wrong_sized_record_and_a_negative_budget_the_shipped_way() {
     // something, the font door measured nothing.
     //
     // And the font door answers with **no display object in the runtime at all**, which is what the
-    // shipped bodies do: the header and the header read only the font
+    // platform routines do: the header and the header read only the font
     // object's own metrics and never a display. The display door below needs one, so this call is
     // deliberately placed before it.
     assert_eq!(
@@ -30389,7 +32077,7 @@ fn the_applet_history_moves_along_the_chain_its_bodies_walk() {
 }
 
 /// The `IModel` face of the same object: two slots that sit at byte 12 and 16 **of their own table**,
-/// which are `Forward` and `Back` on the history table. The shipped answer is an embedded second vtable
+/// which are `Forward` and `Back` on the history table. The reference answer is an embedded second vtable
 /// at `[+40]`; this host's is a companion object, and the test is what tells the two apart.
 #[test]
 fn the_history_models_its_listeners_through_a_face_of_its_own() {
@@ -31173,7 +32861,7 @@ fn a_framed_viewport_keeps_its_border_pixel_and_says_which_one_it_kept() {
     );
 }
 
-/// `IGraphics::SetDestination` is not a stored pointer. The shipped body AddRef's the bitmap it is
+/// `IGraphics::SetDestination` is not a stored pointer. The documented behaviour AddRef's the bitmap it is
 /// given — or asks `IDisplay::GetDeviceBitmap` (slot 16) when it is handed `NULL` — reads
 /// `IBitmap::GetInfo` (slot 12, twelve bytes) for the width, the height and the depth, Releases the
 /// destination it already held, and then runs the viewport and clip setters to reset everything that
@@ -31329,7 +33017,7 @@ const DEC13_NEXT: [u8; 8] = [0x3d, 0xb4, 0x96, 0x39, 0x44, 0xa1, 0xe4, 0x43];
 
 /// `AEECipherInit` in the guest's heap from up to four pointer/length pairs, in the struct's own order:
 /// the vector, then `pbKey1`, `pbKey2`, `pbKey3`. A `None` leaves both of its words at zero — which is
-/// what the shipped `aee_malloc` leaves for a field a caller never set, and what the member's gates
+/// what the reference `aee_malloc` leaves for a field a caller never set, and what the member's gates
 /// then read.
 fn put_cipher_init(rt: &mut Runtime, parts: [Option<(u32, u32)>; 4]) -> u32 {
     let names = [
@@ -31392,7 +33080,7 @@ fn cipher_total(rt: &mut Runtime, value: u32) -> u32 {
     at
 }
 
-/// `ICipher`'s shipped table is five words and there is no `QueryInterface` among them: `IBase`, then
+/// `ICipher`'s reference table is five words and there is no `QueryInterface` among them: `IBase`, then
 /// `Init`/`Cipher`/`Flush`. So `Init` sits in slot 2 — the slot an `IQI` caller would use — and this
 /// host has no `QueryInterface` to answer with, because the object it is standing for has none.
 #[test]
@@ -31917,7 +33605,7 @@ fn a_short_tail_writes_a_whole_block_and_reports_the_shorter_count() {
 
     // …and the vector that over-read left behind is the block it *read*, not the payload it wrote: a
     // second call on the same object starts from `DES_CT[8..]`, so its answer is not the plaintext
-    // again. This is the only witness in this file for which of the two a tail walk stores.
+    // again. This is the only record in this file for which of the two a tail walk stores.
     let output = guest_marked(&mut rt, 8);
     let total = cipher_total(&mut rt, 8);
     let rest = guest_bytes(&mut rt, &DES_CT[8..]);
@@ -32328,7 +34016,7 @@ const RAW_OUT: &str = "4f 95 c9 da 26 37 d7 26 73 29 e3 a8 66 0e 2a d9 88 d7 7b 
 const TYPE1_PADDING: &str = "00 01 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 71 75 6f 69 6e 21";
 const TYPE1_CIPHERTEXT: &str = "3a 26 42 df c1 83 41 e2 5a 7a e1 0c c3 90 0c 7d 7d f9 0b 4f c6 5a 5d 31 f2 8a c7 b4 a6 cf a5 e9 81 cd 7d 81 6f 0b 0e e1 4e 87 60 2b 48 04 d5 7e ef 1e 61 ca 48 1f ac ef f6 c8 25 10 37 83 4e 60";
 /// A `md5WithRSAEncryption` `DigestInfo` with its `NULL`: the fourth byte is the inner
-/// `AlgorithmIdentifier`'s own length, which is what the shipped walk measures the digest offsets from.
+/// `AlgorithmIdentifier`'s own length, which is what the reference walk measures the digest offsets from.
 const SIG_INFO: &str = "30 21 30 0d 06 09 2a 86 48 86 f7 0d 01 01 04 05 00 04 10 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10";
 const SIG_DIGEST: &str = "01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10";
 const SIG_CIPHERTEXT: &str = "2c 7c 88 3f bd d8 49 05 f6 da a8 b5 23 5d 7d 8e 79 7c e0 f8 68 26 cc c3 bb 5a 15 1a 91 30 6b 6e d0 55 c4 15 7e 76 69 fb 61 18 be 35 b2 c7 4d 3a 0d 7b 45 15 67 c5 9b d1 d6 92 86 59 08 e7 28 b4";
@@ -32337,8 +34025,8 @@ const SIG_CIPHERTEXT: &str = "2c 7c 88 3f bd d8 49 05 f6 da a8 b5 23 5d 7d 8e 79
 const ZERO_LEAD_DIGEST: &str = "00 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10";
 const ZERO_LEAD_CIPHERTEXT: &str = "60 c1 2d d6 32 1f dd eb 1c cb f9 d6 47 f5 14 2a 48 b1 bb 2d 4f ac a1 7f 9c 51 a5 c2 fa 77 88 1e 0a 27 d3 e5 f9 74 b3 97 31 5c b5 a3 af ae 4f 63 c5 b6 57 f7 81 9a 71 15 fe 86 71 d7 82 c9 bc 1e";
 /// A block laid out the way OpenSSL's SSLv23 padding is — random filler first, the eight `03` bytes at
-/// the end of it. The shipped *writer* does not produce this shape (see the SSLv23 test), but the
-/// shipped *reader* accepts it, which is the half of the disagreement worth pinning by number.
+/// the end of it. The reference *writer* does not produce this shape (see the SSLv23 test), but the
+/// reference *reader* accepts it, which is the half of the disagreement worth pinning by number.
 const SSLV23_OPENSSL_BLOCK: &str = "00 02 03 0b 11 19 1f 27 2d 35 3b 43 49 51 57 5f 65 6d 73 7b 81 89 8f 97 9d a5 ab b3 b9 c1 c7 cf d5 dd e3 eb f1 f9 ff 07 0d 15 1b 23 29 31 03 03 03 03 03 03 03 03 00 72 6f 6c 6c 62 61 63 6b 3f";
 
 /// Every constant above is a fixed number of bytes, and the shapes the bodies measure depend on it.
@@ -32369,7 +34057,7 @@ fn rsa_hex(spec: &str) -> Vec<u8> {
         .collect()
 }
 
-/// A guest buffer holding `bytes`, and nothing else — the shipped bodies read exactly `cbIn` of them.
+/// A guest buffer holding `bytes`, and nothing else — the platform's own routines read exactly `cbIn` of them.
 fn rsa_put(rt: &mut Runtime, bytes: &[u8]) -> u32 {
     let at = rt.cpu.mem.alloc(bytes.len() as u32, 4).unwrap();
     rt.cpu.mem.write_bytes(at, bytes).unwrap();
@@ -32828,7 +34516,7 @@ fn a_signature_verifies_only_when_the_digest_and_its_type_agree() {
         "a digest that is not the one signed"
     );
 
-    // The shipped walk reads the digest's length from the byte *before* the digest and steps past a
+    // The reference walk reads the digest's length from the byte *before* the digest and steps past a
     // leading zero: a signature over a digest that begins `00` is arithmetically fine and cannot
     // verify, because the walk asks for fifteen bytes starting one byte late.
     let lead = rsa_put(&mut rt, &rsa_hex(ZERO_LEAD_DIGEST));
@@ -33074,7 +34762,7 @@ fn a_released_rsa_object_gives_up_the_block_it_handed_out() {
     assert_eq!(rt.rsa_objects.get(&obj).map(|r| r.block), None);
     // The host's heap keeps freed bytes readable for a while on purpose — that delay is what saved
     // `twins` from a use-after-free turning into a blank frame — so "the address is unmapped now" is
-    // not the witness available here. The witness is that no record owns the object any more: a second
+    // not the record available here. The record is that no record owns the object any more: a second
     // object would start with no block rather than inherit this key and this ciphertext.
     assert!(rt.rsa_objects.get(&obj).is_none());
 }
@@ -33106,7 +34794,7 @@ fn the_seed_fixtures_hold_their_own_byte_counts() {
     assert_eq!(rsa_hex(SEED_WALK32).len(), 32);
 }
 
-/// A `Cipher` before any `Init` is the shipped `if (!bReady) return ~bReady;`, and the complement of a
+/// A `Cipher` before any `Init` is the reference `if (!bReady) return ~bReady;`, and the complement of a
 /// clear flag is `-1` — not an error code from any of the three families this table borrows from. The
 /// count word is left exactly as the caller wrote it, because the walk is never entered.
 #[test]
@@ -33293,7 +34981,7 @@ fn the_two_seed_classes_run_the_same_walk_backwards() {
         rsa_hex(SEED_PLAIN)
     );
 
-    // A release ends the record's ownership; the shipped `Release` frees the object's allocation and
+    // A release ends the record's ownership; the reference `Release` frees the object's allocation and
     // answers 0, and a second call through the address should not be able to read a stranger's key.
     let release = abi::method_of("ICipher", "Release").unwrap();
     assert_eq!(
@@ -33384,7 +35072,7 @@ fn the_random_source_is_one_object_wearing_the_isource_table() {
 
 /// `AddRef` is `MOVS R0,#1` and `Release` is `MOVS R0,#0`: neither reads a count, and the object owns
 /// no bytes to free. A host that routes these through its reference bookkeeping would answer a number
-/// the shipped code never computes and then delete the only generator state the runtime has.
+/// the platform code never computes and then delete the only generator state the runtime has.
 #[test]
 fn its_reference_slots_answer_constants_and_survive_every_release() {
     let mut rt = Runtime::new();
@@ -33496,7 +35184,7 @@ fn a_read_answers_the_number_it_was_handed_and_never_comes_back_short() {
 
 /// The pool is a FIFO over one digest at a time: thirteen bytes and then seven come from the same
 /// twenty that a single ask for twenty produces. Two runtimes, because the singleton is only fresh
-/// once — and the shipped code asks the OEM for its twenty bytes **inside** the refill, so a split
+/// once — and the platform code asks the OEM for its twenty bytes **inside** the refill, so a split
 /// read must not pay for a third digest.
 #[test]
 fn a_split_read_hands_out_the_same_twenty_bytes_as_a_whole_one() {
@@ -33609,7 +35297,7 @@ fn readable_is_the_shells_resume_slot_not_a_question_about_the_source() {
         "and the callback ran, which is what the forward through word 36 of the shell's table means"
     );
 
-    // The shipped slot would hand address zero to the shell; this host answers its `Resume` gate.
+    // The reference slot would hand address zero to the shell; this host answers its `Resume` gate.
     assert_eq!(
         call_many(&mut rt, readable, source, &[0]).unwrap(),
         g::AEE_EBADPARM
@@ -33662,7 +35350,7 @@ fn the_socket_table_is_laid_out_the_way_the_delivered_object_is() {
     let table = rt.cpu.mem.read_u32(sock).unwrap();
     // Each word of a delivered table is an `SVC #imm` whose immediate is the dispatch id, so the byte
     // offset a guest call lands on decides which rule runs — and that is exactly the thing the header
-    // and the object disagree about. Positions 11 and 12 are the shipped order, from two independent
+    // and the object disagree about. Positions 11 and 12 are the reference order, from two independent
     // objects that both carry this table.
     let layout = [
         (0usize, "AddRef"),
@@ -33891,7 +35579,7 @@ fn a_loopback_pair_moves_bytes_with_no_network_under_it() {
         socket::EWOULDBLOCK
     );
     // `GetPeerName` reports the address `Connect` wrote into the server side: the listener's port with
-    // 127.0.0.1, both in the orders the shipped code uses.
+    // 127.0.0.1, both in the orders the platform code uses.
     let name = sock_addr(&mut rt, 0, 0, 0);
     let size = rsa_word(&mut rt, 8);
     assert_eq!(
@@ -33908,7 +35596,7 @@ fn a_loopback_pair_moves_bytes_with_no_network_under_it() {
         8,
         "the size word is set to the block written"
     );
-    // The listener is now empty: a second `Accept` is the shipped -2 with `EWOULDBLOCK`.
+    // The listener is now empty: a second `Accept` is the reference -2 with `EWOULDBLOCK`.
     let second = rsa_word(&mut rt, 0xa5a5_a5a5);
     assert_eq!(
         call_many(&mut rt, sock_method("Accept"), server, &[second]).unwrap(),
@@ -33970,7 +35658,7 @@ fn a_zero_port_in_bind_comes_down_from_the_top_of_the_range() {
         "the counter counts down, so the second socket's candidate is one lower — stored swapped"
     );
     // The port the first socket holds is not free: a third record asking for it hears
-    // `EADDRINUSE`(523), the answer the shipped conflict walk gives. `0xffff` is symmetric under the
+    // `EADDRINUSE`(523), the answer the reference conflict walk gives. `0xffff` is symmetric under the
     // byte swap the body applies, so the comparison is the one the body makes.
     let third = service(&mut rt, socket::CLS_HOSTSOCKET);
     call_many(&mut rt, open, third, &[socket::FAMILY_INET as u32, 0]).unwrap();
@@ -34012,7 +35700,7 @@ fn readable_and_writeable_answer_the_errno_in_r0_and_park_only_when_nothing_is_r
     );
 
     // The order of the two gates is pinned by running a *blank* callback block against a record that is
-    // still unopened: the shipped body tests the open bit first, so this answers 514. A host that tested
+    // still unopened: the documented behaviour tests the open bit first, so this answers 514. A host that tested
     // `pcb[+16]` first answers 0 and writes nothing — which is exactly what mutation M1 reddens.
     let blank = rsa_put(&mut rt, &[0u8; 28]);
     assert_eq!(
@@ -34049,7 +35737,7 @@ fn readable_and_writeable_answer_the_errno_in_r0_and_park_only_when_nothing_is_r
 }
 
 /// `AEECLSID_SockPort` — the class an applet names. `gICList`'s row for it is masked `0x0002`, so the
-/// shipped runtime answers only a module whose privilege word carries bit 1; this host does not read MIF
+/// reference runtime answers only a module whose privilege word carries bit 1; this host does not read MIF
 /// privilege words and answers it, the same treatment `AEECLSID_SMSMSG`'s constructor gate gets.
 #[test]
 fn the_app_visible_socket_is_born_and_refuses_the_face_of_a_local_record() {
@@ -34356,7 +36044,7 @@ fn the_socket_face_parks_its_own_block_and_cancel_takes_it_back() {
     assert_eq!(rt.cpu.mem.read_u32(face + 16).unwrap(), 0xaaaa_aaaa);
     assert_eq!(rt.cpu.mem.read_u32(face + 20).unwrap(), 0xbbbb_bbbb);
 
-    // The matching pair: the shipped hook clears the link it threaded out of plus the two words that named
+    // The matching pair: the reference hook clears the link it threaded out of plus the two words that named
     // it, and the face keeps reporting the pair it was given.
     assert_eq!(
         call_many(&mut rt, cancel, face, &[notify, user]).unwrap(),
@@ -34444,7 +36132,7 @@ fn the_socket_face_parks_its_own_block_and_cancel_takes_it_back() {
     );
 
     // A block on neither list is left exactly as the caller wrote it, even when its pair matches: that is
-    // the shipped `if (pcb[8])` — the hook, and with it every write, only runs for a block some
+    // the reference `if (pcb[8])` — the hook, and with it every write, only runs for a block some
     // registration actually armed.
     rt.cpu.mem.write_u32(face + 36, 0x1111_1111).unwrap();
     rt.cpu.mem.write_u32(face + 44, 0x2222_2222).unwrap();
@@ -34492,7 +36180,7 @@ fn the_socket_face_parks_its_own_block_and_cancel_takes_it_back() {
     assert_eq!(rt.cpu.mem.read_u32(face + 92).unwrap(), 0);
     assert_eq!(rt.cpu.mem.read_u32(face + 96).unwrap(), 0);
 
-    // What the slot leaves in r0 is the port's state byte. The `1` branch of the shipped body asks the net
+    // What the slot leaves in r0 is the port's state byte. The `1` branch of the documented behaviour asks the net
     // module, and this host links nothing at `[+108]`, so it answers the 0 that call was handed.
     rt.cpu.mem.write_u8(port + 176, 3).unwrap();
     assert_eq!(call_many(&mut rt, cancel, face, &[0, 0]).unwrap(), 3);
@@ -34552,7 +36240,7 @@ fn two_local_ports_hold_a_conversation_through_the_loopback_provider() {
     );
     assert_eq!(rt.cpu.mem.read_bytes(sink, 5).unwrap(), b"quoin");
     // `Close` releases the provider and clears `[+172]`, so the record stops being open — and the
-    // second close is the `EBADF` the shipped `IS_OPEN` gate gives.
+    // second close is the `EBADF` the reference `IS_OPEN` gate gives.
     assert_eq!(
         call_many(&mut rt, sock_method("Close"), client, &[]).unwrap(),
         0
@@ -34826,7 +36514,7 @@ fn a_dying_port_takes_its_queued_connect_block_out_of_the_queue() {
 /// `IAStream::Readable` (slot 2) at `log + 0/4/8` and `IAStream::Cancel` (slot 4) at
 /// `log + 0x10/0x14/0x18`. `Readable` answers `0x2a`, so a bridge that tail-calls it and a bridge that
 /// invents its own answer are two different numbers here. `Cancel` additionally copies the **block's
-/// `pfnCancel` word as it sees it** into `log + 0x1c` — that is the only witness that distinguishes
+/// `pfnCancel` word as it sees it** into `log + 0x1c` — that is the only record that distinguishes
 /// "clear the hook, then call" from "call, then clear", because anything the test reads afterwards
 /// has already been through both orders. Slots 0 and 1 are `bx lr` because the factory takes a
 /// reference on the way in. Every word was read back out of the encoding by hand; the literal is the ninth
@@ -34928,7 +36616,7 @@ fn a_bridged_source_hands_the_stream_the_runtimes_own_fire_leg() {
         "the stream's own reply was passed through"
     );
 
-    // The stream was asked in the shipped form: its own pointer, the runtime's fire leg, the block.
+    // The stream was asked in the reference form: its own pointer, the runtime's fire leg, the block.
     assert_eq!(
         rt.cpu.mem.read_u32(log).unwrap(),
         stream,
@@ -35128,7 +36816,7 @@ fn two_inet_datagram_ports_exchange_a_packet_through_the_provider() {
         call_many(&mut rt, sock_method("Bind"), server, &[to]).unwrap(),
         0
     );
-    // A sender has to be bound as well: the shipped `IsWriteable` answers `EINVAL` for a datagram
+    // A sender has to be bound as well: the reference `IsWriteable` answers `EINVAL` for a datagram
     // socket without the bound bit.
     let me = sock_addr(&mut rt, socket::FAMILY_INET, 0, 0x0100_007f);
     assert_eq!(
@@ -35227,7 +36915,10 @@ fn two_inet_stream_ports_connect_listen_accept_and_carry_bytes() {
     );
 
     let out = rt.cpu.mem.alloc(8, 4).unwrap();
-    rt.cpu.mem.write_bytes(out, b"ping\x00\x00\x00\x00").unwrap();
+    rt.cpu
+        .mem
+        .write_bytes(out, b"ping\x00\x00\x00\x00")
+        .unwrap();
     let wrote = call_many(&mut rt, sock_method("Write"), child, &[out, 4]).unwrap();
     let err = call_many(&mut rt, sock_method("GetLastError"), child, &[]).unwrap();
     assert_eq!(wrote, 4, "the write was refused with {err}");
@@ -35586,14 +37277,14 @@ fn a_negotiation_and_a_payload_complete_over_a_real_socket() {
     // call**, which is also the proof that a short read leaves the rest buffered: an earlier shape of
     // this host drained the session into the caller's buffer and threw away whatever did not fit. The
     // third entry asks for nothing, and a read with nothing left answers `EWOULDBLOCK` — negative, so
-    // the walk breaks on the same test the shipped body breaks on, with the two bytes it took.
+    // the walk breaks on the same test the documented behaviour breaks on, with the two bytes it took.
     let writev = abi::method_of("ISocket", "WriteV").unwrap();
     let readv = abi::method_of("ISocket", "ReadV").unwrap();
     let src = rsa_put(&mut rt, b"abcd");
     let out = rsa_put(&mut rt, &[0u8; 8]);
     let iov = rt.cpu.mem.alloc(16, 4).unwrap();
     // The `bgt` half of `ISSL_Socket_WriteV` first, on its own: a **zero-length first entry** is a
-    // satisfied write, so the shipped body's `n <= 0` test is what ends the walk here — the answer is 0
+    // satisfied write, so the documented behaviour's `n <= 0` test is what ends the walk here — the answer is 0
     // and no plaintext goes out at all. Under the other gate (`n < 0`, which is `ReadV`'s), the same
     // call would carry on into the second entry and send two bytes, so this separates the two break
     // tests without touching the session state.
@@ -35649,7 +37340,7 @@ fn a_negotiation_and_a_payload_complete_over_a_real_socket() {
     // scalar a second time. This payload is sent fresh, on purpose: how much of the last round stayed
     // buffered is a race between two records, and a stop test must not be argued from it. One entry of
     // eight is asked for over a stream that can hold at most six, so the first entry ends the walk with
-    // whatever had arrived; the witness that no second call happened is what the *second* entry leaves
+    // whatever had arrived; the record that no second call happened is what the *second* entry leaves
     // alone — its buffer keeps the caller's bytes and the face's error word at `+36` keeps the caller's
     // sentinel, whereas a second call would have had nothing to give and would have written
     // `EWOULDBLOCK` there.
@@ -35949,7 +37640,7 @@ fn loopback_pair(rt: &mut Runtime) -> (u32, u32) {
 
 /// One `AEECallback` block with the notify pair filled in — the only thing a socket source reads before
 /// it decides whether anything is waiting. `_AEECallback` puts `pfnNotify` at `+16` and `pNotifyData` at
-/// `+20`, which is what the shipped body's `a2[4]` test is reading.
+/// `+20`, which is what the documented behaviour's `a2[4]` test is reading.
 fn waiting_block(rt: &mut Runtime, pfn: u32, tag: u32) -> u32 {
     let pcb = rt.cpu.mem.alloc(28, 4).unwrap();
     rt.cpu.mem.write_u32(pcb + 16, pfn).unwrap();
@@ -36072,9 +37763,9 @@ fn a_socket_source_holds_both_references_and_starts_with_an_empty_chain() {
 }
 
 /// `SourceFromSocket` has no test of its own in front of anything: `(**a2)(a2)` — the socket's `AddRef` —
-/// is the first thing the shipped body does with the caller's pointer. So a null socket is a load from
+/// is the first thing the documented behaviour does with the caller's pointer. So a null socket is a load from
 /// address zero on a handset, and it is left as one here rather than turned into a code nobody published.
-/// The order is the witness: the abort lands *before* the caller's slot is written.
+/// The order is the record: the abort lands *before* the caller's slot is written.
 #[test]
 fn a_null_socket_is_the_load_from_zero_the_body_makes() {
     let mut rt = Runtime::new();
@@ -36138,7 +37829,7 @@ fn a_socket_source_read_is_the_sockets_own_read() {
 }
 
 /// The chain itself: each registration hands back the head that was there, links the caller's block
-/// through its own `pNext`, and leaves the source in the block's `pCancelData` — the field the shipped
+/// through its own `pNext`, and leaves the source in the block's `pCancelData` — the field the reference
 /// unregister hook reads to find which source a block waits on. One socket registration covers the whole
 /// list, and the wake drains it head-first, clearing the hook each popped block carries.
 #[test]
@@ -36179,7 +37870,7 @@ fn the_socket_source_chain_hangs_behind_one_socket_registration() {
         "head-inserted, both still waiting while the ring holds nothing"
     );
 
-    // What the shipped body would have written into `pfnCancel` is a function of the runtime, so this
+    // What the documented behaviour would have written into `pfnCancel` is a function of the runtime, so this
     // host leaves the slot alone — but the pop still clears it, which is `SockSource_ReadableCB`'s
     // `v1[2] = 0`. Filling it here is the only way to watch that write happen.
     for block in [a, b] {
@@ -36282,7 +37973,7 @@ fn the_socket_source_registers_once_and_withdraws_with_its_last_callback() {
     let addref = abi::method_of("ISource", "AddRef").unwrap();
     let release = abi::method_of("ISource", "Release").unwrap();
     assert_eq!(call_many(&mut rt, addref, src, &[]).unwrap(), 2);
-    // The hooks the shipped body would have stored are filled here so the clear is visible: `Release`
+    // The hooks the documented behaviour would have stored are filled here so the clear is visible: `Release`
     // runs `CALLBACK_CANCEL` over the list, and `SockSource_ReadbleCancel` sets `pcb[+8] = 0` as its
     // first act — it clears the hook, it does not call it.
     for block in [a, b] {
@@ -36330,7 +38021,7 @@ fn the_socket_source_registers_once_and_withdraws_with_its_last_callback() {
     );
 }
 
-/// The `CALLBACK_CANCEL` the shipped body runs at the top of every registration is not only about this
+/// The `CALLBACK_CANCEL` the documented behaviour runs at the top of every registration is not only about this
 /// host's own chain. If the block was armed by somebody else — a hook the caller put in `pfnCancel` —
 /// that hook is run with the context the block carries, and the slot is cleared. It is the same half the
 /// stream bridge answers, and it is what stops one block waiting on two owners at once.
@@ -36346,7 +38037,7 @@ fn arming_a_socket_callback_runs_the_hook_the_block_already_carried() {
 
     let pcb = waiting_block(&mut rt, pfn, 0xcccc);
     // A hook nobody but the caller put there. Its context word is deliberately *not* the block: the
-    // shipped `CALLBACK_Cancel` hands the hook the block (`v1(pcb)`), and only the hook itself then reads
+    // reference `CALLBACK_Cancel` hands the hook the block (`v1(pcb)`), and only the hook itself then reads
     // `pcb[+12]` to find its source — so `0xbeef` here must reach the stub, and `pcb` must not.
     rt.cpu.mem.write_u32(pcb + 8, pfn).unwrap();
     rt.cpu.mem.write_u32(pcb + 12, 0xbeef).unwrap();
@@ -36439,15 +38130,22 @@ fn the_device_bitmaps_update_is_the_bodys_fall_through() {
         )
         .unwrap(),
         g::AEE_SUCCESS,
-        "a device bitmap with no display device and no parent reaches the function's last line"
+        "the device bitmap's face answers SUCCESS"
     );
+    // `IBitmapDev_Update` is documented as "This function copies the bitmap to its associated
+    // display **synchronously**". The old assertion here said it copied nothing, on the reading
+    // that a handset's body only copies when it has both a display device and a parent and this
+    // host models neither — which made the slot a SUCCESS that took no screen, so a pack
+    // presenting through this face had every frame go unrecorded. The bitmap this face was
+    // obtained from *is* the one the display is showing, so the copy has somewhere to land.
     assert_eq!(
-        rt.display.presentations, presentations,
-        "and that line copies nothing: the presentation count is not this slot's to move"
+        rt.display.presentations,
+        presentations + 1,
+        "so the call takes the screen it was asked to copy to"
     );
     // `Update` takes **one** argument. `bDefer` belongs to `IDisplay::Update` (slot 7), where it selects
     // `AEE_ResumeCallback` over a synchronous wake; reading it into this slot would make the host answer
-    // a question the shipped body never asks, so a second word in the caller's registers is ignored.
+    // a question the documented behaviour never asks, so a second word in the caller's registers is ignored.
     rt.cpu.r[1] = 1;
     assert_eq!(
         call_many(
@@ -36461,13 +38159,15 @@ fn the_device_bitmaps_update_is_the_bodys_fall_through() {
         "with or without a value in the slot after the object, the same line runs"
     );
     assert_eq!(
-        rt.display.presentations, presentations,
-        "and neither one of them presents"
+        rt.display.presentations,
+        presentations + 2,
+        "and each of them copies: the word after the object is not a defer flag, so both calls \
+         take their own screen rather than coalescing into one"
     );
 }
 
 /// `AEEHelperFuncs::getlasterror` is `aee_getlasterror` (eighteen bytes; word 99 of
-/// the shipped table, at offset 392 — the same field the header publishes as
+/// the reference table, at offset 392 — the same field the header publishes as
 /// `int (*getlasterror)(int errRegion)`). Region 0 is `ERR_REGION_FLOAT`, and it is the only region the
 /// header's own `GETLASTFPERROR()` ever passes: for it the body reads the C library's error word through
 /// `__rt_errno_addr` and hands the word back unchanged — no sign handling, no bias, and nothing cleared
@@ -36498,7 +38198,7 @@ fn getlasterror_answers_the_error_word_and_not_a_refusal() {
 fn the_ssl_socket_vector_slots_disagree_the_way_their_bodies_do() {
     let mut rt = Runtime::new();
     let ssl = service(&mut rt, g::AEECLSID_SSL_313);
-    // The face is adopted by the `QueryInterface` that hands it out, which is the shipped object's own
+    // The face is adopted by the `QueryInterface` that hands it out, which is the reference object's own
     // one-liner for `AEECLSID_SOCKET`.
     let qi = abi::method_of("ISSL", "QueryInterface").unwrap();
     let out = rsa_word(&mut rt, 0);
@@ -36763,7 +38463,7 @@ fn the_ssl_faces_ioctl_answers_each_branch_it_switches_on() {
     );
 
     // 4102 with `AEECLSID_SOCKET`: the face comes back, and the record is referenced through its own
-    // vtable — which moves the count at the shipped `[+4]`. The face at `+20` shares that number
+    // vtable — which moves the count at the reference `[+4]`. The face at `+20` shares that number
     // through its `[+4]` self word, so one record, one number.
     rt.cpu.mem.write_u32(pair, g::AEECLSID_SOCKET).unwrap();
     rt.cpu.mem.write_u32(pair + 4, 0xdead).unwrap();
@@ -37165,7 +38865,7 @@ fn the_ssl_close_legs_run_the_parked_pair_and_decline_for_anyone_elses_record() 
 /// The delivered queue refuses an un-armed block — a `pfnNotify` of zero is not a thing to resume —
 /// and the shell's own wrappers only name the eight `AEE_SCB_*` events, so a type past the range
 /// queues nothing at all. ⚠ Both marks are on a `void` slot, so this host keeps answering `0`: the
-/// shell's leg is a bridge into the OEM layer and is not on this box, and the readable in-AEE twin
+/// shell's leg is a bridge into the platform layer and is not on this box, and the readable in-AEE twin
 /// hands back its queue's yes/no. What is reproduced is who gets kept and what their block says.
 #[test]
 fn the_system_callback_door_keeps_only_an_armed_block_in_range_and_the_leg_takes_it_back() {
@@ -37629,7 +39329,7 @@ fn an_ssl_readiness_registration_wakes_only_when_the_socket_under_it_has_bytes()
         "nothing has arrived, so nobody was woken"
     );
 
-    // The peer sends: the shipped model fires the receiver's readable chain, which drains the record off
+    // The peer sends: the reference model fires the receiver's readable chain, which drains the record off
     // it and queues the notify the registration carried.
     let payload = rsa_put(&mut rt, b"hey");
     assert_eq!(
@@ -37715,7 +39415,7 @@ fn the_ssl_faces_writeable_registration_parks_the_face_until_the_writer_gets_roo
     );
     assert_eq!(rt.ssl[&ssl].armed_read, None);
 
-    // The peer reads: the ring that was full now empties, which is the shipped condition for waking the
+    // The peer reads: the ring that was full now empties, which is the reference condition for waking the
     // writer.
     let sink = rsa_put(&mut rt, &[0u8; socket::RING]);
     let read = sock_method("Read");
@@ -38096,7 +39796,7 @@ fn the_ssl_faces_cancel_clears_the_pair_it_names_and_both_when_it_names_none() {
 }
 
 /// The same `Cancel` over a socket this host built: there is no `Cancel` slot to ask there, so the
-/// registration comes off the socket's chain here instead — which is what the shipped forward achieves.
+/// registration comes off the socket's chain here instead — which is what the reference forward achieves.
 /// Withdrawn is not the same as never parked: bytes that arrive afterwards find an empty chain and wake
 /// nobody.
 #[test]
@@ -38164,14 +39864,14 @@ fn the_ssl_faces_cancel_withdraws_its_registration_from_a_socket_this_host_built
     assert_eq!(rt.cpu.mem.read_u32(cell).unwrap(), 0, "and wake nobody");
 }
 
-/// Two words read back as the `double` the shipped code stored them as.
+/// Two words read back as the `double` the platform code stored them as.
 fn posdet_double(mem: &crate::mem::Mem, at: u32) -> f64 {
     let lo = u64::from(mem.read_u32(at).unwrap());
     let hi = u64::from(mem.read_u32(at + 4).unwrap());
     f64::from_bits((hi << 32) | lo)
 }
 
-/// One field of a shipped struct, written at the width the ABI tables give for it. The delivered
+/// One field of a reference struct, written at the width the ABI tables give for it. The delivered
 /// `IPosDet` reads its inputs as `LDRB`/`LDRH`/`LDR` per field, so a test that wrote every one as a
 /// word would put its value in the neighbour's byte and still pass if the host ignored that neighbour.
 fn posdet_poke(rt: &mut Runtime, at: u32, table: &str, name: &str, value: u32) {
@@ -38202,7 +39902,7 @@ fn posdet_gps(rt: &mut Runtime, fields: &[(&str, u32)]) -> u32 {
 }
 
 /// An `AEEPositionInfoEx` the way the delivered code leaves it reachable: 84 bytes, the align-4
-/// layout the shipped Thumb code reads (its `Heading` sits at `+28` and is written as two words),
+/// layout the reference Thumb code reads (its `Heading` sits at `+28` and is written as two words),
 /// `dwSize` filled in, and the rest set to a recognisable pattern so a field the body does not write
 /// can be told from one it wrote with zeros.
 fn posdet_position(rt: &mut Runtime, size: u32, flags: u32) -> u32 {
@@ -38514,7 +40214,7 @@ fn the_position_detector_converts_a_fix_without_asking_anything() {
         "nothing was written"
     );
 
-    // The five fields whose shipped arithmetic lands on an exact number.
+    // The five fields whose reference arithmetic lands on an exact number.
     let filled = posdet_gps(
         &mut rt,
         &[
@@ -38566,7 +40266,7 @@ fn the_position_detector_converts_a_fix_without_asking_anything() {
     );
 
     // Latitude and longitude share one divisor, and the conversion is **signed**, which is what the
-    // southern and western halves are made of. ⚠ The divisor is not `2^25/180`: the shipped code
+    // southern and western halves are made of. ⚠ The divisor is not `2^25/180`: the platform code
     // divides by `186413.51111111`, that ratio truncated at the eighth decimal, and the last units of
     // the quotient show it. Both spellings are pinned so a later "just do the maths" edit cannot pass
     // this test by being more correct than the binary.
@@ -38614,7 +40314,7 @@ fn the_position_detector_reports_uncertainty_only_where_its_table_reaches() {
     let det = new_service(&mut rt, g::AEECLSID_POSDET_312);
     let at = |name: &str| abi::offset_of("AEEPositionInfoEx_ALIGN_32", name).unwrap();
 
-    // Entry 31 of the shipped table is `-1.0`, which is the device's own "no uncertainty available",
+    // Entry 31 of the reference table is `-1.0`, which is the device's own "no uncertainty available",
     // and the body reports it as a value while taking the valid bit away. Entry 20 is 512 metres and
     // does carry the bit.
     for (index, expected, flagged) in [(20u32, 512.0f64, true), (31, -1.0, false)] {
@@ -38642,7 +40342,7 @@ fn the_position_detector_reports_uncertainty_only_where_its_table_reaches() {
 
     // `wVerUnc` is range-checked by the body (`CMP R0,#0x20; BCS`). The two byte indices are not: a
     // `bHorUnc` of 200 walks off the end of the table into the debug strings that follow it in the
-    // shipped image. There is no witness for what such a reading means, so the host leaves the
+    // guest image. There is no record for what such a reading means, so the host leaves the
     // field's own bytes alone and says so.
     let past = posdet_gps(
         &mut rt,
@@ -38872,7 +40572,7 @@ fn the_case_folding_library_lowers_the_latin1_letters_the_shipped_table_covers()
         "and the mirror raises `à` while still holding `÷` back"
     );
 
-    // The comparison side: a Latin-1 pair that ASCII folding calls different, and the shipped table
+    // The comparison side: a Latin-1 pair that ASCII folding calls different, and the reference table
     // calls the same byte. `strnicmp` folds both sides, and its answer is the difference of the
     // folded bytes rather than a bare sign.
     let left = bytes_at(&mut rt, b"\xc0\x41");
@@ -39443,7 +41143,7 @@ fn the_numeric_library_cuts_toward_zero_and_scales_the_wgs84_count() {
         "a value below zero cuts to zero rather than to -1"
     );
     assert_eq!(dbl(&mut rt, "utrunc", 4_294_967_295.5), 0xffff_ffff);
-    // ⚠ What the answer is for a NaN or a magnitude beyond the type has no witness here: `dfix` and
+    // ⚠ What the answer is for a NaN or a magnitude beyond the type has no record here: `dfix` and
     // `dfixu` are the tool chain's own runtime, defined by no member of this drop. The host's
     // saturating cast answers these two ways, and that choice is the host's.
     assert_eq!(
@@ -39485,8 +41185,8 @@ fn the_numeric_library_cuts_toward_zero_and_scales_the_wgs84_count() {
 
     // `floattowstr`'s entire body is a pointer check and `return OEM_FloatToWStr(a1, a2, a3, a4);`,
     // and `OEM_FloatToWStr` is referenced by two members and defined by none of the 235. The host has
-    // no OEM layer to read a conversion off, so it refuses by name — answering FALSE, which is also
-    // what the shipped body falls back to when its own check refuses, and formatting nothing.
+    // no platform layer to read a conversion off, so it refuses by name — answering FALSE, which is also
+    // what the documented behaviour falls back to when its own check refuses, and formatting nothing.
     let (lo, hi) = pair(1.5);
     let buf = rt.cpu.mem.alloc(16, 4).unwrap();
     assert_eq!(
@@ -39645,7 +41345,7 @@ fn the_float_library_answers_the_pair_and_the_zero_pair_the_body_loads() {
     assert_eq!(op(&mut rt, 2.5, 4.0, g::FO_MUL), 10.0);
     assert_eq!(op(&mut rt, 7.0, 2.0, g::FO_DIV), 3.5);
 
-    // ⚠ Division is IEEE because the shipped body only calls `ddiv`. The published *static* header
+    // ⚠ Division is IEEE because the documented behaviour only calls `ddiv`. The published *static* header
     // spells the same macro `(v2 ? v1 / v2 : 0)`, which would answer zero here; the header is the
     // non-delivered build path, so the body wins and `1.0 / 0.0` is +inf.
     assert_eq!(
@@ -39671,7 +41371,7 @@ fn the_float_library_answers_the_pair_and_the_zero_pair_the_body_loads() {
 
     // Everything outside those five codes answers the zero pair — including the comparison codes
     // 4..8 (which belong to `f_cmp`) and anything at or above ten. Passing a sentinel high half for
-    // `v1` is the witness that the body *loads* both halves rather than leaving `r1` alone.
+    // `v1` is the record that the body *loads* both halves rather than leaving `r1` alone.
     for code in [g::FO_CMP_L, g::FO_CMP_GE, 10, 0xffff_ffff] {
         let (alo, _ahi) = bits(1.5);
         let (blo, bhi) = bits(2.5);
@@ -39724,7 +41424,7 @@ fn the_float_library_answers_the_pair_and_the_zero_pair_the_body_loads() {
         "r1 still holds v1's high half, which is what the body leaves"
     );
     // For NaN the flags come from the runtime that is not on this box, so no handset answer is
-    // witnessed; the host gives the IEEE reading, and every one of the five is false.
+    // recorded; the host gives the IEEE reading, and every one of the five is false.
     for code in [
         g::FO_CMP_L,
         g::FO_CMP_LE,
@@ -39940,7 +41640,7 @@ fn the_error_returning_helpers_answer_through_the_callers_slot() {
     );
 }
 
-/// The three decimal conversions: `STRTOD`, `WSTRTOFLOAT` and `FASSIGN_STR`. Their shipped bodies all
+/// The three decimal conversions: `STRTOD`, `WSTRTOFLOAT` and `FASSIGN_STR`. Their platform routines all
 /// end in a jump this box has no code behind (`_softfp_strtod`, `OEM_WStrToFloat` — `who_defines` reads
 /// defined=0 for both), so what is pinned here is the half that is *not* the host's arithmetic: the
 /// end-pointer the caller reads back, the 19-unit window the widening imposes, and the NULL branch the
@@ -40028,7 +41728,7 @@ fn a_pack_cancels_a_socket_source_registration_through_the_address_it_was_handed
 
 /// A source's release cancels its chain and **leaves** the dispatcher's queue alone.
 ///
-/// None of the three shipped bodies touches the shell's resume list: `SockSource_Readable` opens with
+/// None of the three platform routines touch the shell's resume list: `SockSource_Readable` opens with
 /// `CALLBACK_Cancel`, the pack's own `CALLBACK_CANCEL` runs the hook, and `SockSource_Release` runs
 /// it once per block on the chain — and all three land in `SockSource_ReadbleCancel`, which unlinks,
 /// clears `cb[+8]` and cancels the socket registration. The address a wake queues is the caller's own
@@ -40598,6 +42298,37 @@ fn each_egl_context_keeps_its_own_gl_state() {
 }
 
 #[test]
+fn a_context_switch_keeps_the_profile_gl_caps() {
+    let mut profile = crate::device::DeviceProfile::standard();
+    profile.gl = crate::device::GlCaps::w64sa();
+    let mut rt = Runtime::with_device(profile);
+    let a = rt.egl.create_context(&rt.cpu.mem, 0, 0).unwrap();
+    let b = rt.egl.create_context(&rt.cpu.mem, 0, 0).unwrap();
+    let mut mem = Mem::new();
+    mem.set_heap(crate::layout::HEAP_BASE, crate::layout::HEAP_LIMIT);
+    let mut egl = crate::gles::Egl::new();
+    let max_texture_size = |rt: &mut Runtime, mem: &mut Mem, egl: &mut crate::gles::Egl| -> u32 {
+        let out = mem.alloc(4, 4).unwrap();
+        rt.gl
+            .method("IGL", "GetIntegerv", &[0x0D33, out], mem, egl)
+            .unwrap();
+        mem.read_u32(out).unwrap()
+    };
+
+    // Host defaults to 2048; the carrier profile reports 1024 from its own Q3D driver.
+    assert_eq!(max_texture_size(&mut rt, &mut mem, &mut egl), 1024);
+    assert!(rt.egl.make_current(0, 0, a));
+    rt.sync_gl_context();
+    assert!(rt.egl.make_current(0, 0, b));
+    rt.sync_gl_context();
+    assert_eq!(
+        max_texture_size(&mut rt, &mut mem, &mut egl),
+        1024,
+        "a fresh context must still answer with the device profile's limits"
+    );
+}
+
+#[test]
 fn bind_tex_image_request_reaches_the_current_gl_texture() {
     let mut rt = Runtime::new();
     let dpy = 0x5000;
@@ -40823,9 +42554,9 @@ fn an_html_viewer_answers_its_own_slots_and_its_document() {
         "the same length query on an attribute writes nothing either"
     );
 
-    // View state is the page's own state in the shipped reader's format — `<scroll>,<focuspos>`
+    // View state is the page's own state in the reference reader's format — `<scroll>,<focuspos>`
     // plus the forms' words — written out by `GetViewState` itself. The header's "including zero
-    // terminator" and the shipped body disagree, and the body wins, the
+    // terminator" and the documented behaviour disagree, and the body wins, the
     // way it does for `aee_strcmp`: the answer is the string's own length, and the copy is
     // `aee_strlcpy` — at most `cb - 1` characters and the terminator.
     let state = rt.cpu.mem.alloc(16, 1).unwrap();
@@ -41107,6 +42838,87 @@ fn an_html_viewer_paints_the_picture_a_data_uri_carries() {
     assert_eq!(rt.widgets.html_image_cache_len(html).unwrap(), before);
 }
 
+/// The viewer owes its own repaint. `IHtmlViewer::Redraw` says the application "does not normally
+/// have to call this function to ensure that the screen has been updated after changes have been
+/// made to the content or options of the viewer", so a pack that only sets a page and then presents
+/// the frame must still see it. A handset collects that in its screen-invalidate pass; this host has
+/// none, so the page is painted at `IDisplay::Update` — the one point late enough to survive a pack
+/// that draws its own frame after the page, which is the shape a notification dialog has.
+#[test]
+fn an_html_viewer_paints_the_page_it_was_given_when_the_frame_is_presented() {
+    let mut rt = Runtime::new();
+    let html = new_service(&mut rt, g::AEECLSID_HTML);
+    let slot = |name: &str| abi::method_of("IHtmlViewer", name).unwrap();
+    let set_rect = abi::method_of("IControl", "SetRect").unwrap();
+    let update = abi::method_of("IDisplay", "Update").unwrap();
+
+    let screen = new_display(&mut rt);
+    assert_ne!(screen, 0, "a display to draw into");
+    rt.display.clear(&mut rt.cpu.mem, screen).unwrap();
+    let rect = put_rect(&mut rt, 0, 0, 64, 40);
+    call_many(&mut rt, set_rect, html, &[rect]).unwrap();
+
+    let text = b"<p>hello</p>";
+    let at = rt.cpu.mem.alloc(text.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(at, text).unwrap();
+    call_many(&mut rt, slot("SetData"), html, &[at, text.len() as u32]).unwrap();
+
+    // Setting the page paints nothing by itself, which is what lets a pack draw its own frame
+    // afterwards without having the page land underneath it.
+    assert_eq!(
+        ink_in(&rt, (0, 0, 64, 40)),
+        0,
+        "SetData alone draws nothing"
+    );
+    assert_eq!(
+        rt.widgets.html_views_to_paint().len(),
+        1,
+        "the page is owed exactly one paint"
+    );
+
+    call_many(&mut rt, update, screen, &[1]).unwrap();
+    assert!(
+        ink_in(&rt, (0, 0, 64, 40)) > 0,
+        "the page reached the screen on the frame the pack presented"
+    );
+    assert!(
+        rt.widgets.html_views_to_paint().is_empty(),
+        "the debt is paid once, so the next frame repaints nothing"
+    );
+}
+
+/// `IHtmlViewer::SetData` promises its stream is in "an 8-bit encoding compatible with the native
+/// encoding of the device", so the page is decoded with the word the device publishes rather than
+/// assumed to be UTF-8. The standard device publishes `AEE_ENC_S_JIS`, and `Runtime::new` passes it
+/// on before any page can be set.
+#[test]
+fn an_html_viewer_reads_its_page_in_the_devices_encoding() {
+    let mut rt = Runtime::new();
+    let html = new_service(&mut rt, g::AEECLSID_HTML);
+    let slot = |name: &str| abi::method_of("IHtmlViewer", name).unwrap();
+
+    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("<p>続行不能</p>");
+    let at = rt.cpu.mem.alloc(bytes.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(at, &bytes).unwrap();
+    call_many(&mut rt, slot("SetData"), html, &[at, bytes.len() as u32]).unwrap();
+
+    let doc = rt.widgets.html_document(html).unwrap();
+    let text: String = doc.runs.iter().map(|run| run.text.as_str()).collect();
+    assert_eq!(
+        text, "続行不能",
+        "the device says Shift-JIS, so that is how it reads"
+    );
+
+    // The same bytes without that word are not the sentence: the device is what decides, not a
+    // guess about which decode looks more plausible.
+    let as_utf8: String = crate::web::html::Document::parse_as(&bytes, "")
+        .runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect();
+    assert_ne!(as_utf8, "続行不能");
+}
+
 #[test]
 fn an_html_viewer_paints_the_controls_of_a_form() {
     let mut rt = Runtime::new();
@@ -41283,8 +43095,17 @@ fn a_span_reaches_the_display_as_the_word_it_is() {
         &[],
     )
     .unwrap();
-    let drawn: Vec<&str> = rt.display.runs.iter().map(|run| run.text.as_str()).collect();
-    assert_eq!(drawn, vec!["AB"], "the display was handed UTF-16, not UTF-8");
+    let drawn: Vec<&str> = rt
+        .display
+        .runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect();
+    assert_eq!(
+        drawn,
+        vec!["AB"],
+        "the display was handed UTF-16, not UTF-8"
+    );
 }
 
 /// Redraw `html` into a cleared 64x16 rectangle whose two background items are colours the page's
@@ -41316,13 +43137,7 @@ fn paint_page_in(rt: &mut Runtime, html: u32, dx: i16, dy: i16) {
         &[rect],
     )
     .unwrap();
-    call_many(
-        rt,
-        abi::method_of("IControl", "Redraw").unwrap(),
-        html,
-        &[],
-    )
-    .unwrap();
+    call_many(rt, abi::method_of("IControl", "Redraw").unwrap(), html, &[]).unwrap();
 }
 
 #[test]
@@ -41850,7 +43665,7 @@ fn wake(rt: &mut Runtime, ctl: u32) {
 #[test]
 fn a_box_is_ticked_by_select_and_the_state_travels_in_the_focus_report() {
     let mut rt = Runtime::new();
-    // The state string serializes the forms, as the shipped `DoxFormIter` walk does, so the
+    // The state string serializes the forms, as the reference `DoxFormIter` walk does, so the
     // page has to have one for the tick to have somewhere to travel in.
     let html = html_with(
         &mut rt,
@@ -42333,7 +44148,7 @@ fn dragging_the_page_scrolls_it_without_following_what_it_started_on() {
 #[test]
 fn a_textarea_takes_a_line_break_and_the_up_arrow_walks_it() {
     let mut rt = Runtime::new();
-    // The state string serializes the forms, as the shipped `DoxFormIter` walk does, so the
+    // The state string serializes the forms, as the reference `DoxFormIter` walk does, so the
     // textarea sits inside one.
     let html = html_with(
         &mut rt,
@@ -42468,7 +44283,7 @@ fn the_caret_is_drawn_only_while_its_field_holds_the_focus() {
     rt.cpu.mem.write_bytes(at, text).unwrap();
     call_many(&mut rt, slot("SetData"), html, &[at, text.len() as u32]).unwrap();
 
-    // One keystroke puts the caret after the two characters the page shipped, then one more.
+    // One keystroke puts the caret after the two characters the page reference, then one more.
     call_many(&mut rt, evt, html, &[g::EVT_CHAR, 'c' as u32, 0]).unwrap();
     call_many(&mut rt, redraw, html, &[]).unwrap();
 
@@ -42715,7 +44530,7 @@ fn a_reset_clears_the_document_and_leaves_the_control_dark() {
     )
     .unwrap();
 
-    // The shipped `Reset` frees the document (`Dox_Reset`), clears the base URL
+    // The reference `Reset` frees the document (`Dox_Reset`), clears the base URL
     // (`Dox_SetUrl(dox, 0)`) and drops out of active mode all at once
     //.
     call_many(&mut rt, slot("Reset"), html, &[]).unwrap();
@@ -42756,7 +44571,7 @@ fn an_inactive_viewer_takes_no_event() {
     let html = html_with(&mut rt, b"<p><a href=x>AB</a></p>");
     let evt = abi::method_of("IControl", "HandleEvent").unwrap();
 
-    // Nobody called `SetActive`: the shipped door refuses everything — keys, characters, pen —
+    // Nobody called `SetActive`: the reference door refuses everything — keys, characters, pen —
     // until the pack opens it.
     assert_eq!(
         call_many(&mut rt, evt, html, &[g::EVT_KEY, g::AVK_RIGHT, 0]).unwrap(),
@@ -42801,7 +44616,7 @@ fn a_stop_while_a_picture_is_in_flight_says_the_load_did_not_finish() {
 
     // `Stop` cancels the load in flight, and the cancel is what the caller hears:
     // `HVN_DONE` with `nDone = AEE_EINCOMPLETEITEM` — "the load did not finish" — which the
-    // shipped `IHtmlViewer_Cancel` posts and no `HVP_*` flag gates
+    // reference `IHtmlViewer_Cancel` posts and no `HVP_*` flag gates
     //.
     call_many(&mut rt, slot("Stop"), html, &[]).unwrap();
     assert_eq!(rt.cpu.mem.read_u32(state + 4).unwrap(), g::HVN_DONE);
@@ -42825,7 +44640,7 @@ fn the_option_slots_carry_the_shipped_pool_and_its_quirks() {
     let slot = |name: &str| abi::method_of("IHtmlViewer", name).unwrap();
     let out = rt.cpu.mem.alloc(4, 4).unwrap();
 
-    // An id outside the whitelist is refused without a write, on both doors — the shipped
+    // An id outside the whitelist is refused without a write, on both doors — the reference
     // setter answers 20 for it and so does the getter.
     let before = rt.cpu.mem.read_u32(out).unwrap();
     assert_eq!(
@@ -42862,7 +44677,7 @@ fn the_option_slots_carry_the_shipped_pool_and_its_quirks() {
     // The same constraint from below, which only a signed read can reach: `DoxConstrain` takes an
     // `int`, so -1 — the word a pack writes when it means "whatever the
     // default is" — is 0. Clamping the raw `u32` instead would answer the upper bound, the one
-    // direction the shipped body cannot go.
+    // direction the documented behaviour cannot go.
     call_many(
         &mut rt,
         slot("SetOption"),
@@ -42883,7 +44698,7 @@ fn the_option_slots_carry_the_shipped_pool_and_its_quirks() {
         "a negative count is the lower bound, not the upper one"
     );
 
-    // The string options answer the getter with the same `EUNSUPPORTED` — the shipped getter's
+    // The string options answer the getter with the same `EUNSUPPORTED` — the reference getter's
     // pool is the six numeric ids and nothing else.
     let media = rt.cpu.mem.alloc(12, 1).unwrap();
     rt.cpu.mem.write_bytes(media, b"text/html\0").unwrap();
@@ -42905,9 +44720,9 @@ fn the_option_slots_carry_the_shipped_pool_and_its_quirks() {
         g::AEE_EUNSUPPORTED
     );
 
-    // `HVOPT_PTR_IWEB` is gated on a pointer the host knows — the shipped gate is a
+    // `HVOPT_PTR_IWEB` is gated on a pointer the host knows — the reference gate is a
     // `QueryInterface` the handset runs on the object — and
-    // its getter writes the pointer and *then* answers `EUNSUPPORTED`, which is the shipped
+    // its getter writes the pointer and *then* answers `EUNSUPPORTED`, which is the reference
     // body's own quirk ().
     assert_eq!(
         call_many(
@@ -43700,7 +45515,7 @@ fn a_rightward_marquee_enters_from_the_other_edge() {
     );
 }
 
-/// `IDisplay_CreateDIBitmap` hands `w` and `h` straight to `DIB_New`: the shipped 3.1.2 wrapper is
+/// `IDisplay_CreateDIBitmap` hands `w` and `h` straight to `DIB_New`: the reference 3.1.2 wrapper is
 /// `return DIB_New(a3, a4, a5, 0)` with no substitution, and `DIB_NewEx` keys the pixel pointer on
 /// `w * h` rather than on the depth. Asking with both zero names
 /// an empty DIB, not the screen.
@@ -43743,7 +45558,7 @@ fn start_applet_reaches_a_class_a_library_module_owns() {
     let app = fake_module(&mut rt);
     let lib = fake_library(&mut rt, 0x0107_f149);
     assert_ne!(app.cls, lib.cls);
-    // The app's module does not own the library's class, and a shipped module says so by handing the
+    // The app's module does not own the library's class, and a guest module says so by handing the
     // class back to the shell — which this host answers as a refusal rather than a cycle.
     let refuse = arm_code(&mut rt, &[0xe3a0_0001, 0xe12f_ff1e]); // mov r0, #AEE_EFAILED ; bx lr
     rt.cpu.mem.write_u32(app.mvtbl + 8, refuse).unwrap();
@@ -43754,7 +45569,10 @@ fn start_applet_reaches_a_class_a_library_module_owns() {
         g::AEE_SUCCESS,
         "the class has to be looked up among the loaded modules, not only the app's own"
     );
-    assert_eq!(rt.applet, lib.applet, "the library's applet is the one running");
+    assert_eq!(
+        rt.applet, lib.applet,
+        "the library's applet is the one running"
+    );
     assert_eq!(rt.app_cls, lib.cls);
     // The registry follows the switch: the next ask for that class resolves to the module that is
     // now running, not to the app's.
@@ -43768,7 +45586,7 @@ fn start_applet_reaches_a_class_a_library_module_owns() {
 }
 
 /// `AEECLSID_Port1Sensor` (0x0104192d) is Brew MP's sensor port: `AEEPort1Sensor.bid` names the class
-/// and the header gives it nine slots. A shipped pack asks for it by name and, when the request
+/// and the header gives it nine slots. A guest pack asks for it by name and, when the request
 /// fails, prints `FAILED to Create IPort1 Object`.
 ///
 /// Over that port runs the Sensors Messaging Protocol (80-VF213-1 D, §2 and Table 4-1): ASCII
@@ -44083,7 +45901,7 @@ fn the_sensor_utility_builds_the_requests_the_protocol_defines() {
     assert_eq!(text, "set");
     assert_eq!(need as usize, "set,accelx=40".len() + 1);
 
-    // A NULL buffer is answered the shipped module's way — the required size, `AEE_SUCCESS` — so a
+    // A NULL buffer is answered the guest module's way — the required size, `AEE_SUCCESS` — so a
     // caller that sized its buffer that way works here too. A NULL struct pointer or a count of
     // zero is the module's `AEE_EBADPARM`.
     let need = rt.cpu.mem.alloc(4, 4).unwrap();
@@ -44375,7 +46193,7 @@ fn the_sensor_utility_walks_a_response_the_way_the_header_documents() {
 
 /// `ISensorUtil_GetValueByDataType` — the "lightweight alternative to the iterator based API's" —
 /// and `IsProtocolSupported`, whose accepted name is the one place in this file that is inferred
-/// rather than read out of a shipped artefact.
+/// rather than read out of a reference artefact.
 #[test]
 fn the_sensor_utility_reads_one_value_out_of_a_response() {
     let mut rt = Runtime::new();
@@ -44496,7 +46314,7 @@ fn the_sensor_utility_reads_one_value_out_of_a_response() {
 
 /// `AEECLSID_MemCache1` — Brew MP's cache maintenance service.
 ///
-/// The class is the most-named thing in the corpus that the host did not serve: 139 of 1041 packs
+/// The class is the most-named thing in the sample set that the host did not serve: 139 of many packs
 /// name it, and 19 name it and nothing else. Its whole body is five slots, and the reason they are
 /// answerable at all is that this host has no cache — the memory a pack writes is the memory the
 /// emulated CPU fetches, which is the invariant `ClearCache` exists to restore on a real handset.
@@ -44614,7 +46432,7 @@ fn the_cache_service_has_nothing_to_maintain() {
 /// `.mif` manifests — so what it serves is the registry before anyone registers: the root, and
 /// nothing under it.
 ///
-/// The class is the second-most-named thing in the corpus the host did not serve (132 of 1041
+/// The class is the second-most-named thing in the sample set the host did not serve (132 of 1041
 /// packs), and the only one of those 132 that the host needed a *tree* for. The tree is the point of
 /// the test: the root answers, and every key below it is a setting no store owns.
 #[test]
@@ -45082,7 +46900,7 @@ fn a_vector_model_lets_a_listener_take_itself_off() {
 }
 
 /// `ValueModel`: one datum, one free routine, and the listeners a widget binds to. The class the
-/// corpus names 41 times through this id, and `IValueModel` 82 times through the interface — the
+/// sample set names 41 times through this id, and `IValueModel` 82 times through the interface — the
 /// family's second-most-named interface after `IWidget`, and the one a widget binds its value to.
 #[test]
 fn a_value_model_answers_both_of_its_faces_with_one_object() {
@@ -45218,6 +47036,630 @@ fn setting_a_value_tells_every_listener_with_the_events_own_code() {
         rt.cpu.mem.read_u32(sink).unwrap(),
         0x1000,
         "EVT_MDL_VALUE is the widget-model range's first code"
+    );
+}
+
+/// A text model built through the class the sample set names, answering both faces off one vtable.
+///
+/// The interface is what most packs reach (74 references, against 11 for the class), because a
+/// widget gets its model from `IWidget::GetModel` rather than by building one — but the class has
+/// to exist for the widget tree that does build one directly.
+#[test]
+fn a_text_model_answers_both_of_its_faces_with_one_object() {
+    fn create(rt: &mut Runtime) -> u32 {
+        let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+        let shell = rt.shell;
+        let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+        assert_eq!(
+            call_many(rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+            g::AEE_SUCCESS
+        );
+        rt.cpu.mem.read_u32(slot).unwrap()
+    }
+
+    let mut rt = Runtime::new();
+    let model = create(&mut rt);
+
+    assert_eq!(abi::label(abi::textmodel_id(4)), "IModel::Notify");
+    assert_eq!(abi::label(abi::textmodel_id(5)), "ITextModel::ReplaceSel");
+    assert_eq!(abi::label(abi::textmodel_id(8)), "ITextModel::SetSel");
+
+    // A fresh model is empty with the caret at 0 — not "no selection".
+    assert_eq!(rt.text_models[&model].text, Vec::<u16>::new());
+    assert_eq!(rt.text_models[&model].sel_start, 0);
+    assert_eq!(rt.text_models[&model].sel_end, 0);
+
+    let ppi = rt.cpu.mem.alloc(4, 4).unwrap();
+    for iid in [
+        0x0101_5946u32, // ITextModel, the default
+        0x0101_593a,    // IModel
+        g::AEEIID_IQI,
+    ] {
+        rt.cpu.mem.write_u32(ppi, 0xdead_beef).unwrap();
+        assert_eq!(
+            call_many(&mut rt, abi::textmodel_id(2), model, &[iid, ppi]).unwrap(),
+            g::AEE_SUCCESS
+        );
+        assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), model);
+    }
+    // A value model's IID is a different interface, even though both spend `IModel`'s five slots.
+    rt.cpu.mem.write_u32(ppi, 0xdead_beef).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(2), model, &[0x0101_593b, ppi]).unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), 0);
+}
+
+/// One slot does insert, replace and delete, because the selection is the range it acts on.
+///
+/// The three calls below are the header's own three recipes: `SetSel(-1,-1)` then `ReplaceSel` is
+/// how a pack appends, a non-empty selection is what a replace works through, and a null buffer
+/// with a zero count deletes.
+#[test]
+fn a_text_model_appends_replaces_and_deletes_through_one_slot() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    // A three-character wide-string the caller owns, terminating NUL included.
+    let run = |rt: &mut Runtime, text: &[u16]| -> u32 {
+        let at = rt.cpu.mem.alloc((text.len() as u32 + 1) * 2, 2).unwrap();
+        for (i, unit) in text.iter().enumerate() {
+            rt.cpu
+                .mem
+                .write_u16(at + i as u32 * 2, *unit as u32)
+                .unwrap();
+        }
+        rt.cpu.mem.write_u16(at + text.len() as u32 * 2, 0).unwrap();
+        at
+    };
+    // `AECHAR` values are code units, and this host decides nothing about their meaning.
+    let read_back = |rt: &mut Runtime| -> Vec<u16> { rt.text_models[&model].text.clone() };
+
+    // Append: caret to the end, then replace the (empty) selection with "ABC".
+    let abc = run(&mut rt, &[65, 66, 67]);
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::textmodel_id(8),
+            model,
+            &[0xffff_ffff, 0xffff_ffff]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[abc, 0xffff_ffff]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(read_back(&mut rt), vec![65, 66, 67]);
+    // The caret sits after what was inserted, so the next append continues there.
+    assert_eq!(rt.text_models[&model].sel_start, 3);
+    assert_eq!(rt.text_models[&model].sel_end, 3);
+
+    // Replace the middle character: positions are zero based and the end is one past the last.
+    let xy = run(&mut rt, &[88, 89]);
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[1, 3]).unwrap(),
+        0
+    );
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[xy, 2]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(read_back(&mut rt), vec![65, 88, 89]);
+
+    // Delete: null buffer, zero count, selection over the first two.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[0, 2]).unwrap(),
+        0
+    );
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[0, 0]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(read_back(&mut rt), vec![89]);
+    // A deletion collapses the selection to where it began.
+    assert_eq!(rt.text_models[&model].sel_start, 0);
+    assert_eq!(rt.text_models[&model].sel_end, 0);
+
+    // `GetTextInfo` hands out the same characters through guest memory, with the length beside
+    // them: this is the only route by which a widget reads the buffer itself.
+    let info = rt.cpu.mem.alloc(16, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(7), model, &[info]).unwrap(),
+        0
+    );
+    let ptr = rt.cpu.mem.read_u32(info).unwrap();
+    assert_eq!(rt.cpu.mem.read_u32(info + 4).unwrap(), 1);
+    assert_eq!(rt.cpu.mem.read_u32(info + 8).unwrap(), 0);
+    assert_eq!(rt.cpu.mem.read_u32(info + 12).unwrap(), 0);
+    assert_eq!(rt.cpu.mem.read_u16(ptr).unwrap(), 89);
+    assert_eq!(
+        rt.cpu.mem.read_u16(ptr + 2).unwrap(),
+        0,
+        "the buffer is terminated"
+    );
+}
+
+/// `cchText` of `-1` means "measure it", and the length does not include the terminator; a
+/// selection that runs past the text is clamped rather than indexing outside it.
+#[test]
+fn a_length_of_minus_one_is_measured_and_a_selection_is_clamped() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    let text = rt.cpu.mem.alloc(12, 2).unwrap();
+    for (i, unit) in [72u32, 101, 108, 108, 111].iter().enumerate() {
+        rt.cpu.mem.write_u16(text + i as u32 * 2, *unit).unwrap();
+    }
+    rt.cpu.mem.write_u16(text + 10, 0).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[text, 0xffff_ffff]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.text_models[&model].text,
+        vec![72, 101, 108, 108, 111],
+        "-1 measures the buffer and stops at the terminator"
+    );
+
+    // A selection past the end has no defined meaning in the header; clamping is the only reading
+    // that cannot index outside the buffer.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[3, 9999]).unwrap(),
+        0
+    );
+    assert_eq!(rt.text_models[&model].sel_start, 3);
+    assert_eq!(rt.text_models[&model].sel_end, 5);
+
+    // `-1` on either end means end-of-text: `SetSel(0, -1)` selects the whole run.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[0, 0xffff_ffff]).unwrap(),
+        0
+    );
+    assert_eq!(rt.text_models[&model].sel_start, 0);
+    assert_eq!(rt.text_models[&model].sel_end, 5);
+
+    // An explicit count that names a buffer the caller did not supply is refused, not read as
+    // zeros: characters the caller never wrote must not enter the model.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[0, 3]).unwrap(),
+        g::AEE_EBADPARM
+    );
+}
+
+/// `GetSelText` answers the selection's length even when the buffer cannot hold it, and copies at
+/// most `cchBuf` characters **including** the terminator.
+#[test]
+fn get_sel_text_reports_the_run_even_when_the_buffer_is_short() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    let text = rt.cpu.mem.alloc(10, 2).unwrap();
+    for (i, unit) in [65u32, 66, 67, 68].iter().enumerate() {
+        rt.cpu.mem.write_u16(text + i as u32 * 2, *unit).unwrap();
+    }
+    rt.cpu.mem.write_u16(text + 8, 0).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[text, 4]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    // Select "BC": start 1, end 3.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[1, 3]).unwrap(),
+        0
+    );
+
+    // Room for one character and the terminator.
+    let buf = rt.cpu.mem.alloc(4, 2).unwrap();
+    rt.cpu.mem.write_u16(buf, 0xffff).unwrap();
+    rt.cpu.mem.write_u16(buf + 2, 0xffff).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(6), model, &[buf, 2]).unwrap(),
+        2,
+        "the length is the selection's, not the buffer's"
+    );
+    assert_eq!(rt.cpu.mem.read_u16(buf).unwrap(), 66);
+    assert_eq!(rt.cpu.mem.read_u16(buf + 2).unwrap(), 0, "terminated");
+
+    // `cchBuf == 0` is the header's way of asking for the length alone.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(6), model, &[0, 0]).unwrap(),
+        2
+    );
+}
+
+/// Both text events carry a payload, and the two are the opposite of each other: a change reports
+/// the selection start *before* the edit, a selection reports it *after*.
+#[test]
+fn a_text_change_reports_where_the_edit_began_and_a_selection_where_it_ended() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    let code_sink = rt.cpu.mem.alloc(4, 4).unwrap();
+    let param_sink = rt.cpu.mem.alloc(4, 4).unwrap();
+    for sink in [code_sink, param_sink] {
+        rt.cpu.mem.write_u32(sink, 0xdead_beef).unwrap();
+    }
+    // `ldr r4,[r1]` (evCode) / `ldr r5,[pc,#20]` → code_sink / `str r4,[r5]` /
+    // `ldr r4,[r1,#8]` (dwParam) / `ldr r5,[pc,#12]` → param_sink / `str r4,[r5]` / `bx lr`.
+    let pfn = arm_code(
+        &mut rt,
+        &[
+            0xe591_4000,
+            0xe59f_5014,
+            0xe585_4000,
+            0xe591_4008,
+            0xe59f_500c,
+            0xe585_4000,
+            0xe12f_ff1e,
+            0,
+            code_sink,
+            param_sink,
+        ],
+    );
+    let node = put_listener(&mut rt, pfn, 0, 0);
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(3), model, &[node]).unwrap(),
+        g::AEE_SUCCESS
+    );
+
+    let text = rt.cpu.mem.alloc(8, 2).unwrap();
+    for (i, unit) in [65u32, 66, 67].iter().enumerate() {
+        rt.cpu.mem.write_u16(text + i as u32 * 2, *unit).unwrap();
+    }
+    rt.cpu.mem.write_u16(text + 6, 0).unwrap();
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(5), model, &[text, 0xffff_ffff]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(code_sink).unwrap(),
+        0x1002,
+        "EVT_MDL_TEXT_CHANGE is EVT_MDL_WIDGET_START + 2"
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(param_sink).unwrap(),
+        0,
+        "the edit began at 0, which is the selection start before the call"
+    );
+
+    // Move the selection to 1..3 and check the other event, whose payload is the start *after*.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(8), model, &[1, 3]).unwrap(),
+        0
+    );
+    assert_eq!(rt.cpu.mem.read_u32(code_sink).unwrap(), 0x1003);
+    assert_eq!(rt.cpu.mem.read_u32(param_sink).unwrap(), 1);
+}
+
+/// The unregister leg: `AddListener` leaves a cancel routine in the node, and that routine takes it
+/// off the text model's chain rather than the value model's.
+#[test]
+fn a_text_model_lets_a_listener_take_itself_off() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e5, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    // A null node is the one parameter error the slot documents.
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(3), model, &[0]).unwrap(),
+        g::AEE_EBADPARM
+    );
+    let node = put_listener(&mut rt, 0, 0, 0);
+    assert_eq!(
+        call_many(&mut rt, abi::textmodel_id(3), model, &[node]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(rt.text_models[&model].listeners, vec![node]);
+    let hook = rt.cpu.mem.read_u32(node + 0x10).unwrap();
+    assert_ne!(hook, 0);
+    assert_eq!(rt.cpu.mem.read_u32(node + 0x14).unwrap(), model);
+
+    let (id, _) = rt
+        .host_fns
+        .iter()
+        .find(|(_, kind)| matches!(kind, HostFn::TextModelCancelListener))
+        .expect("the text model has to have minted a cancel hook");
+    let id = *id;
+    assert_eq!(rt.host_fn_addr[&HostFn::TextModelCancelListener], hook);
+    rt.cpu.r[0] = node;
+    assert_eq!(rt.dispatch(id, 0).unwrap(), 0);
+    assert_eq!(rt.cpu.mem.read_u32(node + 0x10).unwrap(), 0);
+    assert!(
+        rt.text_models[&model].listeners.is_empty(),
+        "the cancel leg has to unlink the node from the text model"
+    );
+}
+
+/// The fourth member of the model family: one interface pointer filed under one class id.
+#[test]
+fn an_interface_model_answers_both_of_its_faces_with_one_object() {
+    fn create(rt: &mut Runtime) -> u32 {
+        let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+        let shell = rt.shell;
+        let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+        assert_eq!(
+            call_many(rt, crinst, shell, &[0x0105_51ce, slot]).unwrap(),
+            g::AEE_SUCCESS
+        );
+        rt.cpu.mem.read_u32(slot).unwrap()
+    }
+
+    let mut rt = Runtime::new();
+    let model = create(&mut rt);
+
+    assert_eq!(abi::label(abi::interfacemodel_id(4)), "IModel::Notify");
+    assert_eq!(
+        abi::label(abi::interfacemodel_id(5)),
+        "IInterfaceModel::SetIPtr"
+    );
+    assert_eq!(
+        abi::label(abi::interfacemodel_id(6)),
+        "IInterfaceModel::GetIPtr"
+    );
+
+    // A fresh model files a null pointer under class 0 — which is the one pairing `GetIPtr(0)`
+    // answers for, because it names no data to take a reference on.
+    assert_eq!(rt.interface_models[&model].ptr, 0);
+    assert_eq!(rt.interface_models[&model].clsid, 0);
+
+    let ppi = rt.cpu.mem.alloc(4, 4).unwrap();
+    for iid in [
+        0x0101_593cu32, // IInterfaceModel, the default
+        0x0101_593a,    // IModel
+        g::AEEIID_IQI,
+    ] {
+        rt.cpu.mem.write_u32(ppi, 0xdead_beef).unwrap();
+        assert_eq!(
+            call_many(&mut rt, abi::interfacemodel_id(2), model, &[iid, ppi]).unwrap(),
+            g::AEE_SUCCESS
+        );
+        assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), model);
+    }
+    rt.cpu.mem.write_u32(ppi, 0xdead_beef).unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::interfacemodel_id(2),
+            model,
+            &[0x0101_5946, ppi]
+        )
+        .unwrap(),
+        g::AEE_ECLASSNOTSUPPORT
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), 0);
+}
+
+/// The type is the whole point of the class: a pointer goes back only under the class id it was
+/// filed under, and the caller's word is left untouched when it does not match.
+#[test]
+fn an_interface_model_answers_only_for_the_type_it_was_given() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51ce, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+    // Something to point at that this host can take a reference on.
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e9, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let target = rt.cpu.mem.read_u32(slot).unwrap();
+
+    let filed = 0x0105_51e9u32;
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(5), model, &[target, filed]).unwrap(),
+        0
+    );
+    assert_eq!(rt.interface_models[&model].ptr, target);
+    assert_eq!(rt.interface_models[&model].clsid, filed);
+
+    let ppi = rt.cpu.mem.alloc(4, 4).unwrap();
+    rt.cpu.mem.write_u32(ppi, 0xdead_beef).unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::interfacemodel_id(6),
+            model,
+            &[0x0105_51e5, ppi]
+        )
+        .unwrap(),
+        g::AEE_ECLASSNOTSUPPORT,
+        "a different class id is unsupported, not empty"
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(ppi).unwrap(),
+        0xdead_beef,
+        "a refusal must not look like a null value"
+    );
+
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(6), model, &[filed, ppi]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), target);
+}
+
+/// `SetIPtr` takes no reference and `GetIPtr` gives one — the asymmetry is the header's, and this
+/// is what it looks like from the outside: two `Release` calls are needed after one `GetIPtr`.
+#[test]
+fn a_stored_pointer_comes_back_with_a_reference_and_was_never_held_without_one() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51ce, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51e9, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let target = rt.cpu.mem.read_u32(slot).unwrap();
+
+    // One reference, the one `CreateInstance` left the caller holding.
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::interfacemodel_id(5),
+            model,
+            &[target, 0x0105_51e9]
+        )
+        .unwrap(),
+        0
+    );
+    let ppi = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(
+            &mut rt,
+            abi::interfacemodel_id(6),
+            model,
+            &[0x0105_51e9, ppi]
+        )
+        .unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ppi).unwrap(), target);
+
+    // The reference `GetIPtr` added, then the caller's own. A store that had taken a reference
+    // would need a third, and a store that had taken none would drop to zero on the first.
+    assert_eq!(
+        call_many(&mut rt, abi::valuemodel_id(1), target, &[]).unwrap(),
+        1,
+        "GetIPtr has to have added one"
+    );
+    assert_eq!(
+        call_many(&mut rt, abi::valuemodel_id(1), target, &[]).unwrap(),
+        0
+    );
+
+    // Releasing the model does not touch the pointer it filed: it never owned it.
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(1), model, &[]).unwrap(),
+        0
+    );
+    assert!(rt.interface_models.get(&model).is_none());
+}
+
+/// A store reports `EVT_MDL_VALUE`, the same code a value model uses — the header names that event
+/// rather than a new one, and leaves its payload unspecified.
+#[test]
+fn storing_a_pointer_tells_listeners_with_the_value_event() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51ce, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    let sink = rt.cpu.mem.alloc(4, 4).unwrap();
+    rt.cpu.mem.write_u32(sink, 0xdead_beef).unwrap();
+    let pfn = arm_code(
+        &mut rt,
+        &[0xe591_2000, 0xe59f_3004, 0xe583_2000, 0xe12f_ff1e, sink],
+    );
+    let node = put_listener(&mut rt, pfn, 0, 0);
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(3), model, &[node]).unwrap(),
+        g::AEE_SUCCESS
+    );
+
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(5), model, &[0, 0]).unwrap(),
+        0
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u32(sink).unwrap(),
+        0x1000,
+        "EVT_MDL_VALUE is what an interface store reports"
+    );
+}
+
+/// The unregister leg against this model's own chain.
+#[test]
+fn an_interface_model_lets_a_listener_take_itself_off() {
+    let mut rt = Runtime::new();
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let shell = rt.shell;
+    let slot = rt.cpu.mem.alloc(4, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, crinst, shell, &[0x0105_51ce, slot]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    let model = rt.cpu.mem.read_u32(slot).unwrap();
+
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(3), model, &[0]).unwrap(),
+        g::AEE_EBADPARM
+    );
+    let node = put_listener(&mut rt, 0, 0, 0);
+    assert_eq!(
+        call_many(&mut rt, abi::interfacemodel_id(3), model, &[node]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(rt.interface_models[&model].listeners, vec![node]);
+    let hook = rt.cpu.mem.read_u32(node + 0x10).unwrap();
+    assert_ne!(hook, 0);
+
+    let (id, _) = rt
+        .host_fns
+        .iter()
+        .find(|(_, kind)| matches!(kind, HostFn::InterfaceModelCancelListener))
+        .expect("the interface model has to have minted a cancel hook");
+    let id = *id;
+    assert_eq!(rt.host_fn_addr[&HostFn::InterfaceModelCancelListener], hook);
+    rt.cpu.r[0] = node;
+    assert_eq!(rt.dispatch(id, 0).unwrap(), 0);
+    assert!(
+        rt.interface_models[&model].listeners.is_empty(),
+        "the cancel leg has to unlink the node from the interface model"
     );
 }
 
@@ -45407,7 +47849,14 @@ fn the_hash_table_is_the_six_words_the_header_publishes() {
     let names: Vec<&str> = iface.methods.iter().map(|m| m.name).collect();
     assert_eq!(
         names,
-        vec!["AddRef", "Release", "Update", "GetResult", "Restart", "SetKey"],
+        vec![
+            "AddRef",
+            "Release",
+            "Update",
+            "GetResult",
+            "Restart",
+            "SetKey"
+        ],
         "the header documents exactly this order"
     );
     assert_eq!(abi::slot_of("IHash", "GetResult"), Some(3));
@@ -45418,7 +47867,11 @@ fn the_hash_table_is_the_six_words_the_header_publishes() {
 
     let mut rt = Runtime::new();
     let made = hash_object(&mut rt, g::AEECLSID_MD5);
-    assert_eq!(refs(&mut rt, made), 1, "the constructor sets its count to one");
+    assert_eq!(
+        refs(&mut rt, made),
+        1,
+        "the constructor sets its count to one"
+    );
 }
 
 /// The whole point of the class id being answered at all: a pack feeds bytes and reads sixteen back.
@@ -45793,7 +48246,10 @@ const QEGL_IIDS: &[(u32, &str)] = &[
     (g::AEECLSID_QEGL, "AEECLSID_QEGL"),
     (g::AEEIID_EGL11, "AEEIID_EGL11"),
     (g::AEEIID_EGLGETCOLORBUFFER, "AEEIID_EGLGETCOLORBUFFER"),
-    (g::AEEIID_EGLGETCOLORBUFFERINFO, "AEEIID_EGLGETCOLORBUFFERINFO"),
+    (
+        g::AEEIID_EGLGETCOLORBUFFERINFO,
+        "AEEIID_EGLGETCOLORBUFFERINFO",
+    ),
     (g::AEEIID_GLES10, "AEEIID_GLES10"),
     (g::AEEIID_GLES10EXT, "AEEIID_GLES10EXT"),
     (g::AEEIID_GLES11, "AEEIID_GLES11"),
@@ -45817,7 +48273,11 @@ const QEGL_QI_GOLDEN: &[(&str, &str, &str)] = &[
     ("IEGL10", "AEECLSID_QEGL", "self"),
     ("IEGL10", "AEEIID_EGL11", "IEGL11"),
     ("IEGL10", "AEEIID_EGLGETCOLORBUFFER", "IEGLGetColorBuffer"),
-    ("IEGL10", "AEEIID_EGLGETCOLORBUFFERINFO", "IEGLGetColorBufferInfo"),
+    (
+        "IEGL10",
+        "AEEIID_EGLGETCOLORBUFFERINFO",
+        "IEGLGetColorBufferInfo",
+    ),
     ("IEGL10", "AEEIID_GLES10", "IGLES10"),
     ("IEGL10", "AEEIID_GLES10EXT", "-"),
     ("IEGL10", "AEEIID_GLES11", "-"),
@@ -45831,7 +48291,11 @@ const QEGL_QI_GOLDEN: &[(&str, &str, &str)] = &[
     ("IEGL11", "AEECLSID_QEGL", "IEGL10"),
     ("IEGL11", "AEEIID_EGL11", "self"),
     ("IEGL11", "AEEIID_EGLGETCOLORBUFFER", "IEGLGetColorBuffer"),
-    ("IEGL11", "AEEIID_EGLGETCOLORBUFFERINFO", "IEGLGetColorBufferInfo"),
+    (
+        "IEGL11",
+        "AEEIID_EGLGETCOLORBUFFERINFO",
+        "IEGLGetColorBufferInfo",
+    ),
     ("IEGL11", "AEEIID_GLES10", "-"),
     ("IEGL11", "AEEIID_GLES10EXT", "-"),
     ("IEGL11", "AEEIID_GLES11", "-"),
@@ -45859,7 +48323,11 @@ const QEGL_QI_GOLDEN: &[(&str, &str, &str)] = &[
     ("IEGLGetColorBufferInfo", "AEECLSID_QEGL", "IEGL10"),
     ("IEGLGetColorBufferInfo", "AEEIID_EGL11", "IEGL11"),
     ("IEGLGetColorBufferInfo", "AEEIID_EGLGETCOLORBUFFER", "-"),
-    ("IEGLGetColorBufferInfo", "AEEIID_EGLGETCOLORBUFFERINFO", "self"),
+    (
+        "IEGLGetColorBufferInfo",
+        "AEEIID_EGLGETCOLORBUFFERINFO",
+        "self",
+    ),
     ("IEGLGetColorBufferInfo", "AEEIID_GLES10", "-"),
     ("IEGLGetColorBufferInfo", "AEEIID_GLES10EXT", "-"),
     ("IEGLGetColorBufferInfo", "AEEIID_GLES11", "-"),
@@ -45894,7 +48362,11 @@ const QEGL_QI_GOLDEN: &[(&str, &str, &str)] = &[
     ("IGLESImageonExt", "AEEIID_GLES11EXT", "-"),
     ("IGLESImageonExt", "AEEIID_GLES11EXTPAK", "-"),
     ("IGLESImageonExt", "AEEIID_GLESIMAGEONEXT", "self"),
-    ("IGLESImageonExt", "AEEIID_GLESIMAGEONEXT_V1", "IGLESImageonExt_V1"),
+    (
+        "IGLESImageonExt",
+        "AEEIID_GLESIMAGEONEXT_V1",
+        "IGLESImageonExt_V1",
+    ),
     ("IGLESImageonExt", "AEEIID_IQI", "self"),
     ("IGLESImageonExt", "AEEIID_UNKNOWN", "-"),
     ("IGLESImageonExt_V1", "AEEIID_EGL10", "IEGL10"),
@@ -45907,7 +48379,11 @@ const QEGL_QI_GOLDEN: &[(&str, &str, &str)] = &[
     ("IGLESImageonExt_V1", "AEEIID_GLES11", "-"),
     ("IGLESImageonExt_V1", "AEEIID_GLES11EXT", "-"),
     ("IGLESImageonExt_V1", "AEEIID_GLES11EXTPAK", "-"),
-    ("IGLESImageonExt_V1", "AEEIID_GLESIMAGEONEXT", "IGLESImageonExt"),
+    (
+        "IGLESImageonExt_V1",
+        "AEEIID_GLESIMAGEONEXT",
+        "IGLESImageonExt",
+    ),
     ("IGLESImageonExt_V1", "AEEIID_GLESIMAGEONEXT_V1", "self"),
     ("IGLESImageonExt_V1", "AEEIID_IQI", "self"),
     ("IGLESImageonExt_V1", "AEEIID_UNKNOWN", "-"),
@@ -46131,4 +48607,357 @@ fn a_released_face_takes_its_payload_with_it() {
     // The other faces are untouched: one object died, not the family.
     let egl = family.iter().find(|(n, _)| n == "IEGL10").unwrap().1;
     assert!(rt.hle.payload(egl).is_some());
+}
+
+/// The display reads `AECHAR` units in the number the handset advertises, and the runtime hands it
+/// that number from the device profile — the same word `--encoding` and a device file set.
+#[test]
+fn the_display_reads_units_in_the_encoding_the_profile_advertises() {
+    let sjis = Runtime::with_device(DeviceProfile {
+        encoding: g::AEE_ENC_S_JIS as u16,
+        ..DeviceProfile::standard()
+    });
+    assert_eq!(sjis.display.encoding(), crate::encoding::TextEncoding::Sjis);
+
+    let unicode = Runtime::with_device(DeviceProfile {
+        encoding: g::AEE_ENC_UNICODE as u16,
+        ..DeviceProfile::standard()
+    });
+    assert_eq!(
+        unicode.display.encoding(),
+        crate::encoding::TextEncoding::Unicode
+    );
+}
+
+/// A carrier class that names a cell size uses the face the install pass attached to the class,
+/// before the nearest-designator rows `FONT_FACES` keeps for a run with no system font.
+#[test]
+fn a_kddi_class_uses_its_own_cell_size_before_the_nearest_designator() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    let cls = g::KDDI_FONT_FIXED24X24B;
+    let font = service(&mut rt, cls);
+
+    let side = 24usize;
+    let cells = [crate::makebbf::Cell {
+        ch: 0x41,
+        width: 24,
+        ink: vec![false; side * side],
+    }];
+    let bytes = crate::makebbf::encode(&cells, 24, 6, 0x80);
+    let face = crate::font::Face::Bbf(std::sync::Arc::new(
+        crate::bbf::Bbf::parse(&bytes).expect("the encoder's own output"),
+    ));
+    rt.font_class_faces.insert(cls, face);
+
+    let info = abi::method_of("IFont", "GetInfo").unwrap();
+    let font_info = abi::struct_info("AEEFontInfo").unwrap();
+    let n_ascent = abi::offset_of("AEEFontInfo", "nAscent").unwrap();
+    let rec = rt.cpu.mem.alloc(font_info.size as u32, 4).unwrap();
+    assert_eq!(
+        call_many(&mut rt, info, font, &[rec, font_info.size as u32]).unwrap(),
+        g::AEE_SUCCESS
+    );
+    assert_eq!(
+        rt.cpu.mem.read_u16(rec + n_ascent).unwrap() as u32,
+        18,
+        "the class face's 24-pixel cell (24 - 6 descent), not the large designator's 32"
+    );
+}
+
+/// An animated GIF is more than a first frame: its later frames are rectangles over the canvas,
+/// and `IImage_DrawFrame` has to select the composed picture. The fixture updates the right half of
+/// a black canvas with white and leaves one column transparent, so the screen shows through there.
+fn a_two_frame_sub_rect_gif() -> Vec<u8> {
+    let rgb = [0u8, 0, 0, 255, 255, 255];
+    let mut out = Vec::new();
+    {
+        let mut enc = gif::Encoder::new(&mut out, 4, 2, &rgb).unwrap();
+        let mut first =
+            gif::Frame::from_indexed_pixels(4, 2, vec![0, 0, 0, 1, 0, 0, 0, 1], Some(1));
+        first.delay = 5;
+        first.dispose = gif::DisposalMethod::Keep;
+        enc.write_frame(&first).unwrap();
+        let mut second = gif::Frame::from_indexed_pixels(2, 2, vec![1, 0, 1, 0], Some(0));
+        second.left = 2;
+        second.delay = 7;
+        second.dispose = gif::DisposalMethod::Keep;
+        enc.write_frame(&second).unwrap();
+    }
+    out
+}
+
+#[test]
+fn an_animated_gif_loads_every_frame_and_drawframe_selects_one() {
+    let mut rt = Runtime::new();
+    let _ = new_display(&mut rt);
+    rt.display.clear_device(&mut rt.cpu.mem, RGB_WHITE).unwrap();
+
+    let bytes = a_two_frame_sub_rect_gif();
+    let data = rt.cpu.mem.alloc(bytes.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(data, &bytes).unwrap();
+    let stream = new_service(&mut rt, g::AEECLSID_MEMASTREAM);
+    let set = abi::method_of("IMemAStream", "Set").unwrap();
+    call_many(&mut rt, set, stream, &[data, bytes.len() as u32, 0, 0]).unwrap();
+
+    let shell = rt.shell;
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(&mut rt, crinst, shell, &[g::AEECLSID_PNG, ppv]).unwrap();
+    let image = rt.cpu.mem.read_u32(ppv).unwrap();
+    let put = abi::method_of("IImage", "SetStream").unwrap();
+    call_many(&mut rt, put, image, &[stream]).unwrap();
+
+    let frames = rt.image_frames.get(&image).expect("the GIF's frames");
+    assert_eq!(frames.rasters.len(), 2);
+    assert_eq!(frames.delays, vec![5, 7]);
+
+    let info = rt.cpu.mem.alloc(10, 2).unwrap();
+    let get = abi::method_of("IImage", "GetInfo").unwrap();
+    call_many(&mut rt, get, image, &[info]).unwrap();
+    let at = |f: &str| abi::offset_of("AEEImageInfo", f).unwrap();
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cx")).unwrap(), 4);
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cy")).unwrap(), 2);
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cxFrame")).unwrap(), 4);
+    assert_eq!(
+        rt.cpu.mem.read_u8(info + at("bAnimated")).unwrap(),
+        g::TRUE as u8
+    );
+
+    // Frame 0: black on the left, its right column a transparent hole.
+    let draw_frame = abi::method_of("IImage", "DrawFrame").unwrap();
+    call_many(&mut rt, draw_frame, image, &[0, 10, 10]).unwrap();
+    assert_eq!(device_pixel(&rt, 10, 10), ink(0, 0, 0));
+    assert_eq!(device_pixel(&rt, 13, 10), ink(255, 255, 255));
+
+    // Frame 1: white on the right half; its transparent column still shows the white screen.
+    call_many(&mut rt, draw_frame, image, &[1, 10, 10]).unwrap();
+    assert_eq!(rt.image_frames[&image].current, 1);
+    assert_eq!(device_pixel(&rt, 10, 10), ink(0, 0, 0));
+    assert_eq!(device_pixel(&rt, 12, 10), ink(255, 255, 255));
+    assert_eq!(device_pixel(&rt, 13, 10), ink(255, 255, 255));
+
+    // Plain `Draw` after an explicit selection uses that frame, not frame 0.
+    let draw = abi::method_of("IImage", "Draw").unwrap();
+    call_many(&mut rt, draw, image, &[10, 10]).unwrap();
+    assert_eq!(device_pixel(&rt, 12, 10), ink(255, 255, 255));
+
+    // `Start` + `Draw` advance on the virtual clock using the file's own delays: 50 ms then 70 ms.
+    let start = abi::method_of("IImage", "Start").unwrap();
+    call_many(&mut rt, start, image, &[10, 10]).unwrap();
+    rt.clock_ms = rt.clock_ms.saturating_add(60);
+    call_many(&mut rt, draw, image, &[10, 10]).unwrap();
+    assert_eq!(
+        device_pixel(&rt, 12, 10),
+        ink(255, 255, 255),
+        "60 ms is inside frame 1's 50 ms slot"
+    );
+    rt.clock_ms = rt.clock_ms.saturating_add(70);
+    call_many(&mut rt, draw, image, &[10, 10]).unwrap();
+    assert_eq!(
+        device_pixel(&rt, 12, 10),
+        ink(0, 0, 0),
+        "130 ms wraps to frame 0"
+    );
+
+    // Stop freezes the frame the clock landed on; `IPARM_RATE(0)` is the same stop.
+    call_many(&mut rt, start, image, &[10, 10]).unwrap();
+    rt.clock_ms = rt.clock_ms.saturating_add(60);
+    call_many(&mut rt, draw, image, &[10, 10]).unwrap();
+    assert_eq!(device_pixel(&rt, 12, 10), ink(255, 255, 255));
+    let stop = abi::method_of("IImage", "Stop").unwrap();
+    call(&mut rt, stop, image).unwrap();
+    rt.clock_ms = rt.clock_ms.saturating_add(500);
+    call_many(&mut rt, draw, image, &[10, 10]).unwrap();
+    assert_eq!(
+        device_pixel(&rt, 12, 10),
+        ink(255, 255, 255),
+        "Stop freezes the frame that was on screen"
+    );
+    call_many(&mut rt, start, image, &[10, 10]).unwrap();
+    let set_parm = abi::method_of("IImage", "SetParm").unwrap();
+    call_many(&mut rt, set_parm, image, &[g::IPARM_RATE, 0, 0]).unwrap();
+    assert_eq!(
+        rt.image_frames[&image].started_ms, None,
+        "a zero period stops the clock"
+    );
+
+    // Releasing the image releases every frame raster it made, not just the first.
+    let rasters = rt.image_frames[&image].rasters.clone();
+    let release = abi::method_of("IImage", "Release").unwrap();
+    call(&mut rt, release, image).unwrap();
+    assert!(rt.image_frames.get(&image).is_none());
+    for raster in rasters {
+        assert!(
+            rt.display.bitmap(raster).is_none(),
+            "frame raster {raster:#x} survived"
+        );
+    }
+}
+
+const SIS_2FRAME: &[u8] = include_bytes!("data/018_multiq_18.sis");
+
+#[test]
+fn an_animated_sis_loads_both_frames_through_iimage() {
+    let mut rt = Runtime::new();
+    let _ = new_display(&mut rt);
+    let bytes = SIS_2FRAME;
+    let data = rt.cpu.mem.alloc(bytes.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(data, bytes).unwrap();
+    let stream = new_service(&mut rt, g::AEECLSID_MEMASTREAM);
+    let set = abi::method_of("IMemAStream", "Set").unwrap();
+    call_many(&mut rt, set, stream, &[data, bytes.len() as u32, 0, 0]).unwrap();
+
+    let shell = rt.shell;
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(&mut rt, crinst, shell, &[g::AEECLSID_PNG, ppv]).unwrap();
+    let image = rt.cpu.mem.read_u32(ppv).unwrap();
+    let put = abi::method_of("IImage", "SetStream").unwrap();
+    call_many(&mut rt, put, image, &[stream]).unwrap();
+
+    let frames = rt.image_frames.get(&image).expect("the SIS frames");
+    assert_eq!(frames.rasters.len(), 2);
+    assert_eq!(frames.delays, vec![40, 40]);
+
+    let info = rt.cpu.mem.alloc(10, 2).unwrap();
+    let get = abi::method_of("IImage", "GetInfo").unwrap();
+    call_many(&mut rt, get, image, &[info]).unwrap();
+    let at = |f: &str| abi::offset_of("AEEImageInfo", f).unwrap();
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cx")).unwrap(), 28);
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cy")).unwrap(), 36);
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cxFrame")).unwrap(), 28);
+    assert_eq!(
+        rt.cpu.mem.read_u8(info + at("bAnimated")).unwrap(),
+        g::TRUE as u8
+    );
+}
+
+const SIS_ONE_FRAME: &[u8] = include_bytes!("data/006_multiq_6.sis");
+
+#[test]
+fn a_one_frame_sis_stream_uses_the_static_image_path() {
+    let mut rt = Runtime::new();
+    let _ = new_display(&mut rt);
+    let bytes = SIS_ONE_FRAME;
+    let data = rt.cpu.mem.alloc(bytes.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(data, bytes).unwrap();
+    let stream = new_service(&mut rt, g::AEECLSID_MEMASTREAM);
+    let set = abi::method_of("IMemAStream", "Set").unwrap();
+    call_many(&mut rt, set, stream, &[data, bytes.len() as u32, 0, 0]).unwrap();
+
+    let shell = rt.shell;
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(&mut rt, crinst, shell, &[g::AEECLSID_PNG, ppv]).unwrap();
+    let image = rt.cpu.mem.read_u32(ppv).unwrap();
+    let put = abi::method_of("IImage", "SetStream").unwrap();
+    call_many(&mut rt, put, image, &[stream]).unwrap();
+
+    assert!(
+        rt.image_frames.get(&image).is_none(),
+        "one frame is not an animation"
+    );
+    let info = rt.cpu.mem.alloc(10, 2).unwrap();
+    let get = abi::method_of("IImage", "GetInfo").unwrap();
+    call_many(&mut rt, get, image, &[info]).unwrap();
+    let at = |f: &str| abi::offset_of("AEEImageInfo", f).unwrap();
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cx")).unwrap(), 9);
+    assert_eq!(rt.cpu.mem.read_u16(info + at("cy")).unwrap(), 9);
+    assert_eq!(
+        rt.cpu.mem.read_u8(info + at("bAnimated")).unwrap(),
+        g::FALSE as u8
+    );
+
+    let src = rt.images[&image];
+    let release = abi::method_of("IImage", "Release").unwrap();
+    call(&mut rt, release, image).unwrap();
+    assert!(
+        rt.display.bitmap(src).is_none(),
+        "the static raster is released with the image"
+    );
+}
+
+#[test]
+fn a_snapshot_keeps_an_animated_images_frames() {
+    let mut rt = Runtime::new();
+    let _ = new_display(&mut rt);
+    let bytes = a_two_frame_sub_rect_gif();
+    let data = rt.cpu.mem.alloc(bytes.len() as u32, 1).unwrap();
+    rt.cpu.mem.write_bytes(data, &bytes).unwrap();
+    let stream = new_service(&mut rt, g::AEECLSID_MEMASTREAM);
+    let set = abi::method_of("IMemAStream", "Set").unwrap();
+    call_many(&mut rt, set, stream, &[data, bytes.len() as u32, 0, 0]).unwrap();
+
+    let shell = rt.shell;
+    let crinst = abi::method_of("IShell", "CreateInstance").unwrap();
+    let ppv = rt.cpu.mem.alloc(4, 4).unwrap();
+    call_many(&mut rt, crinst, shell, &[g::AEECLSID_PNG, ppv]).unwrap();
+    let image = rt.cpu.mem.read_u32(ppv).unwrap();
+    let put = abi::method_of("IImage", "SetStream").unwrap();
+    call_many(&mut rt, put, image, &[stream]).unwrap();
+    let rasters = rt.image_frames[&image].rasters.clone();
+    assert_eq!(rasters.len(), 2);
+
+    let block = rt.snapshot();
+    let release = abi::method_of("IImage", "Release").unwrap();
+    call(&mut rt, release, image).unwrap();
+    assert!(rt.image_frames.get(&image).is_none());
+
+    rt.restore(&block).unwrap();
+    let frames = rt
+        .image_frames
+        .get(&image)
+        .expect("the restored frame list");
+    assert_eq!(frames.rasters, rasters);
+    assert_eq!(frames.delays, vec![5, 7]);
+    assert_eq!(frames.current, 0);
+    assert_eq!(rt.images[&image], rasters[0]);
+    for raster in rasters {
+        assert!(
+            rt.display.bitmap(raster).is_some(),
+            "restored raster {raster:#x}"
+        );
+    }
+}
+
+/// The IGraphics record is private, but its destination word is not: `QGraphics::m_pbmDst` lives at
+/// `+20` in the delivered source, and a pack that walks the record reads it instead of calling
+/// `GetDestination`. The host mirrors the same pointer there, and follows `SetDestination`.
+#[test]
+fn an_igraphics_mirrors_its_canvas_where_the_private_record_keeps_it() {
+    let mut rt = Runtime::new();
+    fake_module(&mut rt);
+    assert_eq!(rt.graphics_canvas_offset, 20);
+    let ig = new_service(&mut rt, g::AEECLSID_GRAPHICS);
+    let off = rt.graphics_canvas_offset;
+    let screen = rt.display.device_bitmap();
+    assert_eq!(
+        rt.cpu.mem.read_u32(ig + off).unwrap(),
+        screen,
+        "the screen is the canvas a fresh object draws into"
+    );
+
+    let dib = rt
+        .display
+        .new_bitmap(&mut rt.cpu.mem, &mut rt.hle, 4, 4, 16)
+        .unwrap();
+    let set = abi::method_of("IGraphics", "SetDestination").unwrap();
+    assert_eq!(call_many(&mut rt, set, ig, &[dib]).unwrap(), g::AEE_SUCCESS);
+    assert_eq!(rt.cpu.mem.read_u32(ig + off).unwrap(), dib);
+    assert_eq!(
+        call_many(&mut rt, set, ig, &[0]).unwrap(),
+        g::AEE_SUCCESS,
+        "a null destination means the device bitmap"
+    );
+    assert_eq!(rt.cpu.mem.read_u32(ig + off).unwrap(), screen);
+
+    // A profile that names no offset leaves the private record alone.
+    rt.graphics_canvas_offset = 0;
+    let other = new_service(&mut rt, g::AEECLSID_GRAPHICS);
+    assert_eq!(
+        rt.hle.object(other).expect("an object").len,
+        8,
+        "zero is the off switch: no word is reserved for a mirror"
+    );
 }

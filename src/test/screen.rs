@@ -91,7 +91,11 @@ fn the_screen_says_what_the_reference_capture_says() {
         f.screenshot().as_slice(),
         "a row-at-a-time conversion has to be the same bytes as the one-shot path"
     );
-    assert_eq!(screen.bands(), &[(0, 16)], "the first refresh is the whole screen");
+    assert_eq!(
+        screen.bands(),
+        &[(0, 16)],
+        "the first refresh is the whole screen"
+    );
     assert_eq!(screen.epoch(), f.display.presentations);
 }
 
@@ -112,7 +116,11 @@ fn a_present_of_the_same_picture_costs_no_conversion() {
         "the guest presented, but no row moved: {:?}",
         screen.bands()
     );
-    assert_eq!(screen.epoch(), f.display.presentations, "the epoch still moves");
+    assert_eq!(
+        screen.epoch(),
+        f.display.presentations,
+        "the epoch still moves"
+    );
 }
 
 #[test]
@@ -135,7 +143,11 @@ fn only_the_rows_that_moved_are_converted() {
     f.display.update(&f.mem, f.present, 0).unwrap();
     f.refresh(&mut screen);
 
-    assert_eq!(screen.bands(), &[(5, 6)], "one row moved, one row is reported");
+    assert_eq!(
+        screen.bands(),
+        &[(5, 6)],
+        "one row moved, one row is reported"
+    );
     assert_eq!(
         &screen.pixels()[5 * stride..5 * stride + 3],
         &[255, 0, 0],
@@ -325,7 +337,11 @@ fn an_indexed_screen_still_reaches_a_565_consumer() {
     f.display.flush_deferred(&f.mem).unwrap();
     let mut screen = Screen::with_format(Format::Rgb565);
     f.refresh(&mut screen);
-    assert_eq!(screen.bands(), &[(0, 8)], "a full conversion is a full screen");
+    assert_eq!(
+        screen.bands(),
+        &[(0, 8)],
+        "a full conversion is a full screen"
+    );
     assert_eq!(screen.stride(), 16 * 2);
     assert_eq!(unpacked(screen.pixels()), f.screenshot());
 
@@ -462,5 +478,51 @@ fn every_format_describes_the_same_picture() {
         (words.stride(), bytes.stride(), wide.stride()),
         (12 * 2, 12 * 3, 12 * 4),
         "and each says how wide a row is, which is what an uploader needs"
+    );
+}
+
+/// A 32-bpp frame reaches a consumer as colour through the same row-shadow path as 565: the shadow
+/// is four bytes a pixel, and only rows that actually moved are converted.
+#[test]
+fn a_32_bpp_screen_reaches_a_consumer_as_colour() {
+    let mut mem = Mem::new();
+    mem.set_heap(layout::HEAP_BASE, layout::HEAP_LIMIT);
+    let mut hle = Hle::new();
+    let mut display = Display::new_with_layout(&mut mem, &mut hle, 2, 1, 32, 32, 128).unwrap();
+    let present = display.create_display(&mut mem, &mut hle).unwrap();
+    mem.write_u32(display.device.px, 0x0012_3456).unwrap();
+    mem.write_u32(display.device.px + 4, 0x00ab_cdef).unwrap();
+    display.update(&mem, present, 0).unwrap();
+
+    let mut screen = Screen::with_format(Format::Rgb888);
+    screen.refresh(&display, &mem).unwrap();
+    assert_eq!(
+        screen.pixels(),
+        &[0x12, 0x34, 0x56, 0xab, 0xcd, 0xef][..],
+        "the frame's own 888 words, untouched"
+    );
+    assert_eq!(screen.bands(), &[(0, 1)]);
+
+    // A present of the same picture costs one row compare and no output work.
+    display.update(&mem, present, 0).unwrap();
+    screen.refresh(&display, &mem).unwrap();
+    assert!(screen.bands().is_empty());
+
+    // One changed word produces one band and leaves the neighbour alone.
+    mem.write_u32(display.device.px, 0x00ff_0000).unwrap();
+    display.update(&mem, present, 0).unwrap();
+    screen.refresh(&display, &mem).unwrap();
+    assert_eq!(screen.bands(), &[(0, 1)]);
+    assert_eq!(screen.pixels(), &[0xff, 0, 0, 0xab, 0xcd, 0xef][..]);
+
+    let mut words = Screen::with_format(Format::Rgb565);
+    words.refresh(&display, &mem).unwrap();
+    assert_eq!(
+        words.pixels(),
+        &[
+            pack565(0xff, 0, 0).to_le_bytes(),
+            pack565(0xab, 0xcd, 0xef).to_le_bytes()
+        ]
+        .concat()[..]
     );
 }

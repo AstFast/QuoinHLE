@@ -7,8 +7,11 @@
 use super::*;
 
 impl Runtime {
-    /// The `IMedia` slots, for the two media classes this host serves: `AEECLSID_MEDIAMIDI` and
-    /// `AEECLSID_MEDIAMP3`.
+    /// The `IMedia` slots, for the media classes this host serves: `AEECLSID_MEDIAMIDI`,
+    /// `AEECLSID_MEDIAMP3`, `AEECLSID_MEDIAQCP`, `AEECLSID_MEDIAAAC`, `AEECLSID_MEDIAMMF` and the
+    /// The carrier SPF face `AEECLSID_MEDIAPHR`. The three Yamaha faces (`MIDI`, `MMF`, `SPF`) differ only
+    /// in a format flag, exactly as `IMediaMA3` registers them (`audio/mid`, `audio/mmf`,
+    /// `audio/spf`).
     ///
     /// A media controller and a sound player are the same object in two shapes. The caller names bytes
     /// — `SetMediaParm(MM_PARM_MEDIA_DATA, AEEMediaData *, 0)`, and that struct is a class id, a
@@ -16,11 +19,11 @@ impl Runtime {
     /// `Play`. So this answers through the [`Player`] record an `ISoundPlayer` already uses, and the
     /// front end's voice-per-object polling picks the clip up with no new machinery behind it.
     ///
-    /// What it does not model is *time*, for the same reason the sound player does not: there is no
-    /// playback position to seek against, so `GetState` says nothing is changing and a registered
-    /// notify is kept and never fired — which is why `GetTotalTime` refuses rather than answering
-    /// `AEE_SUCCESS` with a duration that would have to arrive on a notification nobody sends (see
-    /// the arm). Recording is a different device
+    /// Time is the pump's, not this object's: a `Play` that reaches a clip this host can time opens
+    /// a window (`tick_at`/`pass_at`) and the dispatch loop turns those deadlines into the
+    /// `MM_STATUS_*` jobs the `RegisterNotify` pair asks for. `GetTotalTime` and `MM_PARM_POS` work
+    /// against that same clip, which is why a position this host cannot measure is refused by name
+    /// rather than answered with a plausible number. Recording is a different device
     /// entirely and answers `AEE_EUNSUPPORTED` rather than pretending to a microphone. A parameter this
     /// record has no room for is accepted and *noted*, because a silent yes is the one answer a later
     /// reader cannot tell from a real one.
@@ -80,7 +83,7 @@ impl Runtime {
 
     /// `AEEMediaUtil_FindClass`: the class id one `AEEMediaData` resolves to, or the error the body
     /// answers instead (`MM_ENOTENOUGHTDATA`, `MM_ENOMEDIAMEMORY`, `MM_EBADMEDIADATA`). The order is
-    /// the shipped one: the `DetectType` probe, the file extension, then the bytes.
+    /// the reference one: the `DetectType` probe, the file extension, then the bytes.
     pub(crate) fn media_util_find_class(&mut self, pmd: u32) -> HResult<u32> {
         let at = |field: &str| {
             abi::offset_of("AEEMediaData", field).expect("AEEMediaData is in the tables")
@@ -148,9 +151,15 @@ impl Runtime {
     }
 
     /// `IMediaUtil` — `AEEMediaUtil_CreateMedia` and its `FindClass`, plus the two slots this box has
-    /// no body for. The shipped class is a singleton (`gsMediaUtil`, `AddRef`→1, `Release`→0); this
+    /// no body for. The reference class is a singleton (`gsMediaUtil`, `AddRef`→1, `Release`→0); this
     /// host models it as an ordinary service object.
-    pub(crate) fn imediautil(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn imediautil(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -251,7 +260,7 @@ impl Runtime {
     pub(crate) fn posdet_born(&mut self, clsid: u32, ppv: u32) -> Result<u32, Error> {
         if ppv == 0 {
             // `AEE_CreateInstanceEx` answers `AEE_EBADPARM` for a null slot before its class table is
-            // consulted at all; the shipped constructor, which the shell calls only after that, would
+            // consulted at all; the reference constructor, which the shell calls only after that, would
             // have written through address zero.
             return Ok(g::AEE_EBADPARM);
         }
@@ -288,8 +297,8 @@ impl Runtime {
     /// One entry of the delivered uncertainty table, by the index the body uses.
     ///
     /// The body multiplies a `uint8` by eight and adds it to the table, so an index past entry 31
-    /// reads the debug strings that follow it in the shipped image and calls one of those a distance
-    /// in metres. There is no witness for what such a number *should* be, so this host says so out
+    /// reads the debug strings that follow it in the guest image and calls one of those a distance
+    /// in metres. There is no record for what such a number *should* be, so this host says so out
     /// loud and leaves the caller's own bytes alone instead of inventing a reading.
     pub(crate) fn posdet_unc(&mut self, index: u32, what: &str) -> Option<f64> {
         if let Some(value) = POSDET_UNC.get(index as usize) {
@@ -314,7 +323,7 @@ impl Runtime {
         let field = |name: &str| {
             abi::offset_of("AEEGPSInfo", name).expect("AEEGPSInfo is in the ABI tables")
         };
-        // ⚠ The align-4 spelling is the one the shipped code uses: its `Heading` sits at `+28`, an
+        // ⚠ The align-4 spelling is the one the platform code uses: its `Heading` sits at `+28`, an
         // unaligned double written as two words, and `+32` is where its `HorVelocity` begins. The
         // table's `AEEPositionInfoEx` row is the align-8 layout of a *different* build.
         if self.cpu.mem.read_u32(out)? != position("AltitudeUnc") + 8 {
@@ -434,7 +443,7 @@ impl Runtime {
     /// The one thing every request-shaped slot of this family ends with: `bridle_SystemCall` with an
     /// `OEMPosDet` software-call number folded in (`0x600000` for the configuration, `0x500000` for a
     /// GPS fix, `0x700000` for the serving sector, `0x800000` for an orientation). This host delivers
-    /// no such device, so the answer is the device's own failure code — the shipped slots pass that
+    /// no such device, so the answer is the device's own failure code — the reference slots pass that
     /// number straight out, or ignore it — with one sentence in the report naming what is missing.
     pub(crate) fn posdet_device(&mut self, what: &str) -> u32 {
         self.display.note(format!(
@@ -462,7 +471,13 @@ impl Runtime {
     /// What stays in code is what this host *can* answer differently: the version gates on
     /// `+40`, the parameter gates, `pfnNotify`, and the whole of `ExtractPositionInfo`, which asks
     /// nothing of the platform at all.
-    pub(crate) fn iposdet(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn iposdet(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -532,7 +547,7 @@ impl Runtime {
                 if pc == 0 {
                     return Ok(g::AEE_EBADPARM);
                 }
-                // The shipped `aee_memmove(pc, obj + 44, 20)` — the object's own store, which on this
+                // The reference `aee_memmove(pc, obj + 44, 20)` — the object's own store, which on this
                 // host is the zeroed block `aee_malloc` handed out (the delivered allocator clears by
                 // default) and nothing has ever written. The `_20` swap-back of the mirror cannot
                 // disagree with these bytes, because the only writer of that mirror is the `Set` above.
@@ -584,14 +599,20 @@ impl Runtime {
     }
 
     /// The `IRingerMgr` slots. This family's body is the OEM's, and the only copy of it this box has is
-    /// real source — the shipped 235 members hold no ringer object — so the
-    /// source is the highest witness available here, and every answer below is taken from it line for
+    /// real source — the reference 235 members hold no ringer object — so the
+    /// source is the highest record available here, and every answer below is taken from it line for
     /// line.
     ///
-    /// The object behind every slot is the run's one `gMgr`: the shipped `CRingerMgr_New` hands the same
+    /// The object behind every slot is the run's one `gMgr`: the reference `CRingerMgr_New` hands the same
     /// static to each `CreateInstance`, so a second holder sees the first holder's enumeration cursors,
     /// its category table and its `PFNRINGEREVENT` — not a fresh set of its own.
-    pub(crate) fn iringermgr(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn iringermgr(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -691,7 +712,7 @@ impl Runtime {
                 let size = abi::struct_info("AEERingerInfo")
                     .expect("AEERingerInfo is in the tables")
                     .size as usize;
-                // `if (pi) MEMSET(pi, 0, sizeof(AEERingerInfo));` — the shipped body clears only when it
+                // `if (pi) MEMSET(pi, 0, sizeof(AEERingerInfo));` — the documented behaviour clears only when it
                 // was given a record, then writes into it **without** any further gate: a null record
                 // with a file in the directory is a write to address zero on a handset. This host
                 // answers FALSE for that caller, and says so; the entry is still consumed, because the
@@ -708,7 +729,7 @@ impl Runtime {
                 if dst == 0 {
                     self.display.note(
                         "IRingerMgr::EnumNextRinger was handed a null record after taking an entry: \
-                         the shipped body writes into it and would fault there; this host answered \
+                         the platform routine writes into it and would fault there; this host answered \
                          FALSE and left the entry consumed",
                     );
                     return Ok(g::FALSE);
@@ -848,11 +869,11 @@ impl Runtime {
                 self.ringer.delay = dw_pause;
                 self.ringer.playing = true;
                 // The body's own order: register, name, play. `RegisterNotify` is called with the pair
-                // the shipped call carries — the callback's address is this host's, so only the manager's
+                // the reference call carries — the callback's address is this host's, so only the manager's
                 // own address travels as `pUser`.
                 self.ringer_player_slot("RegisterNotify", player, &[0, this])?;
                 if let Some(name) = &named {
-                    // `ISOUNDPLAYER_Set(pPlayer, SDT_FILE, pszFile)`. The pointer the shipped call hands
+                    // `ISOUNDPLAYER_Set(pPlayer, SDT_FILE, pszFile)`. The pointer the reference call hands
                     // over is the caller's own, and the player copies it; this host resolved the name out
                     // of the walk, so it goes into a block that is given back the moment that copy is
                     // made — which is the same lifetime the caller's string had on a handset.
@@ -889,7 +910,7 @@ impl Runtime {
     /// forgets the address too, because its object layer drops the record at zero — the next
     /// `CreateInstance` re-runs `CRingerMgr_New` and gets fresh cursors either way.
     ///
-    /// The notification inside that `Stop` is what the shipped `m_bInRelease` latch exists for: the body
+    /// The notification inside that `Stop` is what the reference `m_bInRelease` latch exists for: the body
     /// takes a reference around the guest call and gives it back with a `Release` that reaches zero
     /// again, so without the latch the teardown would run once more per event delivered.
     pub(crate) fn ringer_died(&mut self, addr: u32) -> Result<(), Error> {
@@ -898,7 +919,7 @@ impl Runtime {
         }
         self.ringer.in_release = true;
         // The object layer gives this address up at the top of the release hook — `Display::forget` is
-        // the line that forgets it, and it runs before this one — but the shipped static stays
+        // the line that forgets it, and it runs before this one — but the reference static stays
         // addressable for the whole teardown: `CRingerMgr_Notify` counts references on `pme` and the
         // pack's handler may call any slot of the manager from inside the notification. So the record is
         // claimed back for the duration, and the release the notification makes gives it up again —
@@ -907,7 +928,7 @@ impl Runtime {
             self.hle
                 .adopt_object(addr, "IRingerMgr", g::AEECLSID_RINGERMGR, 4);
         }
-        // The shipped order is `IFILEMGR_Release`, `Stop`, `FinishCreate`, `MEMSET`. This host has no
+        // The reference order is `IFILEMGR_Release`, `Stop`, `FinishCreate`, `MEMSET`. This host has no
         // file manager of its own to give back — it reads [`Runtime::volume`] directly — so what is
         // left is the pass and anything a create left in flight, whose `ARE_CREATE` with
         // `EINCOMPLETEITEM` goes out from inside this release.
@@ -951,7 +972,7 @@ impl Runtime {
         Ok(g::AEE_SUCCESS)
     }
 
-    /// `CRingerMgr_Notify`: the event door, with the shipped body's reference dance around the call.
+    /// `CRingerMgr_Notify`: the event door, with the documented behaviour's reference dance around the call.
     /// That dance is not decoration — the return value is `Release(...) != 0`, so a handler that gave up
     /// its last reference from inside its own notification makes this answer FALSE, and the one caller
     /// that reads it ([`Runtime::ringer_sound_status`]) drops the replay timer it was about to arm. With
@@ -1011,9 +1032,14 @@ impl Runtime {
     /// them takes a word on the stack, so `r1..r3` are the whole list; they go back before the answer
     /// travels. The nested call is the **manager's**, not the pack's, and that is what makes the player's
     /// own reports — `PLAY_CB` for a `Play`, `STATUS_CB` for a `Set` — arrive inside the `IRingerMgr` slot
-    /// that asked for them, in the order the shipped bodies put them.
+    /// that asked for them, in the order the platform's own routines put them.
     #[inline(never)]
-    pub(crate) fn ringer_player_slot(&mut self, name: &str, player: u32, args: &[u32]) -> Result<u32, Error> {
+    pub(crate) fn ringer_player_slot(
+        &mut self,
+        name: &str,
+        player: u32,
+        args: &[u32],
+    ) -> Result<u32, Error> {
         let id = abi::method_of("ISoundPlayer", name).ok_or(HleError::Unimplemented {
             id: 0,
             label: "ISoundPlayer".to_string(),
@@ -1299,7 +1325,11 @@ impl Runtime {
     /// inside `EnumNextRinger` — so a walk that finds nothing still leaves the **last examined** entry
     /// in the caller's memory, which is what its own stack `AEERingerInfo` holds when `GetRingerInfo`
     /// answers `EFAILED`. `dst == 0` is that stack record: the same walk, nothing written.
-    pub(crate) fn ringer_find(&mut self, dst: u32, want: RingerWant) -> Result<Option<RingerEntry>, Error> {
+    pub(crate) fn ringer_find(
+        &mut self,
+        dst: u32,
+        want: RingerWant,
+    ) -> Result<Option<RingerEntry>, Error> {
         if self.ringer_walk_init() != g::AEE_SUCCESS {
             return Ok(None);
         }
@@ -1626,10 +1656,10 @@ impl Runtime {
             // `Resume` and `Pause` are split on the header's own distinction rather than on this
             // host's: a start is a pass from the top, a resume carries the elapsed time it picked up
             // at, and this host does keep a position to come back to. ⚠ **Contract-derived, with no
-            // pack witness**: across the sweep logs the method-level `IMedia` lines are `Play` 65,
+            // pack record**: across the sweep logs the method-level `IMedia` lines are `Play` 65,
             // `GetState` 64, `SetMediaParm` 7, `RegisterNotify` 7, `Stop` 1, `Release` 1, and
             // `Resume`/`Pause`/`Seek` **0** each (`Hle::HISTORY` truncates a long call log, so those
-            // are "what survived the window", not "never"). No pack in the corpus has ever resumed or
+            // are "what survived the window", not "never"). No pack in the sample set has ever resumed or
             // paused through this door, which is also why the frame regression is the thing that would
             // catch a mistake here rather than a test.
             "Resume" => {
@@ -1659,7 +1689,7 @@ impl Runtime {
                 player.tick_at = 0;
                 player.pass_at = 0;
                 // `MM_STATUS_PAUSE` carries "Elapsed Time in MS" in the header's own table, and the
-                // shipped sample reads exactly that (`if (dwSize)` then `pCmdData / 1000`). This arm
+                // reference sample reads exactly that (`if (dwSize)` then `pCmdData / 1000`). This arm
                 // used to answer with silence, on the reasoning that a number would be invented —
                 // see the `Resume` split above for what changed. The silence is kept for the one case
                 // where it is still true: nobody registered, so there is no handler to carry it.
@@ -1667,7 +1697,7 @@ impl Runtime {
             }
             // `IMedia_Seek(IMedia*, AEEMediaSeek eSeek, int32 lTimeMS)`,
             // and `lTimeMS` is milliseconds. **Signed**, which the Seek paragraph never says out loud —
-            // the witness is the type (`int32`) plus its sibling `IMedia_SeekFrame`, whose own parameter
+            // the record is the type (`int32`) plus its sibling `IMedia_SeekFrame`, whose own parameter
             // line reads "Number of frames. Negative indicates reverse direction".
             // So the arithmetic below goes through `i64` rather than the
             // `u32` the register hands over: read as unsigned, `MM_SEEK_END, -5 000` on a 30 000 ms clip
@@ -1774,12 +1804,12 @@ impl Runtime {
             //
             // This arm used to answer `AEE_EUNSUPPORTED` outright, on the reasoning that the length
             // arrives through a callback this host did not implement, which is the reason `Job::Media`
-            // exists. The witness counts are: across the sweep logs the method-level lines are
+            // exists. The record counts are: across the sweep logs the method-level lines are
             // `IMedia::Play` 65, `GetState` 64, `SetMediaParm` 7, `RegisterNotify` 7, `Stop` 1,
             // `Release` 1, and `GetTotalTime` **0** (`Hle::HISTORY` truncates a long call log, so those
             // are "what survived the window", not "never"). That leaves `GetTotalTime`, `Pause`,
-            // `Resume` and `Seek` at zero: nobody in the corpus has ever asked this
-            // question — which means the answer below is **contract-derived, with no pack witness at
+            // `Resume` and `Seek` at zero: nobody in the sample set has ever asked this
+            // question — which means the answer below is **contract-derived, with no pack record at
             // all**, and it is the reason `IMedia::RegisterNotify`'s seven hits are load-bearing:
             // those packs did register, and this host calls them back.
             //
@@ -1814,12 +1844,12 @@ impl Runtime {
                     match timed {
                         Some(ms) => {
                             // The milliseconds travel **in** `pCmdData`, not behind it — that is how
-                            // the shipped sample reads it, and the header's
+                            // the reference sample reads it, and the header's
                             // own table calls these entries "values" while it says "points to this
                             // structure" for the one case that really is a pointer (`AEEMediaAudioSync`).
                             // ⚠ This is the one place in the channel where the two readings cannot both
                             // be honoured: a pack that dereferenced the field would read guest memory
-                            // at an address equal to the length. The sample is the witness this host
+                            // at an address equal to the length. The sample is the record this host
                             // follows, and the frame regression is what would catch the other shape.
                             self.queue.push_back(Job::Media {
                                 player: this,
@@ -1881,7 +1911,7 @@ impl Runtime {
         // the new one. `arm_notify` is shape-agnostic — the schedule is identical for both interfaces,
         // and only the *shape* of what the pump enqueues differs (see its `sounding` loop).
         self.arm_notify(this);
-        // `MM_STATUS_START` is "[Play/Rec] Playback/Recording has started" and the shipped sample
+        // `MM_STATUS_START` is "[Play/Rec] Playback/Recording has started" and the reference sample
         // branches on it to move its own menu selection, so a play that never says it began leaves the
         // caller waiting for news only this host can give. It is told **only for a pass the arming
         // above accepted**: a clip this host cannot parse gets no start either, because a start is the
@@ -1995,7 +2025,13 @@ impl Runtime {
     /// `IASTREAM_Read` says a stream at its end answers. `Readable` and `Cancel` have nothing to do:
     /// every byte is already in memory, so there is no arrival to wait for and no callback to call
     /// off — the same answer `IUnzipAStream` gives them, for the same reason.
-    pub(crate) fn imemastream(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn imemastream(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         if !self.memstreams.contains_key(&this) {
             return Err(HleError::NotAnObject { addr: this }.into());
         }
@@ -2090,7 +2126,13 @@ impl Runtime {
         Ok(retval)
     }
 
-    pub(crate) fn isoundplayer(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn isoundplayer(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let mut player = self.players.get(&this).copied().unwrap_or_default();
         if !player.noted {
             player.noted = true;
@@ -2224,7 +2266,7 @@ impl Runtime {
                 // right after the internal `Stop` and never reaches the ordinary accept answer.
                 let mut swapped = false;
                 if player.pending {
-                    // The shipped second-`Play` machine: `if ( m_bDataSet && !m_bPlayIssued ) {
+                    // The reference second-`Play` machine: `if ( m_bDataSet && !m_bPlayIssued ) {
                     // m_bDataSet = FALSE; m_bPlayIssued = TRUE; Stop; return; }`, and when that
                     // stop completes `MediaNotify` swaps `m_pMedia = m_pMediaPending` and calls
                     // `Play` again. What the pack hears is the interrupted clip finishing — a
@@ -2304,7 +2346,7 @@ impl Runtime {
                 }
                 0
             }
-            // `Resume` is the control slot, not a second `Play`: the shipped `Resume` has no
+            // `Resume` is the control slot, not a second `Play`: the reference `Resume` has no
             // second-play branch of its own, so a naming queued during the clip is left for `Play`
             // to consume.
             "Resume" => {
@@ -2332,7 +2374,7 @@ impl Runtime {
                 // changes nothing. `m_pMedia`'s counterpart here is a naming that resolved to
                 // something (the media class itself is not modelled).
                 if player.playing && player.input != 0 && player.data != 0 {
-                    // The shipped stop completion is what clears `m_bDataSet`, so a naming queued by
+                    // The reference stop completion is what clears `m_bDataSet`, so a naming queued by
                     // a `Set` during the clip is dropped rather than carried into the next `Play`.
                     player.pending = false;
                     player.playing = false;
@@ -2572,11 +2614,11 @@ impl Runtime {
             // `AEESoundPlayer_GetTotalTime` is `void`, and the length travels on
             // `AEE_SOUNDPLAYER_TIME_CB` — "Get time callback" — which this host had never raised
             // anywhere: a pack that asked for the length and waited for the number had nothing to
-            // wait for. The shipped slot raises two reports, because its device answers late:
+            // wait for. The reference slot raises two reports, because its device answers late:
             // `AEESoundPlayer_NotifyCmdSuccess(a1, 2)` with a null `dwParam` for the accepted query,
             // then the device's own notify with the number. This host knows the number at the moment
             // it is asked, so it raises the one report that carries it, on the same channel and with
-            // the same status code. ⚠ The `r0` this slot returns is the other divergence: the shipped
+            // the same status code. ⚠ The `r0` this slot returns is the other divergence: the reference
             // slot leaves there the callback's own result, and a pack compiled against `void` never
             // reads it — this host still answers the number, because its own tests and report read it.
             "GetTotalTime" => {
@@ -2622,7 +2664,7 @@ impl Runtime {
                 if kind == g::SDT_FILE as i32 {
                     // `case SDT_FILE:` opens with a comparison the delivered object could not be
                     // read for — its literal-pool word carries a relocation onto that object's own
-                    // vtable, not onto a string — but the shipped source spells the operand out:
+                    // vtable, not onto a string — but the published description spells the operand out:
                     // `if ( STRCMP((char *)pInfo->pData, "") == 0 ) return EBADPARM;`. So a blank
                     // name is a refusal, and it is the first statement of the branch.
                     //
@@ -2652,7 +2694,7 @@ impl Runtime {
                 player.tick_at = 0;
                 player.pass_at = 0;
                 player.position = 0;
-                // The shipped tail — `if ( (record[+80] & 2) == 0 ) record[+20] =
+                // The reference tail — `if ( (record[+80] & 2) == 0 ) record[+20] =
                 // AEESoundPlayer_NewMedia(record, record + 28);` — is the step that turns the naming
                 // into a media object, and on this host that is `note_audio_source` plus the
                 // arming in [`Runtime::arm_notify`], both run below for every call.
@@ -2668,7 +2710,7 @@ impl Runtime {
                 //
                 // NULL is a **status query**: the same gate `SetInfo` opens with answers
                 // `AEE_EITEMBUSY`, and a player with nothing in flight answers `AEE_EIDLE`. This
-                // host used to answer `AEE_EBADPARM` for both, which is a code the shipped body never
+                // host used to answer `AEE_EBADPARM` for both, which is a code the documented behaviour never
                 // returns from this slot.
                 let [pinfo] = self.args()?;
                 if pinfo == 0 {
@@ -2734,7 +2776,7 @@ impl Runtime {
             return Ok(());
         };
         // The ringer manager's own player answers to a host callback rather than to a guest one; see
-        // [`Player::host_ringer`]. Everything the shipped `CRingerMgr_SoundStatus` does with a report it
+        // [`Player::host_ringer`]. Everything the reference `CRingerMgr_SoundStatus` does with a report it
         // does not act on is: nothing.
         if player.host_ringer != 0 {
             return self.ringer_sound_status(cmd, status);
@@ -2814,16 +2856,22 @@ impl Runtime {
     /// Call the status function an `ISound` was given, in the caller's own frame.
     ///
     /// This is the door `AEESound_StatusNotify` uses, and it is the one place a refusal by these
-    /// slots can be heard: the shipped code calls the handler before its own slot returns, so a pack
+    /// slots can be heard: the platform code calls the handler before its own slot returns, so a pack
     /// that asked for a tone outside the published list is told so *during* the call. Everything the
     /// hardware would report later travels as [`Job::Tone`] instead, which is what
     /// `AEESound_StatusCB` does when it fills a record and hands it to `AEE_ResumeCallback`.
     ///
-    /// The shipped function brackets the handler with the interface's own `AddRef` and `Release` so
+    /// The reference function brackets the handler with the interface's own `AddRef` and `Release` so
     /// the object cannot die underneath it; this host cannot, because its cleanup runs in the
     /// `Release` dispatch rather than on the count reaching zero inside a host-side reference. So
     /// [`Runtime::tone_write_back`] checks for the one case that bracket was there to prevent.
-    pub(crate) fn tone_notify(&mut self, tone: &Tone, cmd: u32, status: u32, param: u32) -> Result<(), Error> {
+    pub(crate) fn tone_notify(
+        &mut self,
+        tone: &Tone,
+        cmd: u32,
+        status: u32,
+        param: u32,
+    ) -> Result<(), Error> {
         if tone.pfn == 0 {
             return Ok(());
         }
@@ -2834,7 +2882,7 @@ impl Runtime {
     /// Queue the `AEE_SOUND_SUCCESS` that the published status lists promise for `ISOUND_StopTone` and
     /// `ISOUND_SetVolume` — the two slots whose whole job is a request the host can answer at once.
     /// The two vibration slots are deliberately not among them: their own side-effects lines say
-    /// "This function does not cause any callback", and the shipped
+    /// "This function does not cause any callback", and the reference
     /// bodies raise nothing. The play slots are not either: `AEESound_PlayTone`'s accepted path calls
     /// the OEM generator and counts the play, and the report that follows is the end of the play, not
     /// its start.
@@ -2871,7 +2919,7 @@ impl Runtime {
     /// of no length. The pending count then waits for a stop, which is what a handset does too.
     ///
     /// The answer says whether this frame reached the caller's own function, which is what the caller
-    /// needs before it writes anything back: the shipped code stores its state *first* and raises the
+    /// needs before it writes anything back: the platform code stores its state *first* and raises the
     /// status function *after* (`AEESound_PlayToneList` writes its four list fields, then calls
     /// `AEESound_PlayTone`), so a handler that answers the report by calling the interface back is the
     /// last writer. A frame that stored its own copy afterwards would undo that call.
@@ -2888,12 +2936,12 @@ impl Runtime {
             // `AEESound_StatusNotify(a1, 3)` — a `AEE_SOUND_FAILURE` handed to the caller's function
             // before the slot returns, and the tone is never counted as playing.
             //
-            // The bound is the shipped one, not `AEE_TONE_LAST`: that constant is `0x68`, a reserved
+            // The bound is the reference one, not `AEE_TONE_LAST`: that constant is `0x68`, a reserved
             // sentinel, while the published list ends at `AEE_TONE_PTT_FLOOR_AVAILABLE` = `0x63`, so
-            // the shipped `100` is exactly one past the highest id a pack may name. Ids 100 to 103
+            // the reference `100` is exactly one past the highest id a pack may name. Ids 100 to 103
             // name nothing any header lists; on a handset they are the OEM tone database's problem,
             // which is not the same thing as a valid id.
-            // The shipped test is written against `(char)` arguments, so its two halves are a sign
+            // The reference test is written against `(char)` arguments, so its two halves are a sign
             // test and a range test. Only the range half is modelled here: the id arrives as a
             // 32-bit word, `AEE_TONE_FIRST` is zero, and the narrowing's signedness decides whether
             // ids 128-255 are the "negative" case — a reading this host has not confirmed, so it
@@ -2963,7 +3011,13 @@ impl Runtime {
     /// Like [`Runtime::irscpool`], this arm returns the runtime's own error type rather than an
     /// `HleError`: refusing a tone by calling the caller's handler is a downcall, and a handler that
     /// faults or that stops the run is not a gap in the host.
-    pub(crate) fn isound(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn isound(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let mut tone = self.tones.get(&this).copied().unwrap_or_default();
         if !tone.noted {
             tone.noted = true;
@@ -3100,7 +3154,7 @@ impl Runtime {
                 // `AEESound_PlayToneList` stores the caller's pointer instead of copying the list and
                 // truncates the length into a `uint16` field, so the buffer belongs to the pack for
                 // as long as the list runs — each further item is read out of it when the previous
-                // one reports done. The four stores come first, exactly as they do in the shipped
+                // one reports done. The four stores come first, exactly as they do in the reference
                 // body (`+120` flag, `+122` index, `+124` count, `+128` pointer), and only then does
                 // it call `AEESound_PlayTone` for item zero, which may refuse and reach the handler.
                 tone.list = list;
@@ -3133,7 +3187,7 @@ impl Runtime {
                 if tone.list_active {
                     tone.list = 0;
                 }
-                // Cancelling the armed deadline is this host's own move: the shipped body stops the
+                // Cancelling the armed deadline is this host's own move: the documented behaviour stops the
                 // OEM generator and leaves the record's play flags alone, because the report that
                 // ends the play comes back from the OEM through `AEESound_AEECallbackNotify`. Here
                 // there is no other party to report the end of a tone the caller has just stopped, so
@@ -3178,7 +3232,13 @@ impl Runtime {
     /// The bridged `IAStream` — the other direction, an `IAStream` face over a source the caller owns.
     /// Its vtable has no `QueryInterface` at all (`gvtSourceAStream_IAStream` is AddRef, Release,
     /// Readable, Read, Cancel), which is what the vendored five-slot table says too.
-    pub(crate) fn iastream(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn iastream(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || {
             Error::Hle(HleError::Unimplemented {
                 id,
@@ -3186,7 +3246,7 @@ impl Runtime {
                 this,
             })
         };
-        // A host-made `IMemAStream` reached through its `IAStream` face is the shipped shape — the
+        // A host-made `IMemAStream` reached through its `IAStream` face is the reference shape — the
         // delivered `CMemStream` vtable **is** an `IAStream`'s — and a pack that calls `IASTREAM_Read`
         // on one ended the run here, because this arm only knew the bridged source. Forward to the
         // record the class was created under.
@@ -3211,7 +3271,7 @@ impl Runtime {
             // function and context are written into the record's own embedded callback, at the offsets
             // `_AEECallback` gives its notify pair, and the *source* is told to call that callback. So
             // when the pack's source has bytes it runs the pack's own function with the pack's own
-            // context, exactly as the shipped object arranges. With no function named, the body only
+            // context, exactly as the reference object arranges. With no function named, the body only
             // cancels.
             "Readable" => {
                 let [pfn, ctx] = self.args()?;
@@ -3241,5 +3301,4 @@ impl Runtime {
             _ => Err(unimplemented()),
         }
     }
-
 }

@@ -23,7 +23,7 @@ exclude = ["platform/web", "third_party/rynarmic"]
 # `cpal`, `winit`, `glutin` and the glyph crates are Apache-2.0 alone, which is
 # compatible with GPL-3.0 and not with GPL-2.0-only.
 [workspace.package]
-version = "0.0.1-alpha"
+version = "0.0.1-beta"
 license = "GPL-2.0-or-later"
 
 [dependencies]
@@ -77,7 +77,7 @@ rynarmic = { path = "third_party/rynarmic/rynarmic", optional = true }
 # can fail before a note is heard.
 cpal = { version = "0.18.2", optional = true }
 
-# A SoundFont MIDI synthesizer: pure Rust, and no dependencies of its own. The corpus is 616 payloads
+# A SoundFont MIDI synthesizer: pure Rust, and no dependencies of its own. The sample set holds many payloads
 # this host plays as `audio/mid` and not one waveform (both corpora, 827 packs; an earlier
 # figure here under-reported by 2.7x), so the sound to make is a score played by an
 # instrument, and the instrument is not something a pack carries. The `.sf2` bank is deliberately
@@ -105,7 +105,7 @@ midly = { version = "0.5.3", default-features = false, features = ["std"] }
 # the guest execution path: it decides what a vertex becomes, never what an instruction does.
 glam = "0.29"
 
-# Shift-JIS, for the `FD FE`-marked strings the KDDI containers carry. Turning one encoding into
+# Shift-JIS, for the `FD FE`-marked strings the carrier containers carry. Turning one encoding into
 # another is a decoder's job and sits outside the guest execution path; the alternative was a
 # transcription table this host would have had to own. Pure Rust, no C toolchain.
 encoding_rs = "0.8"
@@ -145,11 +145,11 @@ eframe = { version = "0.31", optional = true, default-features = false, features
 ] }
 # The deflate half of `IUnzipAStream`, and the gzip container a pack wraps its own module in. Pure
 # Rust (miniz_oxide) by default, so it adds no C toolchain to a build that already has to link with
-# mingw; a pack in the corpus ships its `program.bin` as a gzip stream, and
+# mingw; a pack in the sample set ships its `program.bin` as a gzip stream, and
 # inflating that stream is what produces the module the pack runs.
 flate2 = "1.1.10"
 
-# Disassembly, for `--disasm` and for the listing a fault report prints of its own program counter.
+# Inspection, for `--disasm` and for the listing a fault report prints of its own program counter.
 #
 # `yaxpeax-arm` is a decoder and not an emulator, and it is pure Rust with no C toolchain — which is
 # the reason it is here rather than `capstone`, whose C sources would be one more thing to get built
@@ -162,14 +162,14 @@ flate2 = "1.1.10"
 yaxpeax-arm = { version = "0.5.0", default-features = false }
 yaxpeax-arch = { version = "0.3.2", default-features = false }
 
-# A pack's pictures are not always BMPs. One pack in the corpus keeps every image
+# A pack's pictures are not always BMPs. One pack in the sample set keeps every image
 # as a PNG (and as four private formats this host still has no decoder for), so a
 # viewer request for one of its resources used to be answered with a null - which
 # the app stored and dereferenced. Pure Rust, like the rest, so the mingw build
 # gains no C toolchain.
 png = "0.18.1"
 
-# The other picture format the corpus declares. `aeejpeg/AEEJPEGViewer.o` is the shipped JPEG decoder and
+# The other picture format the sample set declares. `a carrier's JPEG decoder` is the reference JPEG decoder and
 # its own bodies are delivered (`objs/aeejpeg/jpegdecoder.o`, `idct.o`, `h2v2.o`), so the class
 # `AEECLSID_JPEGDECODER` has always been servable — what this host lacked was only a JPEG decoder of its
 # own. Pure Rust, so the mingw build gains no C toolchain. `default-features = false` keeps `rayon` out:
@@ -185,7 +185,7 @@ des = "0.9.0"
 
 # `IHash`'s MD5 class (`AEECLSID_MD5`, `src/hash.rs`). Pure Rust with no dependencies of its own, and
 # like `des` it answers a function the guest asks the *host* for rather than a step on the guest's
-# execution path. The corpus asks for MD5 and for no other hash: the S7 client behind Sprint Mail and
+# execution path. The sample set asks for MD5 and for no other hash: the S7 client behind Sprint Mail and
 # Mobile Email creates one while building its platform layer, and treats the refusal as fatal.
 md5 = "0.7.0"
 # `rustls` is the TLS state machine `aeessl/AEESSL.o` implements: `ISSL::Negotiate` is a
@@ -199,7 +199,7 @@ webpki-roots = "1.0.11"
 # path without the subject-name check, which is exactly what the delivered member does (it sends
 # no SNI and never sets a host). rustls itself only re-exports its `RootCertStore`.
 rustls-webpki = "0.103"
-# The third picture format the corpus declares: `GIF87a`/`GIF89a` to an indexed `IBitmap`
+# The third picture format the sample set declares: `GIF87a`/`GIF89a` to an indexed `IBitmap`
 # (`resource::gif`). No delivered member decodes it, so what this decoder backs is the host's own
 # answer rather than a class the guest can reach. Pure Rust, so the mingw build gains no C toolchain.
 gif = "0.14.2"
@@ -250,7 +250,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = 
 rfd = { version = "0.15", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-# `Platform/android/entry.rs` uses both to request media permissions through JNI.
+# `platform/android/entry.rs` uses both to request media permissions through JNI.
 android-activity = "0.6"
 jni = "0.22"
 
@@ -316,9 +316,9 @@ name = "quoin"
 path = "src/main.rs"
 
 # Interpreter throughput on hand-written guest bytes - no pack, no HLE, no window,
-# so nothing here needs an external corpus. `harness = false` keeps it on the
+# so nothing here needs an external sample set. `harness = false` keeps it on the
 # stable toolchain and adds no dependency: `#[bench]` would need nightly. Run
-# *this target only*: a bare `cargo bench` also builds the corpus-gated
+# *this target only*: a bare `cargo bench` also builds the sample-gated
 # integration tests under `tests/`.
 [[bench]]
 name = "interp"

@@ -1,0 +1,22 @@
+{
+  "_note": "au by KDDI / Sony Ericsson W53S (BREW 3.1.2 era, CDMA 1X WIN). Screen 240x432 is the published W53S specification (2.7 inch Fullwide QVGA, 240x432), not 240x400: two independent spec tables give 432, and the packs' own art tops out at 240 wide. Firmware version and chip are left out — no W53S image is on this machine, so there is nothing to quote. The carrier's private classes still need --carrier kddi on the command line.",
+  "version": "1.0",
+  "screen": {
+    "width": 240,
+    "height": 432,
+    "color_depth": 16,
+    "frame_bpp": 16
+  },
+  "text": {
+    "encoding": 253,
+    "text_bytes": false,
+    "font_normal": 20,
+    "font_large": 24
+  },
+  "identity": {
+    "model_name": "W53S",
+    "manufacturer": "Sony Ericsson",
+    "friendly_name": "au W53S",
+    "subscriber_number": "09000000000"
+  }
+}

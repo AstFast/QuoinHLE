@@ -1,6 +1,6 @@
 [package]
 name = "quoin-web"
-version = "0.0.1-alpha"
+version = "0.0.1-beta"
 edition = "2021"
 publish = false
 # A literal because this crate is excluded from the root workspace (Trunk builds it

@@ -340,7 +340,7 @@ fn a_stop_in_the_load_phase_ends_the_run_before_the_applet() {
 
 /// A load that ran out of instructions is not a module that refused to publish an `IModule*`.
 ///
-/// The corpus has self-unpacking loaders whose `AEEMod_Load` needs 4–18 million instructions. A
+/// The sample set has self-unpacking loaders whose `AEEMod_Load` needs 4–18 million instructions. A
 /// headless run with a small `--session-ceiling` cuts them off mid-unpack; the old report then said
 /// "`--start` needs a module that published an IModule*", which sent the reader to the module's
 /// own code instead of to the budget. The two skip reasons must stay distinguishable.
@@ -602,25 +602,54 @@ fn every_dump_line_that_names_a_register_also_names_the_machine() {
     );
 }
 
+/// There is no developer tier any more: every option is accepted on every run. The gate used to
+/// turn a switch into a password — a command that named `--trace` had already said what it wanted,
+/// and refusing it only taught people to prefix `--dev` until it stopped being a decision.
+///
+/// What this pins is that no flag left the gate half-removed: each one parses far enough that the
+/// run stops for want of a pack, rather than being refused by name.
 #[test]
-fn the_memory_knobs_are_developer_flags() {
-    for flag in ["--heap-mb", "--heap-initial-kb", "--ram-mb"] {
-        let args = vec![flag.to_string(), "64".to_string()];
-        assert_eq!(developer_flag(&args), Some(flag));
-        let error = run(&args).expect_err("a memory knob without --dev is refused");
-        assert!(error.contains("--dev"), "{error}");
+fn diagnostics_no_longer_need_a_switch() {
+    for args in [
+        vec!["--trace"],
+        vec!["--heap-mb", "64"],
+        vec!["--heap-initial-kb", "512"],
+        vec!["--ram-mb", "128"],
+        vec!["--platform", "classic-1.2.3"],
+        vec!["--carrier", "kddi"],
+        vec!["--color-depth", "16"],
+        vec!["--watch", "0x20000000,4"],
+    ] {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let error = run(&args).expect_err("a run with no pack cannot succeed");
+        assert!(
+            !error.contains("--dev") && !error.contains("unknown"),
+            "{} should parse on its own, got: {error}",
+            args[0]
+        );
+        assert!(
+            error.contains("no .mod"),
+            "{} parsed, so the run should stop for want of a pack; got: {error}",
+            args[0]
+        );
     }
 }
 
+/// `--dev` is still accepted, as a no-op, because every command and script written against the old
+/// surface carries it. It must also stay invisible: the same arguments say the same thing with it
+/// and without it, so nobody has to wonder whether the run behaved differently.
 #[test]
-fn developer_flags_need_the_dev_switch() {
-    let args = vec!["--trace".to_string()];
-    assert_eq!(developer_flag(&args), Some("--trace"));
-    let error = run(&args).expect_err("a diagnostic flag without --dev is refused");
-    assert!(error.contains("--dev"), "{error}");
-
-    let with_dev = vec!["--dev".to_string(), "--trace".to_string()];
-    assert_eq!(developer_flag(&with_dev), Some("--trace"));
+fn the_old_dev_switch_is_a_no_op() {
+    let without = run(&["--trace".to_string()]).expect_err("no pack");
+    let with = run(&["--dev".to_string(), "--trace".to_string()]).expect_err("no pack");
+    assert_eq!(
+        with, without,
+        "--dev must not change what the rest of the line means"
+    );
+    assert!(
+        !with.contains("--dev"),
+        "and must not be reported as a problem: {with}"
+    );
 }
 
 /// `--start auto`'s verdict, which used to require the running applet to be the one the probe found.
@@ -629,8 +658,18 @@ fn developer_flags_need_the_dev_switch() {
 /// "created no applet".
 #[test]
 fn a_start_counts_when_something_is_running_afterwards() {
-    assert!(start_counts(0x2000_00b0, 0x2000_0150), "a handoff to another applet is a start");
-    assert!(start_counts(0x2000_00b0, 0x2000_00b0), "and so is staying put");
-    assert!(!start_counts(0x2000_00b0, 0), "built and then closed is a start that led nowhere");
+    assert!(
+        start_counts(0x2000_00b0, 0x2000_0150),
+        "a handoff to another applet is a start"
+    );
+    assert!(
+        start_counts(0x2000_00b0, 0x2000_00b0),
+        "and so is staying put"
+    );
+    assert!(
+        !start_counts(0x2000_00b0, 0),
+        "built and then closed is a start that led nowhere"
+    );
     assert!(!start_counts(0, 0), "nothing built is not a start");
 }
+

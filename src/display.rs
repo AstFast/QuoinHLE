@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::abi::{self, generated as g};
 use crate::device::{make_rgb, split_rgb, RGB_BLACK, RGB_NONE, RGB_WHITE};
+use crate::encoding::TextEncoding;
 use crate::font::{self, Face, Faces, GLYPH_W};
 use crate::hle::{Error as HleError, HResult, Hle};
 use crate::mem::Mem;
@@ -43,8 +44,36 @@ pub const fn unpack565(v: u16) -> (u8, u8, u8) {
 }
 
 /// The depth the device's own framebuffer uses: one `u16` per pixel, the RGB565 the packers above
-/// assume. [`Display`] also backs 8-bpp bitmaps — see [`index8_to_native`].
+/// assume. A profile may back a 32-bpp frame instead (`screen.frame_bpp`); this stays the fast
+/// path's format and the answer for a handset that names no other.
 pub const NATIVE_DEPTH: u16 = 16;
+
+/// Where `DIB_NewEx` puts pixel (0, 0) inside the object it allocates, and the default this host
+/// publishes: the delivered body allocates `pixel_bytes + 0x6B` and points `pBmp` just past that
+/// record. A firmware whose header is a different size names the offset in its profile.
+pub const DIB_PIXEL_OFFSET: u32 = 0x6B;
+
+/// The first byte after `IDIB`'s own fields (`reserved` ends at 36). A pixel offset below this
+/// would put pixels inside the record a pack reads through.
+pub const MIN_DIB_PIXEL_OFFSET: u32 = 36;
+
+/// The largest screen `IDisplay::SetPrefs` will resize the device bitmap to, in pixels.
+///
+/// This is a ceiling, not a shape: `w`/`h` arrive as untrusted text from the guest, and the pixels
+/// are allocated from the same arena the rest of the host lives in, so a settings string asking for
+/// 65535x65535 must be answered rather than attempted. 4096 square is a panel no BREW handset ever
+/// had, and past it the honest reply is that the display cannot accommodate the request.
+pub const MAX_SCREEN_PIXELS: u32 = 4096 * 4096;
+
+/// The `IDIB_COLORSCHEME_*` word for a bitmap of this depth — what a device bitmap of it reports in
+/// `nDepth`'s high half, and what `IDisplay::SetPrefs`'s `c` name asks for.
+pub const fn device_scheme(depth: u16) -> u32 {
+    if is_888(depth) {
+        g::IDIB_COLORSCHEME_888
+    } else {
+        g::IDIB_COLORSCHEME_565
+    }
+}
 
 /// What an index in an 8-bpp bitmap means *when the bitmap carries no palette of its own*: three bits
 /// of red, three of green, two of blue, the packing an eight-bit handset display had without loading a
@@ -72,7 +101,7 @@ pub const fn rgb_to_native(rgbval: u32) -> u32 {
 }
 
 /// `IDIB::pRGB` holds each colour as a 32-bit word whose value is `0x00RRGGBB`. The header says
-/// "an array of 32-bit R-G-B color values", and melange's OEM palette reader unpacks it in exactly
+/// "an array of 32-bit R-G-B color values", and a reference front end's OEM palette reader unpacks it in exactly
 /// that shape — `(rgb >> 16) & 0xff` for red. An `RGBVAL` is the other rotation: `MAKE_RGB` puts red
 /// at bits 8-15, so an `RGBVAL` sitting in guest memory reads as the bytes `pad, R, G, B`. The two
 /// disagree by three bytes reversed, and only one of them can paint a screen.
@@ -94,6 +123,48 @@ const fn rgbval_to_palette(rgb: u32) -> u32 {
 pub const fn native_to_rgb(native: u32) -> u32 {
     let (r, g, b) = unpack565(native as u16);
     crate::device::make_rgb(r, g, b)
+}
+
+/// An `RGBVAL` as the word a 32-bpp bitmap stores: `0x00RRGGBB`, the packing
+/// `IDIB_COLORSCHEME_888` names and the delivered `DIB_RGBToNative` builds.
+const fn rgbval_to_888(rgbval: u32) -> u32 {
+    let (r, g, b) = crate::device::split_rgb(rgbval);
+    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+/// A 32-bpp stored word as an `RGBVAL`.
+const fn stored888_to_rgbval(v: u32) -> u32 {
+    crate::device::make_rgb(
+        ((v >> 16) & 0xff) as u8,
+        ((v >> 8) & 0xff) as u8,
+        (v & 0xff) as u8,
+    )
+}
+
+/// The canonical (565) colour a 32-bpp stored word denotes. Drawing state in this host is 565 —
+/// `RGBToNative` on a 16-bpp destination, every palette entry, every `IGraphics` colour — so a
+/// mixed-depth blit converts at this boundary; a 32→32 blit has its own raw row path and does not
+/// pass through here.
+const fn stored888_to_565(v: u32) -> u32 {
+    pack565(
+        ((v >> 16) & 0xff) as u8,
+        ((v >> 8) & 0xff) as u8,
+        (v & 0xff) as u8,
+    ) as u32
+}
+
+/// The 32-bpp stored word a canonical (565) colour denotes.
+const fn native565_to_888(v: u32) -> u32 {
+    let (r, g, b) = unpack565(v as u16);
+    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+/// Whether a stored pixel is a whole 32-bit `0x00RRGGBB` word rather than a packed 565 one.
+///
+/// Strictly 32: `nDepth` is a public field a pack may restate, and treating 24 as four bytes would
+/// read one byte past a surface the host allocated as two.
+const fn is_888(depth: u16) -> bool {
+    depth == 32
 }
 
 /// Squared distance between two `RGBVAL`s, for the one place a colour has to be matched rather than
@@ -120,7 +191,7 @@ pub fn rop_supported(rop: u32) -> bool {
 /// answer — or `None` for an op this host does not carry out.
 ///
 /// The header *buffers*, so the operands here are the packed words, padding bits and all: a handset's 565
-/// blitter inverts and ORs the halfword it has, and that is what the shipped packs were tuned
+/// blitter inverts and ORs the halfword it has, and that is what the guest packs were tuned
 /// against. `AEE_RO_TRANSPARENT` is listed because it is a plain copy once the caller has skipped the
 /// key pixel, which the source-bitmap blits do in [`source_pixel`] and the row paths. It is not a
 /// reached arm from [`Display::put`]: every slot whose "source" is a colour argument answers
@@ -132,7 +203,14 @@ pub fn rop_supported(rop: u32) -> bool {
 /// has no alpha of its own, so there is nothing for the packed words to combine. `AEE_RO_OLDMASK` is
 /// excluded by the enum's own comment — it is not supported for `IBitmap`.
 fn raster(rop: u32, src: Native, dst: Native) -> Option<Native> {
-    let v = match rop {
+    raster_word(rop, src, dst).map(|v| v & 0xffff)
+}
+
+/// The same operation without narrowing the answer to a 16-bit word. A 32-bpp bitmap combines
+/// `0x00RRGGBB` words, and `AEE_RO_NOT` on one has to complement the whole colour rather than leave
+/// the high byte zeroed.
+fn raster_word(rop: u32, src: Native, dst: Native) -> Option<Native> {
+    Some(match rop {
         g::AEE_RO_OR => src | dst,
         g::AEE_RO_XOR => src ^ dst,
         g::AEE_RO_COPY => src,
@@ -142,8 +220,7 @@ fn raster(rop: u32, src: Native, dst: Native) -> Option<Native> {
         g::AEE_RO_TRANSPARENT => src,
         g::AEE_RO_AND => src & dst,
         _ => return None,
-    };
-    Some(v & 0xffff)
+    })
 }
 
 /// An `AEERect`, whose four `int16` members the ABI table positions.
@@ -219,7 +296,7 @@ impl Rect {
     }
 
     pub fn read(mem: &Mem, addr: u32) -> HResult<Rect> {
-        // `IDisplay::DrawRect` arrives 23,400 times in one 500 ms frame of the corpus pack: four
+        // `IDisplay::DrawRect` arrives thousands of times in one 500 ms frame of the sample set pack: four
         // separate `read_u16` calls meant four page-table walks for every rectangle. `AEERect` is
         // four consecutive little-endian `int16`s, so one `read_into` gets the same bytes — it
         // already handles a read straddling two pages, and drops to byte-at-a-time reads while a
@@ -312,7 +389,7 @@ pub struct Bitmap {
 /// from the side table costs one `Arc` clone per blit.
 ///
 /// Keeping it beside the pixels rather than blending it into them is the other half of the same
-/// choice: the pack is entitled to read the colours it shipped, and rewriting a see-through pixel
+/// choice: the pack is entitled to read the colours it reference, and rewriting a see-through pixel
 /// into some mask colour would fabricate a byte the app never stored.
 #[derive(Debug)]
 pub struct AlphaMap {
@@ -459,6 +536,9 @@ impl Bitmap {
             }
         }
         let native = rgb_to_native(rgbval);
+        if is_888(self.depth) {
+            return Ok(rgbval_to_888(rgbval));
+        }
         Ok(match self.depth {
             8 => u32::from(native_to_index8(native)),
             4 => u32::from(native_to_index4(native)),
@@ -481,7 +561,11 @@ impl Bitmap {
     /// of those: it would paint `colour & 0xff`, which names nothing at all.
     fn colour_of_pixel(&self, mem: &Mem, value: Native) -> HResult<Native> {
         if !self.keeps_indices() {
-            return Ok(value & 0xffff);
+            return Ok(if is_888(self.depth) {
+                stored888_to_565(value)
+            } else {
+                value & 0xffff
+            });
         }
         self.colour_of(mem, value as u8)
     }
@@ -514,7 +598,11 @@ impl Bitmap {
         // to `RGBVAL` and back, which is the identity on a 5-6-5 word and a waste of it in a loop that
         // runs per pixel of every blit.
         if !self.keeps_indices() {
-            return Ok(native & 0xffff);
+            return Ok(if is_888(self.depth) {
+                native565_to_888(native)
+            } else {
+                native & 0xffff
+            });
         }
         self.pixel_value(mem, native_to_rgb(native))
     }
@@ -567,6 +655,20 @@ pub struct TextRun {
 pub struct Display {
     /// `IBitmap*` of the screen itself, held alive by this struct.
     pub device: Bitmap,
+    /// Where every DIB this display allocates keeps its pixels, from the device profile.
+    dib_pixel_offset: u32,
+    /// The deepest pixel depth an off-screen DIB may request, from the device profile.
+    dib_depth: u16,
+    /// The encoding an `AECHAR` argument is in: `AEEDeviceInfo::wEncoding`.
+    ///
+    /// A display built by hand — in a test — has no device behind it and keeps the default
+    /// [`TextEncoding::Unicode`], so a unit written into guest memory is read as the code point it
+    /// looks like. [`crate::runtime::Runtime::with_device_and_heap`] sets the device's answer on
+    /// the display it builds, which is the only place a handset's encoding arrives from.
+    encoding: TextEncoding,
+    /// Whether `IDisplay::DrawText`'s `pcText` is the device's 8-bit string (the BREW 1.x ABI)
+    /// rather than an `AECHAR` run (4.0.x). Set from [`crate::device::DeviceProfile::text_bytes`].
+    text_bytes: bool,
     /// The `IDisplay*` applets are handed when the runtime starts one, so `IShell::Clone` and a
     /// second `CreateInstance` do not fight over who owns which state.
     displays: HashMap<u32, DisplayState>,
@@ -574,6 +676,8 @@ pub struct Display {
     /// `IDisplay_MakeDefault` moves this reference, and it is why a display outlives its applet.
     default: u32,
     bitmaps: HashMap<u32, Bitmap>,
+    /// Pixel start → object, for the OEM `CONVERTBMP` answer that is the pixel run itself.
+    pixel_owner: HashMap<u32, u32>,
     /// The transparency a decoded picture named, by the bitmap object it was laid out into. Absent
     /// is the normal case and the fast one: every BMP and every PNG that says nothing about
     /// transparency, and those pictures keep the batched row path.
@@ -624,11 +728,11 @@ pub struct Display {
     /// How many refusals there were, including names past the bound above. The count is the record;
     /// the list is only its first pages.
     pub refused: u64,
-    /// Scratch row for the 16-bpp `COPY` fill fast path. A full-screen clear and a frame of 23,400
-    /// `DrawRect` calls used to allocate a `Vec` per call; one buffer turns that into a `resize`
-    /// which is free once the widest row so far has been seen. Every pair is rewritten on each
-    /// fill, so a shorter row cannot inherit a stale byte. Holds no guest state and is deliberately
-    /// absent from the hand-written `write_state` / `read_state` field lists.
+    /// Scratch row for the whole-colour `COPY` fill fast path (16 or 32 bpp). A full-screen clear and a
+    /// frame of thousands of `DrawRect` calls used to allocate a `Vec` per call; one buffer turns that into a
+    /// `resize` which is free once the widest row so far has been seen. Every pixel is rewritten on
+    /// each fill, so a shorter row cannot inherit a stale byte. Holds no guest state and is
+    /// deliberately absent from the hand-written `write_state` / `read_state` field lists.
     fill_row: Vec<u8>,
 }
 
@@ -642,7 +746,40 @@ impl Display {
         height: u16,
         depth: u16,
     ) -> HResult<Display> {
-        check_depth(depth)?;
+        Self::new_with_layout(
+            mem,
+            hle,
+            width,
+            height,
+            depth,
+            depth.max(NATIVE_DEPTH),
+            DIB_PIXEL_OFFSET,
+        )
+    }
+
+    /// Build a display at the profile's real frame depth, DIB ceiling and DIB pixel offset.
+    ///
+    /// `dib_depth` is the deepest off-screen depth this device backs; it has to cover `depth`, or
+    /// the screen's own `CreateCompatibleBitmap` would be refused. `pixel_offset` is where
+    /// `DIB_NewEx` puts pixels inside the object — see [`crate::device::DeviceProfile`].
+    pub fn new_with_layout(
+        mem: &mut Mem,
+        hle: &mut Hle,
+        width: u16,
+        height: u16,
+        depth: u16,
+        dib_depth: u16,
+        pixel_offset: u32,
+    ) -> HResult<Display> {
+        // The screen itself may be 32 even when DIBs are not, but never below what this host packs.
+        check_depth(depth, 32)?;
+        if pixel_offset < MIN_DIB_PIXEL_OFFSET {
+            return Err(HleError::Unsupported {
+                what: format!(
+                    "a DIB pixel offset of {pixel_offset}: it has to be {MIN_DIB_PIXEL_OFFSET} or more, past IDIB's own fields"
+                ),
+            });
+        }
         let stride = row_bytes(width, depth);
         let seed = Bitmap {
             obj: 0,
@@ -656,15 +793,22 @@ impl Display {
             // In this bitmap's own colour space — see [`default_transparent`].
             trans: default_transparent(depth),
         };
-        let (obj, px) = new_bitmap_object(mem, hle, &seed)?;
+        let (obj, px) = new_bitmap_object(mem, hle, &seed, pixel_offset, true)?;
         let device = Bitmap { obj, px, ..seed };
         let mut bitmaps = HashMap::new();
         bitmaps.insert(obj, device);
+        let mut pixel_owner = HashMap::new();
+        pixel_owner.insert(px, obj);
         Ok(Display {
             device,
+            dib_pixel_offset: pixel_offset,
+            dib_depth: dib_depth.max(depth),
+            encoding: TextEncoding::Unicode,
+            text_bytes: false,
             displays: HashMap::new(),
             default: 0,
             bitmaps,
+            pixel_owner,
             alphas: HashMap::new(),
             faces: HashMap::new(),
             face_epoch: 0,
@@ -693,7 +837,7 @@ impl Display {
     /// The size of the bitmap a display is currently drawing into.
     ///
     /// This used to be what an off-screen bitmap was sized to, on the inference that a DIB belongs
-    /// to the screen it was asked from. The shipped `IDisplay_CreateDIBitmap` wrapper passes `w` and
+    /// to the screen it was asked from. The reference `IDisplay_CreateDIBitmap` wrapper passes `w` and
     /// `h` straight to `DIB_New`, so that inference is withdrawn and this has no caller; it is kept
     /// as a plain query rather than as a rule. See `Runtime`'s `CreateDIBitmap` arm for the evidence.
     pub fn dest_size(&self, disp: u32) -> HResult<(u16, u16)> {
@@ -750,6 +894,23 @@ impl Display {
         self.face_epoch
     }
 
+    /// Set what an `AECHAR` argument is in. The runtime does this once from the device profile,
+    /// and again after restoring a state block whose display was replaced.
+    pub fn set_encoding(&mut self, encoding: TextEncoding) {
+        self.encoding = encoding;
+    }
+
+    /// Set whether `IDisplay::DrawText`'s `pcText` is the device's 8-bit string (BREW 1.x) rather
+    /// than an `AECHAR` run. The runtime does this once from the device profile.
+    pub fn set_text_bytes(&mut self, bytes: bool) {
+        self.text_bytes = bytes;
+    }
+
+    /// The encoding an `AECHAR` argument is read in.
+    pub fn encoding(&self) -> TextEncoding {
+        self.encoding
+    }
+
     /// The faces this display answers with, in the form a caller that only measures can hold.
     ///
     /// Layout has no `&mut Display` and must not have one: it runs from the widget side too, where
@@ -775,6 +936,7 @@ impl Display {
     }
 
     pub fn bitmap(&self, obj: u32) -> Option<Bitmap> {
+        let obj = self.pixel_owner.get(&obj).copied().unwrap_or(obj);
         self.bitmaps.get(&obj).copied()
     }
 
@@ -794,7 +956,9 @@ impl Display {
         let b = self
             .bitmap(obj)
             .ok_or(HleError::NotAnObject { addr: obj })?;
-        let native = if b.depth >= 16 {
+        let native = if is_888(b.depth) {
+            return Ok(stored888_to_rgbval(value));
+        } else if b.depth >= 16 {
             value & 0xffff
         } else {
             b.colour_of(mem, value as u8)?
@@ -810,8 +974,9 @@ impl Display {
     /// bottom-up, and names its own `pRGB`. A host that kept its own geometry and never looked again
     /// blitted the empty buffer it had allocated at creation time, which is why this pack drew solid
     /// black shapes for a whole frame. An app that never touches the struct gets back the bytes we wrote,
-    /// so for every other pack in the corpus this is a no-op.
+    /// so for every other pack in the sample set this is a no-op.
     pub fn sync_bitmap(&mut self, mem: &Mem, obj: u32) -> HResult<()> {
+        let obj = self.pixel_owner.get(&obj).copied().unwrap_or(obj);
         let Some(mut b) = self.bitmaps.get(&obj).copied() else {
             return Ok(());
         };
@@ -833,9 +998,75 @@ impl Display {
         // the palette what it means — on an 8-bpp surface entry 7 and entry 200 are different keys
         // even if the table happens to give them the same 5-6-5 word.
         let trans = mem.read_u32(obj + o.idib_trans)?;
-        b.trans = trans & 0xffff;
+        b.trans = if is_888(b.depth) {
+            trans
+        } else {
+            trans & 0xffff
+        };
         self.bitmaps.insert(obj, b);
+        self.pixel_owner.insert(b.px, obj);
         Ok(())
+    }
+
+    /// Whether a bitmap's pixel extent is actually mapped. A pack may restate `pBmp` to a word it
+    /// never decoded — jump does exactly that before an `IDisplay::BitBlt` — and the blit has to
+    /// answer the same way it answers a null source rather than faulting the run.
+    fn readable_pixels(&self, mem: &Mem, b: &Bitmap) -> bool {
+        if b.px == 0 || b.px == u32::MAX || !mem.is_mapped(b.px) {
+            return false;
+        }
+        let stride = b.pitch.unsigned_abs().max(1);
+        let rows = u32::from(b.height).saturating_sub(1);
+        let run = row_bytes(b.width, b.depth).saturating_sub(1);
+        let start = if b.pitch < 0 {
+            b.px.saturating_sub(rows.saturating_mul(stride))
+        } else {
+            b.px
+        };
+        let end = start
+            .saturating_add(rows.saturating_mul(stride))
+            .saturating_add(run);
+        mem.is_mapped(end)
+    }
+
+    /// A DIB the pack built itself. the bitmap declarations publishes the header and its inline helpers, and
+    /// `IDisplay::BitBlt` takes any `IBitmap*`, not only the ones this host handed out: chtycoon
+    /// copies the device bitmap's header into its own heap block, repoints `pBmp` at the screen
+    /// framebuffer and blits that. Requiring an object-table entry faults a pack doing exactly what
+    /// the header says it may.
+    fn guest_bitmap(&self, mem: &Mem, obj: u32) -> Option<Bitmap> {
+        let o = field_layout();
+        let px = mem.read_u32(obj + o.idib_pbmp).ok()?;
+        if px == 0 || px == u32::MAX || !mem.is_mapped(px) {
+            return None;
+        }
+        let dims = mem.read_u32(obj + o.idib_cx).ok()?;
+        let (width, height) = (dims as u16, (dims >> 16) as u16);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let pitch = mem.read_u32(obj + o.idib_pitch).ok()?;
+        let depth = mem.read_u32(obj + o.idib_depth).ok()? as u16 & 0xff;
+        if !matches!(depth, 1 | 2 | 4 | 8 | 16 | 32) {
+            return None;
+        }
+        let cnt_rgb = (pitch >> 16) as u16;
+        let trans = mem.read_u32(obj + o.idib_trans).ok()?;
+        Some(Bitmap {
+            obj,
+            px,
+            rgb: mem.read_u32(obj + o.idib_prgb).ok()?,
+            cnt_rgb,
+            width,
+            height,
+            pitch: pitch as u16 as i16 as i32,
+            depth,
+            trans: if is_888(depth) {
+                trans
+            } else {
+                trans & 0xffff
+            },
+        })
     }
 
     /// The `IBitmap*` of the screen, i.e. what `IDisplay::GetDeviceBitmap` hands out.
@@ -907,19 +1138,66 @@ impl Display {
     /// tells the caller the installation failed. A pack reads exactly that return value, treats 0 as
     /// failure, releases the font it was given and abandons its own start-up — never drawing a frame.
     ///
-    /// Only the three faces this host has glyphs for are bound. `AEE_FONT_ITALIC` and the two user
-    /// slots stay unbound rather than being answered with a face that does not exist: a designator
-    /// with nothing behind it is the same answer the drawing path gives.
+    /// All six system designators this host can draw with are bound. The three italic ones point
+    /// at the upright classes of the same weight and size, because this host has no slanted cut;
+    /// [`crate::font::Face`] answers them with the upright face. The two user slots stay unbound:
+    /// nothing in this host has a face for them, and a designator with nothing behind it is the
+    /// same answer the drawing path gives.
     const BOUND_FACES: &'static [(u32, u32)] = &[
         (g::AEE_FONT_NORMAL, g::AEECLSID_FONTSYSNORMAL),
         (g::AEE_FONT_BOLD, g::AEECLSID_FONTSYSBOLD),
         (g::AEE_FONT_LARGE, g::AEECLSID_FONTSYSLARGE),
+        (g::AEE_FONT_ITALIC, g::AEECLSID_FONTSYSITALIC),
+        (g::AEE_FONT_LARGE_ITALIC, g::AEECLSID_FONTSYSLARGEITALIC),
+        (g::AEE_FONT_BOLD_ITALIC, g::AEECLSID_FONTSYSBOLDITALIC),
     ];
+
+    /// A carrier build's `IDisplay` is not the eight-byte handle the public header describes. Its
+    /// constructor at `0x159b24` builds a singleton with an embedded mode block at `+0xc` and a
+    /// pointer at `+0x70` to the screen-info record the display driver filled in: `0x156cd0` writes
+    /// `strh #0x78,[+4]`, `strh #0x92,[+6]`, `str #framebuffer,[+0xc]`. Packs built for that
+    /// firmware read those words directly instead of calling `GetDeviceBitmap`, so the handle has
+    /// to carry the same shape — a pack that dereferences the missing `+0x70` reads a null.
+    const PRIVATE_INFO_WORD: u32 = 0x70;
+    const PRIVATE_INFO: u32 = 0x74;
+    const PRIVATE_END: u32 = 0x84;
+
+    /// Fill the firmware-private half of a display object. `state` may be the fresh one, a clone's,
+    /// or one whose destination just changed; the screen-info record follows the destination so a
+    /// pack reading the framebuffer pointer sees the surface the display currently draws into.
+    fn publish_private(&self, mem: &mut Mem, disp: u32, state: &DisplayState) -> HResult<()> {
+        let width = u32::from(self.device.width);
+        let height = u32::from(self.device.height);
+        let px = self
+            .bitmap(state.dest)
+            .map(|b| b.px)
+            .unwrap_or(self.device.px);
+        // The embedded block the firmware's constructor fills: width and height as the first
+        // halfwords, the mode word at +8, and the depth at +0xe.
+        mem.write_u32(disp + 0x0c, width | (height << 16))?;
+        mem.write_u32(disp + 0x14, 3)?;
+        mem.write_u16(disp + 0x1a, u32::from(self.device.depth))?;
+        mem.write_u32(disp + Self::PRIVATE_INFO_WORD, disp + Self::PRIVATE_INFO)?;
+        mem.write_u32(disp + Self::PRIVATE_INFO, 0)?;
+        mem.write_u32(
+            disp + Self::PRIVATE_INFO + 4,
+            width | (height << 16),
+        )?;
+        mem.write_u32(disp + Self::PRIVATE_INFO + 0x0c, px)?;
+        Ok(())
+    }
 
     /// `IShell::CreateInstance` gives every caller its own reference, so a fresh object is built
     /// per display rather than shared.
     pub fn create_display(&mut self, mem: &mut Mem, hle: &mut Hle) -> HResult<u32> {
-        let addr = hle.new_object(mem, "IDisplay", g::AEECLSID_DISPLAY, 8, 4, &[])?;
+        let addr = hle.new_object(
+            mem,
+            "IDisplay",
+            g::AEECLSID_DISPLAY,
+            Self::PRIVATE_END,
+            4,
+            &[],
+        )?;
         let device = self.device.obj;
         let mut fonts = Vec::new();
         for (designator, class) in Self::BOUND_FACES {
@@ -928,18 +1206,17 @@ impl Display {
                 hle.new_object(mem, "IFont", *class, 8, 4, &[])?,
             ));
         }
-        self.put_state(
-            addr,
-            DisplayState {
-                dest: device,
-                clip: Rect::whole(self.device.width, self.device.height),
-                colors: default_colors(),
-                annunciators: 0,
-                backlight: true,
-                fonts,
-                pending: 0,
-            },
-        );
+        let state = DisplayState {
+            dest: device,
+            clip: Rect::whole(self.device.width, self.device.height),
+            colors: default_colors(),
+            annunciators: 0,
+            backlight: true,
+            fonts,
+            pending: 0,
+        };
+        self.publish_private(mem, addr, &state)?;
+        self.put_state(addr, state);
         hle.change_refs(mem, device, 1)?;
         // The header defines the default display as "the one that is returned for
         // AEECLSID_DISPLAY", so the first one this host answers for is the one BREW holds a
@@ -955,7 +1232,15 @@ impl Display {
     pub fn clone_display(&mut self, mem: &mut Mem, hle: &mut Hle, disp: u32) -> HResult<u32> {
         let state = self.state(disp)?;
         let dest = state.dest;
-        let addr = hle.new_object(mem, "IDisplay", g::AEECLSID_DISPLAY, 8, 4, &[])?;
+        let addr = hle.new_object(
+            mem,
+            "IDisplay",
+            g::AEECLSID_DISPLAY,
+            Self::PRIVATE_END,
+            4,
+            &[],
+        )?;
+        self.publish_private(mem, addr, &state)?;
         self.put_state(addr, state);
         hle.change_refs(mem, dest, 1)?;
         Ok(addr)
@@ -1065,7 +1350,7 @@ impl Display {
             .collect()
     }
 
-    /// `IDisplay::NotifyEnable(pcb)` — the shipped body stores nothing.
+    /// `IDisplay::NotifyEnable(pcb)` — the documented behaviour stores nothing.
     ///
     /// What it does is forward to the device object this display wraps (record `+124`) and answer
     /// `AEE_EUNSUPPORTED` when there is none; this host has no such object, so the two answers a
@@ -1095,6 +1380,153 @@ impl Display {
         state.backlight = on != 0;
         self.put_state(disp, state);
         Ok(())
+    }
+
+    /// `IDisplay::SetPrefs(po, pchSettings, cSettings)` — "change settings for a device bitmap",
+    /// with the four names the bitmap-device declarations publishes: `w` screen width, `h` screen height, `c`
+    /// colour scheme, `a` annunciators.
+    ///
+    /// `w` and `h` are the ones with behaviour, and they are the reason this slot is served at
+    /// all: a pack whose layout is for a panel taller than the one it finds asks for that height
+    /// here and then lays its frame out from the number it asked for. The header is explicit that
+    /// the display "may not be able to accommodate all values of all parameters, so it is
+    /// important that the app not assume that it received what it asked for" — so a size this host
+    /// will not back is refused rather than accepted and dropped. Answering SUCCESS and keeping
+    /// the old geometry is the failure shape this repository treats as the worst one: the caller
+    /// reads "yes", clears the screen it believes it now has, and the write lands outside the
+    /// buffer the host made.
+    ///
+    /// The list is applied whole or not at all. One pair this host cannot serve makes the call
+    /// `AEE_EUNSUPPORTED` and changes nothing, because a half-applied list answers "your screen is
+    /// 376 rows now" while quietly dropping the rest of what was asked.
+    pub fn set_prefs(&mut self, mem: &mut Mem, hle: &mut Hle, text: &str) -> HResult<u32> {
+        let mut width = u32::from(self.device.width);
+        let mut height = u32::from(self.device.height);
+        let mut resize = false;
+        for pair in text.split(',') {
+            // An empty element names nothing: `"w:120,"` is what a caller that appends a separator
+            // per setting produces, and skipping it is not guessing at a value.
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = pair.split_once(':') else {
+                return Ok(g::AEE_EBADPARM);
+            };
+            match name {
+                "w" | "h" => {
+                    // `<empty>` is "use the default value" and `*` "the maximum meaningful value".
+                    // Both name the firmware's own idea of the panel, and this host has no record
+                    // of it once the screen has been resized, so they are refused rather than
+                    // guessed at.
+                    let Ok(n) = value.parse::<u32>() else {
+                        return Ok(g::AEE_EUNSUPPORTED);
+                    };
+                    if n == 0 {
+                        return Ok(g::AEE_EBADPARM);
+                    }
+                    let Ok(n) = u16::try_from(n) else {
+                        return Ok(g::AEE_EUNSUPPORTED);
+                    };
+                    if name == "w" {
+                        width = u32::from(n);
+                    } else {
+                        height = u32::from(n);
+                    }
+                    resize = true;
+                }
+                "c" => {
+                    let Ok(scheme) = value.parse::<u32>() else {
+                        return Ok(g::AEE_EUNSUPPORTED);
+                    };
+                    // The frame has one depth, fixed by the profile: naming it is the no-op the
+                    // header describes, and any other scheme asks for a screen whose pixels this
+                    // host does not have.
+                    if scheme != device_scheme(self.device.depth) {
+                        return Ok(g::AEE_EUNSUPPORTED);
+                    }
+                }
+                // `a` says whether annunciators are shown at all. This host draws no annunciator
+                // bar, so there is no state the name could set; any other name is not one the
+                // header publishes.
+                _ => return Ok(g::AEE_EUNSUPPORTED),
+            }
+        }
+        if width.saturating_mul(height) > MAX_SCREEN_PIXELS {
+            return Ok(g::AEE_EUNSUPPORTED);
+        }
+        if resize {
+            self.resize_device(mem, hle, width as u16, height as u16)?;
+        }
+        Ok(g::AEE_SUCCESS)
+    }
+
+    /// Give the screen a device bitmap of `width` x `height`, at the frame's own depth.
+    ///
+    /// A size is a new object, not a longer one: `DIB_NewEx` allocates the header and the pixels as
+    /// one block, so `pBmp` is inside the object and the object's span is the bitmap's span. Every
+    /// `IDisplay` that was drawing into the old screen moves onto the new one, with the reference
+    /// the header's "AddRef the new destination, Release the old" rule owes each end — and the old
+    /// screen goes when its last display has let go, the same way any other bitmap does.
+    fn resize_device(
+        &mut self,
+        mem: &mut Mem,
+        hle: &mut Hle,
+        width: u16,
+        height: u16,
+    ) -> HResult<()> {
+        let old = self.device;
+        if old.width == width && old.height == height {
+            return Ok(());
+        }
+        let seed = Bitmap {
+            obj: 0,
+            px: 0,
+            rgb: 0,
+            cnt_rgb: 0,
+            width,
+            height,
+            pitch: row_bytes(width, old.depth) as i32,
+            depth: old.depth,
+            trans: default_transparent(old.depth),
+        };
+        let (obj, px) = new_bitmap_object(mem, hle, &seed, self.dib_pixel_offset, true)?;
+        let device = Bitmap { obj, px, ..seed };
+        self.bitmaps.insert(obj, device);
+        self.pixel_owner.insert(px, obj);
+        self.device = device;
+
+        // The screen's own reference, plus one per display that was drawing into it. Collected
+        // first and dropped once at the end: releasing inside the loop could destroy the object a
+        // later iteration still has to name.
+        let mut owed = 1i32;
+        let default = self.default;
+        for addr in self.displays.keys().copied().collect::<Vec<_>>() {
+            let Some(mut state) = self.displays.get(&addr).cloned() else {
+                continue;
+            };
+            if state.dest == old.obj {
+                hle.change_refs(mem, obj, 1)?;
+                owed += 1;
+                state.dest = obj;
+            }
+            // A clip that was the whole old screen is the whole new one. A clip a pack set itself
+            // is the pack's, and a resize is not a reason to move it.
+            if state.clip == Rect::whole(old.width, old.height) {
+                state.clip = Rect::whole(width, height);
+            }
+            self.publish_private(mem, addr, &state)?;
+            self.put_state(addr, state);
+        }
+        let left = hle.change_refs(mem, old.obj, -owed)?;
+        if left == 0 {
+            self.forget(mem, hle, old.obj)?;
+        }
+        let bg = self
+            .displays
+            .get(&default)
+            .map(background)
+            .unwrap_or(RGB_WHITE);
+        self.clear_device(mem, bg)
     }
 
     /// `IDisplay::Update(po, bDefer)`, with both of the header's conditions honoured.
@@ -1157,7 +1589,7 @@ impl Display {
 
     /// Adopt wherever the module's device bitmap points now.
     ///
-    /// The header own can repoint it with no host call to witness the change; a host that never re-reads keeps
+    /// The header own can repoint it with no host call to record the change; a host that never re-reads keeps
     /// presenting the buffer the module abandoned. The same licence applies to
     /// `IDisplay::BitBlt`, where [`Display::sync_bitmap`] already re-reads the struct on every call.
     fn adopt_device_pixels(&mut self, mem: &Mem) -> HResult<()> {
@@ -1167,6 +1599,29 @@ impl Display {
             self.device = live;
         }
         Ok(())
+    }
+
+    /// `IBitmapDev::Update` — "This function copies the bitmap to its associated display
+    /// synchronously" (the header's own description), and "has no effect if the bitmap is
+    /// disabled".
+    ///
+    /// This is the face a pack presents through when it draws straight into the device bitmap
+    /// rather than going by way of `IDisplay::Update`; answering SUCCESS without taking the screen
+    /// leaves every pixel it drew unrecorded. `a guest module` presents 5539 times through this call and
+    /// this host counted none of them, which reads as "0 screens" for a pack that was drawing the
+    /// whole time.
+    ///
+    /// There is no bitmap address to check here: `QueryInterface` hands out `AEEIID_IBitmapDev`
+    /// only when the bitmap it was asked on *is* the device bitmap ("It is only implemented for
+    /// device bitmaps"), and what reaches this slot is that face's own object, not the bitmap. A
+    /// call arriving here is already a call about the screen. The header's "no effect if the bitmap
+    /// is disabled" needs no branch either: this host's device bitmap is enabled always, which is
+    /// what both `IsEnabled` slots answer.
+    ///
+    /// The copy is synchronous — this call carries no `bUpdate` flag to defer with — so the screen
+    /// is taken here rather than queued for the UI task.
+    pub fn present_device_bitmap(&mut self) {
+        self.present();
     }
 
     /// One presentation: the counter, and the mark of the step the screen was taken at.
@@ -1246,6 +1701,24 @@ impl Display {
         Ok(mem.read_u16str(text, cap)?)
     }
 
+    /// The device's 8-bit string behind a `DrawText` argument on a BREW 1.x handset. `nChars < 0`
+    /// means count to the NUL; the same 4096 cap bounds a wild pointer or a garbage length.
+    fn read_text_bytes(mem: &Mem, text: u32, nchars: i32) -> HResult<Vec<u8>> {
+        if text == 0 {
+            return Ok(Vec::new());
+        }
+        let cap = if nchars < 0 { 4096 } else { nchars as usize }.min(4096);
+        let mut out = Vec::new();
+        for i in 0..cap {
+            let b = mem.read_u8(text + i as u32)?;
+            if b == 0 {
+                break;
+            }
+            out.push(b);
+        }
+        Ok(out)
+    }
+
     /// `IDisplay::MeasureTextEx(nFont, pcText, nChars, nMaxWidth, pnFits)`.
     ///
     /// A negative `nMaxWidth` measures the whole string; otherwise `pnFits` receives the longest
@@ -1268,10 +1741,10 @@ impl Display {
         let Some(font) = self.face(nfont) else {
             return Ok(0);
         };
-        Self::measure_face(mem, &font, text, nchars, max_width, pn_fits)
+        Self::measure_face(mem, &font, text, nchars, max_width, pn_fits, self.encoding)
     }
 
-    /// The measuring loop, for a caller that has **no display object**. Both shipped font bodies are
+    /// The measuring loop, for a caller that has **no display object**. Both reference font bodies are
     /// display-free -- the delivered body walks the face's own range and width tables, and
     /// The delivered body
     /// `IFont::MeasureText` is answered by this function rather than by [`Display::measure_text`],
@@ -1284,19 +1757,26 @@ impl Display {
         nchars: i32,
         max_width: i32,
         pn_fits: u32,
+        enc: TextEncoding,
     ) -> HResult<u32> {
-        let chars = Self::read_text(mem, text, nchars)?;
+        let units = Self::read_text(mem, text, nchars)?;
+        let text = enc.units_to_string(&units);
         let mut width = 0u32;
         let mut fits = 0u32;
         // Measured a character at a time rather than `count * advance`: the two faces are different
-        // widths, and a run that mixes them is measured by walking it.
-        for n in 1..=chars.len() {
-            let w = face.measure_chars(&chars[..n]);
+        // widths, and a run that mixes them is measured by walking it. The trailing gap is taken
+        // off the prefix exactly as [`Face::measure_text`] would for the same prefix.
+        let mut total = 0u32;
+        let trailing = face.trailing_leading();
+        for (n, ch) in text.chars().enumerate() {
+            let step = face.advance_of_char(ch, enc);
+            total += step;
+            let w = total.saturating_sub(step.min(trailing));
             if max_width >= 0 && w > max_width as u32 {
                 break;
             }
             width = w;
-            fits = n as u32;
+            fits = n as u32 + 1;
         }
         if pn_fits != 0 {
             mem.write_u32(pn_fits, fits)?;
@@ -1304,35 +1784,6 @@ impl Display {
         Ok(width)
     }
 
-    /// `IDisplay::DrawText(nFont, pcText, nChars, x, y, prcBackground, dwFlags)` — the glyph engine,
-    /// which is what [`crate::font`] exists for.
-    ///
-    /// Four documented rules shape the implementation more than the plotting does:
-    ///
-    /// - `nChars < 0` computes the length, and `x`/`y` name the top-left of the rectangle the text
-    ///   goes *into* — ignored entirely once the matching alignment flag is set.
-    /// - A null `prcBackground` means the destination bitmap's bounds, and that rectangle is both the
-    ///   clip and the box alignment is measured against. Drawing is clipped to its intersection with
-    ///   the display's own clip rectangle, which the header is careful to call out as a second,
-    ///   separate rectangle.
-    /// - Text blocks what is behind it unless `IDF_TEXT_TRANSPARENT`, and `IDF_TEXT_INVERTED` swaps
-    ///   the two colours rather than complementing pixels.
-    /// - `IDF_ALIGN_FILL` and `IDF_ALIGN_SPREAD` are declared unsupported by the header itself, so
-    ///   they take the positional answer rather than being guessed at.
-    ///
-    /// The return value is a **result code**, not a count: `IDisplay_DrawText` "returns SUCCESS /
-    /// error code" and `IFont_DrawText` spells the same thing out.
-    ///
-    /// **This used to answer the number of characters drawn** — a reading in which zero meant "drew
-    /// nothing" — and that inverts the contract at both ends: a draw that worked came back with a
-    /// non-zero value (an error code, to a caller that checks one) while a run that could not be
-    /// drawn at all came back `SUCCESS`. The count a reader wants is [`Display::runs_seen`], which the
-    /// report already prints.
-    ///
-    /// Two early returns stay `AEE_SUCCESS` on purpose, and the asymmetry with the font case is the
-    /// point: empty text, and a rectangle that clips everything away, are *legal* outcomes — the
-    /// header says a negative-sized clip rectangle simply draws nothing — while a
-    /// font id this host has no face for means the call could not be carried out at all.
     #[allow(clippy::too_many_arguments)]
     /// `IFont::DrawText` — the same glyphs as [`draw_text`], with every decision `IDisplay` keeps in its
     /// own state arriving as an argument instead.
@@ -1377,11 +1828,12 @@ impl Display {
         if clip.is_empty() {
             return Ok(g::AEE_SUCCESS);
         }
-        let chars = Self::read_text(mem, text, nchars)?;
-        if chars.is_empty() {
+        let units = Self::read_text(mem, text, nchars)?;
+        let text = self.encoding.units_to_string(&units);
+        if text.is_empty() {
             return Ok(g::AEE_SUCCESS);
         }
-        let width = font.measure_chars(&chars) as i32;
+        let width = font.measure_text(&text, self.encoding) as i32;
         let height = font.height() as i32;
         let signed = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         let cell = Rect::new(signed(x), signed(y), signed(width), signed(height));
@@ -1427,14 +1879,15 @@ impl Display {
         // One memo for the whole run: every glyph of it is drawn in the same ink, so a palettized
         // destination pays the table search once rather than once per glyph.
         let mut memo = IndexMemo::new();
-        for ch in chars.iter() {
+        for ch in text.chars() {
             let origin = (pen, y);
-            pen += font.advance_of(*ch) as i32;
+            pen += font.advance_of_char(ch, self.encoding) as i32;
+            let key = font.glyph_key(ch, self.encoding).unwrap_or(u16::MAX);
             self.paint_glyph(
                 mem,
                 &b,
                 font,
-                *ch,
+                key,
                 origin,
                 &mut ink,
                 (ax0, ay0, ax1, ay1),
@@ -1545,6 +1998,40 @@ impl Display {
         Ok(())
     }
 
+    /// `IDisplay::DrawText(nFont, pcText, nChars, x, y, prcBackground, dwFlags)` — the glyph engine,
+    /// which is what [`crate::font`] exists for.
+    ///
+    /// The units are decoded once, here, into the text the drawing works in. Everything below —
+    /// alignment, clipping, underline, the report — sees characters rather than units, and a face
+    /// keyed by `AECHAR` units is reached through [`Face::glyph_key`] with the same encoding.
+    ///
+    /// Four documented rules shape the implementation more than the plotting does:
+    ///
+    /// - `nChars < 0` computes the length, and `x`/`y` name the top-left of the rectangle the text
+    ///   goes *into* — ignored entirely once the matching alignment flag is set.
+    /// - A null `prcBackground` means the destination bitmap's bounds, and that rectangle is both the
+    ///   clip and the box alignment is measured against. Drawing is clipped to its intersection with
+    ///   the display's own clip rectangle, which the header is careful to call out as a second,
+    ///   separate rectangle.
+    /// - Text blocks what is behind it unless `IDF_TEXT_TRANSPARENT`, and `IDF_TEXT_INVERTED` swaps
+    ///   the two colours rather than complementing pixels.
+    /// - `IDF_ALIGN_FILL` and `IDF_ALIGN_SPREAD` are declared unsupported by the header itself, so
+    ///   they take the positional answer rather than being guessed at.
+    ///
+    /// The return value is a **result code**, not a count: `IDisplay_DrawText` "returns SUCCESS /
+    /// error code" and `IFont_DrawText` spells the same thing out.
+    ///
+    /// **This used to answer the number of characters drawn** — a reading in which zero meant "drew
+    /// nothing" — and that inverts the contract at both ends: a draw that worked came back with a
+    /// non-zero value (an error code, to a caller that checks one) while a run that could not be
+    /// drawn at all came back `SUCCESS`. The count a reader wants is [`Display::runs_seen`], which the
+    /// report already prints.
+    ///
+    /// Two early returns stay `AEE_SUCCESS` on purpose, and the asymmetry with the font case is the
+    /// point: empty text, and a rectangle that clips everything away, are *legal* outcomes — the
+    /// header says a negative-sized clip rectangle simply draws nothing — while a
+    /// font id this host has no face for means the call could not be carried out at all.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text(
         &mut self,
         mem: &mut Mem,
@@ -1557,6 +2044,60 @@ impl Display {
         prc_bg: u32,
         flags: u32,
     ) -> HResult<u32> {
+        let enc = self.encoding;
+        let text = if self.text_bytes {
+            let bytes = Self::read_text_bytes(mem, text, nchars)?;
+            enc.units_to_string(&enc.bytes_to_units(&bytes))
+        } else {
+            let units = Self::read_text(mem, text, nchars)?;
+            enc.units_to_string(&units)
+        };
+        self.draw_text_impl(mem, disp, nfont, &text, x, y, prc_bg, flags, enc)
+    }
+
+    /// The same drawing for text the host already holds as Unicode — an `IHtmlViewer` page.
+    ///
+    /// Host text does not cross the guest boundary. Writing it into an `AECHAR` buffer and
+    /// decoding it again would turn every character the device cannot name into a box, and the
+    /// face installed under a designator is keyed by the code point it was rasterized from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_unicode(
+        &mut self,
+        mem: &mut Mem,
+        disp: u32,
+        nfont: u32,
+        text: &str,
+        x: i32,
+        y: i32,
+        prc_bg: u32,
+        flags: u32,
+    ) -> HResult<u32> {
+        self.draw_text_impl(
+            mem,
+            disp,
+            nfont,
+            text,
+            x,
+            y,
+            prc_bg,
+            flags,
+            TextEncoding::Unicode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_impl(
+        &mut self,
+        mem: &mut Mem,
+        disp: u32,
+        nfont: u32,
+        text: &str,
+        x: i32,
+        y: i32,
+        prc_bg: u32,
+        flags: u32,
+        enc: TextEncoding,
+    ) -> HResult<u32> {
         let Some(font) = self.face(nfont) else {
             self.note(format!(
                 "no built-in face for AEEFont {nfont:#08x}; nothing was drawn, and the call answers \
@@ -1566,8 +2107,7 @@ impl Display {
         };
         let state = self.state(disp)?;
         let dest = self.dest(&state)?;
-        let chars = Self::read_text(mem, text, nchars)?;
-        if chars.is_empty() {
+        if text.is_empty() {
             return Ok(0);
         }
         let bounds = if prc_bg == 0 {
@@ -1575,7 +2115,7 @@ impl Display {
         } else {
             Rect::read(mem, prc_bg)?
         };
-        let width = font.measure_chars(&chars) as i32;
+        let width = font.measure_text(text, enc) as i32;
         let height = font.height() as i32;
         let signed = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         let left = match flags & g::IDF_ALIGNHORZ_MASK {
@@ -1641,9 +2181,10 @@ impl Display {
         let mut ink = Ink::colour(rgb_to_native(ink));
         let mut memo = IndexMemo::new();
         let mut pen = left;
-        for ch in chars.iter() {
+        for ch in text.chars() {
             let origin = (pen, top);
-            pen += font.advance_of(*ch) as i32;
+            pen += font.advance_of_char(ch, enc) as i32;
+            let key = font.glyph_key(ch, enc).unwrap_or(u16::MAX);
             // The three faces are plotted by the same loop: each yields a list of (row, bit-count,
             // row-bits) that the magnification below walks. The narrow Latin face's rows are five
             // bits in a byte, the CJK faces' are eight and sixteen bits, so in every case the bit
@@ -1652,7 +2193,7 @@ impl Display {
                 mem,
                 &dest,
                 &font,
-                *ch,
+                key,
                 origin,
                 &mut ink,
                 (ax0, ay0, ax1, ay1),
@@ -1671,7 +2212,15 @@ impl Display {
                     continue;
                 }
                 let ink = ink.of(&dest, mem)?;
-                self.put(mem, &dest, px, baseline, ink, g::AEE_RO_COPY, Some(&mut memo))?;
+                self.put(
+                    mem,
+                    &dest,
+                    px,
+                    baseline,
+                    ink,
+                    g::AEE_RO_COPY,
+                    Some(&mut memo),
+                )?;
             }
         }
         self.runs_seen += 1;
@@ -1684,7 +2233,7 @@ impl Display {
         self.runs.push(TextRun {
             dest: state.dest,
             font: nfont,
-            text: String::from_utf16_lossy(&chars),
+            text: text.to_string(),
             x: left,
             y: top,
             width: width as u32,
@@ -1750,6 +2299,8 @@ impl Display {
     pub fn screenshot(&self, mem: &Mem) -> HResult<Vec<u8>> {
         if self.device.depth == NATIVE_DEPTH {
             self.screenshot_rows(mem)
+        } else if is_888(self.device.depth) {
+            self.screenshot_rows32(mem)
         } else {
             self.screenshot_pixels(mem)
         }
@@ -1773,6 +2324,26 @@ impl Display {
                 out[at] = r;
                 out[at + 1] = g;
                 out[at + 2] = b;
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Display::screenshot_rows`] for a 32-bpp device: four bytes a pixel, `0x00RRGGBB`, read one
+    /// row at a time. The row is the unit for the same reason — inside it the pixels are contiguous,
+    /// so the page-table lookup is once per row instead of once per pixel.
+    fn screenshot_rows32(&self, mem: &Mem) -> HResult<Vec<u8>> {
+        let (wide, high) = (self.device.width as usize, self.device.height as usize);
+        let mut out = vec![0u8; wide * high * 3];
+        let mut row = vec![0u8; wide * 4];
+        for y in 0..high {
+            mem.read_into(self.device.row_start(y as u32), &mut row)?;
+            for x in 0..wide {
+                let at = x * 4;
+                let to = (y * wide + x) * 3;
+                out[to] = row[at + 2];
+                out[to + 1] = row[at + 1];
+                out[to + 2] = row[at];
             }
         }
         Ok(out)
@@ -1821,6 +2392,14 @@ impl Display {
                     // whatever the word at `pBmp` happens to be.
                     0 => 0,
                     8 | 4 | 1 => palette[usize::from(b.index_at(mem, x as u32, y as u32)?)],
+                    32 => {
+                        let v = mem.read_u32(b.at(x as u32, y as u32))?;
+                        let at = (y * wide + x) * 3;
+                        out[at] = ((v >> 16) & 0xff) as u8;
+                        out[at + 1] = ((v >> 8) & 0xff) as u8;
+                        out[at + 2] = (v & 0xff) as u8;
+                        continue;
+                    }
                     _ => mem.read_u16(b.at(x as u32, y as u32))?,
                 };
                 let (r, g, bl) = unpack565(native as u16);
@@ -1902,6 +2481,7 @@ impl Display {
             // A clip inherited from a bitmap of another size would silently hide the new frame,
             // so the destination and its clip change together.
             state.clip = Rect::whole(b.width, b.height);
+            self.publish_private(mem, disp, &state)?;
             self.put_state(disp, state);
         }
         Ok(g::AEE_SUCCESS)
@@ -1918,7 +2498,7 @@ impl Display {
     /// `RGB_NONE` means the active colour rather than "skip".
     /// `GetColor(po, color, nIndex)`: every drawing call's colour arguments arrive as
     /// `RGBVAL`s *or* as indexes into the display's `AEEClrItem` table, and only the index form is
-    /// ambiguous. The shipped body says which is which in two rules:
+    /// ambiguous. The documented behaviour says which is which in two rules:
     ///
     /// * `color == 0xFFFFFFFF` — `RGB_NONE` — asks for the **system** colour at `nIndex`, which the
     ///   caller chooses per call site (`DrawRect` names 3 for the frame and 2 for the fill).
@@ -1930,16 +2510,10 @@ impl Display {
     /// every row came out as a black band.
     ///
     /// ⚠ `RGB_BLACK` is 0, so a caller asking for colour number zero gets black rather than
-    /// `colors[0]`. That is the shipped test (`a2 != 0`), not an oversight here: entry 0 of the table
+    /// `colors[0]`. That is the reference test (`a2 != 0`), not an oversight here: entry 0 of the table
     /// is unused by the header's own numbering.
     fn resolve_color(state: &DisplayState, color: u32, index: u32) -> u32 {
-        let table = |i: u32| {
-            state
-                .colors
-                .get(i as usize)
-                .copied()
-                .unwrap_or(RGB_BLACK)
-        };
+        let table = |i: u32| state.colors.get(i as usize).copied().unwrap_or(RGB_BLACK);
         if color == RGB_NONE && (1..=0x10).contains(&index) {
             table(index)
         } else if color != 0 && color <= 0x10 {
@@ -1960,7 +2534,7 @@ impl Display {
     ) -> HResult<()> {
         let flags = flags & g::IDF_RECT_MASK;
         // `state()` clones a whole `DisplayState` (two `Vec`s) for every call, and `DrawRect` is
-        // the corpus' hottest display call — 23,400 per 500 ms frame. Borrow the record once and
+        // the sample set' hottest display call — thousands of per 500 ms frame. Borrow the record once and
         // copy out only the `Copy` values this call needs: the drawing methods below take `&mut
         // self`, so the borrow must end here. The state and destination lookups still happen before
         // the early returns, exactly as they did when `state()`/`dest()` were called up front.
@@ -2126,7 +2700,14 @@ impl Display {
         };
         for y in y0..=y1 {
             for x in x0..=x1 {
-                if let Some(v) = read_pixel(mem, b, x, y)? {
+                if is_888(b.depth) {
+                    // A 32-bpp pixel is the `0x00RRGGBB` word itself, and the complement is taken
+                    // in that space. Going through the canonical 565 colour first would drop eight
+                    // bits of green and five of each primary before the inversion.
+                    if let Some(v) = read_stored(mem, b, x, y)? {
+                        write_pixel(mem, b, x, y, !v & 0x00ff_ffff)?;
+                    }
+                } else if let Some(v) = read_pixel(mem, b, x, y)? {
                     // A complement of the *colour*: `read_pixel` answers one at every depth — it
                     // resolves a palettized pixel through the bitmap's own table — so inverting it and
                     // storing the answer back through the same table is the whole operation. An
@@ -2164,11 +2745,18 @@ impl Display {
         }
         // The row path, for the same reason the blit has one: a fill is a single value written over
         // a rectangle, and the pixel loop below costs an address computation, a bounds check and a
-        // page lookup per *pixel* of it. A row of a 16-bpp bitmap is contiguous memory holding the
-        // same two bytes repeated, so a whole row is one `write_bytes` — and this, rather than the
-        // blit, is what the measurement found the emulator spending its wall clock on: `clear` and
-        // `IDisplay::DrawRect` fill most of a screen several times a frame.
-        if b.depth == 16 && rop == g::AEE_RO_COPY {
+        // page lookup per *pixel* of it. A row of a whole-colour bitmap is contiguous memory holding
+        // the same two or four bytes repeated, so a whole row is one `write_bytes` — and this,
+        // rather than the blit, is what the measurement found the emulator spending its wall clock
+        // on: `clear` and `IDisplay::DrawRect` fill most of a screen several times a frame.
+        let bytes = if is_888(b.depth) {
+            4
+        } else if b.depth == NATIVE_DEPTH {
+            2
+        } else {
+            0
+        };
+        if bytes != 0 && rop == g::AEE_RO_COPY {
             let (xa, xb) = (x0.max(0), x1.min(b.width as i32 - 1));
             let (ya, yb) = (y0.max(0), y1.min(b.height as i32 - 1));
             if xa > xb || ya > yb {
@@ -2176,11 +2764,16 @@ impl Display {
                 // and not an error — `put` skips a pixel it cannot address.
                 return Ok(());
             }
-            let value = (native as u16).to_le_bytes();
+            let stored = if bytes == 4 {
+                native565_to_888(native)
+            } else {
+                native & 0xffff
+            };
+            let value = stored.to_le_bytes();
             let width = (xb - xa + 1) as usize;
-            self.fill_row.resize(width * 2, 0);
-            for pair in self.fill_row.chunks_exact_mut(2) {
-                pair.copy_from_slice(&value);
+            self.fill_row.resize(width * bytes, 0);
+            for px in self.fill_row.chunks_exact_mut(bytes) {
+                px.copy_from_slice(&value[..bytes]);
             }
             for y in ya..=yb {
                 mem.write_bytes(b.at(xa as u32, y as u32), &self.fill_row)?;
@@ -2265,7 +2858,7 @@ impl Display {
         // bring back the "fill the key colour" bug.
         //
         // Comparing the fill colour against this bitmap's own key was this host's reading of the op,
-        // and the shipped source says otherwise. It is what painted `IBITMAP_Invalidate`'s argument
+        // and the published description says otherwise. It is what painted `IBITMAP_Invalidate`'s argument
         // black instead of leaving the rectangle alone.
         if rop == g::AEE_RO_TRANSPARENT {
             return Ok(());
@@ -2297,16 +2890,21 @@ impl Display {
             write_pixel(mem, b, x as i32, y as i32, v)?;
             return Ok(());
         }
-        // At 16 bpp and above a pixel is the word itself, so one space covers both ends and the
-        // operands go in as they came. The memo is the caller's, and only a caller drawing many
-        // pixels has one — see [`IndexMemo`] for why the search it spares cannot outlive the
-        // operation.
+        // At 16 bpp and above a pixel is a whole colour word, so the operands go in their stored
+        // space: 565 for a 16-bpp bitmap, `0x00RRGGBB` for a 32-bpp one. The memo is the caller's,
+        // and only a caller drawing many indexed pixels has one — see [`IndexMemo`] for why the
+        // search it spares cannot outlive the operation.
+        let src = b.stored(mem, native)?;
         let dst = if needs {
-            read_pixel(mem, b, x as i32, y as i32)?.unwrap_or(0)
+            read_stored(mem, b, x as i32, y as i32)?.unwrap_or(0)
         } else {
             0
         };
-        let Some(v) = raster(rop, native, dst) else {
+        let Some(v) = (if is_888(b.depth) {
+            raster_word(rop, src, dst)
+        } else {
+            raster(rop, src, dst)
+        }) else {
             self.note(format!("unsupported raster op {rop}"));
             return Ok(());
         };
@@ -2498,7 +3096,8 @@ impl Display {
             }
             return Ok(());
         }
-        // The row path: a 16-bpp source into a 16-bpp destination, one whole row at a time.
+        // The row path: a source and destination of the same whole-colour depth — 16 or 32 — one whole
+        // row at a time.
         //
         // The loop below costs an address computation, a bounds check and a page lookup per *pixel* —
         // twice over for a transparent blit, which reads the destination too — and on a pack that
@@ -2508,7 +3107,8 @@ impl Display {
         // `write_bytes`, and what is left per pixel is a comparison in a buffer.
         //
         // Conditions, each checked rather than assumed:
-        //   * both bitmaps are 16-bpp, which is what makes a pixel exactly two bytes;
+        //   * both bitmaps have the same 16- or 32-bit depth, which makes a pixel exactly two or
+        //     four bytes and keeps a 32→32 copy from rounding through the 565 colour space;
         //   * the source coordinates start inside the picture. A blit *larger* than its own source
         //     is legal — `read_stored` answers None past the picture's edge and the pixel loop
         //     simply skips those coordinates — so the batched path clips the shown rectangle to
@@ -2522,15 +3122,15 @@ impl Display {
         //     same thing as the pixel loop only when the write cannot reach a pixel not yet read.
         //   * an alpha map is read per pixel, which is the one thing the row path cannot do; an
         //     opaque source — every BMP and every PNG that names no transparency — keeps the
-        //     batched path, and that is the case the corpus runs on.
+        //     batched path, and that is the case the sample set runs on.
         // i64 throughout: a wild `xdst` / `xsrc` from the guest must clamp, not wrap, before it is
         // compared with the already-clipped `x1`/`y1`.
         let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let src_right = clamp(xdst as i64 + src.width as i64 - xsrc as i64 - 1);
         let src_bottom = clamp(ydst as i64 + src.height as i64 - ysrc as i64 - 1);
         let (rx1, ry1) = (x1.min(src_right), y1.min(src_bottom));
-        if src.depth == 16
-            && dst.depth == 16
+        if src.depth == dst.depth
+            && matches!(src.depth, 16 | 32)
             && matches!(rop, g::AEE_RO_COPY | g::AEE_RO_TRANSPARENT)
             && alpha.is_none()
             && xsrc >= 0
@@ -2624,7 +3224,16 @@ impl Display {
                 let (r, g, b) = img.rgb(sx, sy);
                 let native = rgb_to_native(make_rgb(r, g, b));
                 let a = img.alpha_of(sx, sy);
-                self.lay(mem, &dst, px, py, native, a, g::AEE_RO_BLEND, Some(&mut memo))?;
+                self.lay(
+                    mem,
+                    &dst,
+                    px,
+                    py,
+                    native,
+                    a,
+                    g::AEE_RO_BLEND,
+                    Some(&mut memo),
+                )?;
             }
         }
         Ok(())
@@ -2644,6 +3253,7 @@ impl Display {
         let (x0, y0, x1, y1) = shown;
         let (xdst, ydst, xsrc, ysrc) = from;
         let width = (x1 - x0 + 1) as usize;
+        let bytes = if is_888(dst.depth) { 4 } else { 2 };
         if rop == g::AEE_RO_COPY {
             // Both sides are guest memory and the gate above has already proved the two bitmaps do
             // not overlap. `Mem::copy_bytes` moves a row page-run to page-run: no staging `Vec`,
@@ -2657,7 +3267,7 @@ impl Display {
             for y in y0..=y1 {
                 let s = src.at((xsrc + (x0 - xdst)) as u32, (ysrc + (y - ydst)) as u32);
                 let d = dst.at(x0 as u32, y as u32);
-                mem.copy_bytes(d, s, width * 2)?;
+                mem.copy_bytes(d, s, width * bytes)?;
             }
             return Ok(());
         }
@@ -2665,8 +3275,8 @@ impl Display {
         // stages one row pair. One buffer pair for the whole blit: a row is the unit of work here,
         // and a `Vec` per row would put the allocator back into the loop whose per-pixel work just
         // came out of it.
-        let mut row = vec![0u8; width * 2];
-        let mut keep = vec![0u8; width * 2];
+        let mut row = vec![0u8; width * bytes];
+        let mut keep = vec![0u8; width * bytes];
         for y in y0..=y1 {
             let s = src.at((xsrc + (x0 - xdst)) as u32, (ysrc + (y - ydst)) as u32);
             let d = dst.at(x0 as u32, y as u32);
@@ -2677,12 +3287,21 @@ impl Display {
                 // gives by not writing it, and one pass instead of one read per pixel.
                 mem.read_into(d, &mut keep)?;
                 for i in 0..width {
-                    let pixel = u16::from_le_bytes([row[2 * i], row[2 * i + 1]]);
-                    // A stored word against a stored word: this path is 16 bpp only, which is the
-                    // one depth where the two spaces coincide — see `Bitmap::trans`.
-                    if u32::from(pixel) == src.trans {
-                        row[2 * i] = keep[2 * i];
-                        row[2 * i + 1] = keep[2 * i + 1];
+                    // A stored word against a stored word: the two spaces coincide at 16 bpp, and
+                    // at 32 bpp `trans` was kept as the full `0x00RRGGBB` word by `sync_bitmap`.
+                    let pixel = if bytes == 4 {
+                        u32::from_le_bytes([
+                            row[4 * i],
+                            row[4 * i + 1],
+                            row[4 * i + 2],
+                            row[4 * i + 3],
+                        ])
+                    } else {
+                        u32::from(u16::from_le_bytes([row[2 * i], row[2 * i + 1]]))
+                    };
+                    if pixel == src.trans {
+                        row[bytes * i..bytes * (i + 1)]
+                            .copy_from_slice(&keep[bytes * i..bytes * (i + 1)]);
                     }
                 }
             }
@@ -2696,7 +3315,7 @@ impl Display {
     /// `IBitmap::GetInfo(pinfo, nSize)`, where `nSize` is the *caller's* `sizeof(AEEBitmapInfo)`.
     ///
     /// The header spells out a version negotiation: the struct "may grow over time", a smaller
-    /// `nSize` is an older caller that gets a shorter fill. **The shipped body does not do that.**
+    /// `nSize` is an older caller that gets a shorter fill. **The documented behaviour does not do that.**
     /// `DIB_GetInfo` compares `nSize != sizeof(*pInfo)` and answers `EUNSUPPORTED`,
     /// so on 3.1.2 a caller built against a shorter struct gets no record at all — and this host
     /// answering a truncated one would be inventing an answer no handset gives.
@@ -2849,7 +3468,7 @@ impl Display {
             return Ok(g::AEE_EUNSUPPORTED);
         }
         let area = Rect::read(mem, prc)?.clipped(Rect::whole(b.width, b.height));
-        // `AEE_RO_TRANSPARENT` paints nothing at all in this slot. The shipped OEM bitmap says so in
+        // `AEE_RO_TRANSPARENT` paints nothing at all in this slot. The reference OEM bitmap says so in
         // one line — the inline `FillRect` at the header is `case
         // AEE_RO_TRANSPARENT: return SUCCESS;` — and that is what makes `IBITMAP_Invalidate`, which
         // expands to
@@ -3007,7 +3626,7 @@ impl Display {
     /// direction: [`source_pixel`] and the batched row paths compare against it after resolving their
     /// operand to a stored value, which is the comparison the header asks for. Note where it
     /// is *not* read: a fill, a drawn pixel or a run of them paints nothing at all under
-    /// `AEE_RO_TRANSPARENT` — the shipped `FillRect`/`DrawPixel`/`DrawHScanline` each answer
+    /// `AEE_RO_TRANSPARENT` — the reference `FillRect`/`DrawPixel`/`DrawHScanline` each answer
     /// `SUCCESS` without touching a pixel — so this key belongs to the source side of a blit only.
     pub fn transparency(&mut self, mem: &mut Mem, obj: u32, color: Native) -> HResult<u32> {
         let mut b = self
@@ -3015,14 +3634,20 @@ impl Display {
             .ok_or(HleError::NotAnObject { addr: obj })?;
         let at = abi::offset_of("IDIB", "ncTransparent").expect("IDIB is in the tables");
         mem.write_u32(obj + at, color)?;
-        b.trans = color & 0xffff;
+        b.trans = if is_888(b.depth) {
+            color
+        } else {
+            color & 0xffff
+        };
         self.bitmaps.insert(obj, b);
+        self.pixel_owner.insert(b.px, obj);
         Ok(g::AEE_SUCCESS)
     }
 
     pub fn get_transparency(&self, mem: &mut Mem, obj: u32, pcolor: u32) -> HResult<u32> {
         // The object still has to be one of ours; its record is not what gets answered.
-        self.bitmap(obj).ok_or(HleError::NotAnObject { addr: obj })?;
+        self.bitmap(obj)
+            .ok_or(HleError::NotAnObject { addr: obj })?;
         if pcolor == 0 {
             return Ok(g::AEE_EBADPARM);
         }
@@ -3074,6 +3699,7 @@ impl Display {
             (pitch & 0xffff) | (u32::from(b.cnt_rgb) << 16),
         )?;
         self.bitmaps.insert(addr, made);
+        self.pixel_owner.insert(made.px, addr);
         // `DIB_NewEx` carries `ncTransparent` across. The **field** is what gets copied, not the
         // record's colour: a pack reads this number back through `GetTransparencyColor`, and an index
         // that went out through `NativeToRGB`/`RGBToNative` does not always come back as itself.
@@ -3093,7 +3719,7 @@ impl Display {
         height: u16,
         depth: u16,
     ) -> HResult<u32> {
-        check_depth(depth)?;
+        check_depth(depth, self.dib_depth)?;
         let stride = row_bytes(width, depth);
         // Both dimensions are the guest's here, so the product is checked rather than trusted:
         // `stride * height` in `u32` wraps for a 65535x65535 request, and a wrapped product hands back
@@ -3132,8 +3758,9 @@ impl Display {
             depth,
             trans: default_transparent(depth),
         };
-        let (obj, px) = new_bitmap_object(mem, hle, &seed)?;
+        let (obj, px) = new_bitmap_object(mem, hle, &seed, self.dib_pixel_offset, false)?;
         self.bitmaps.insert(obj, Bitmap { obj, px, ..seed });
+        self.pixel_owner.insert(px, obj);
         Ok(obj)
     }
 
@@ -3151,6 +3778,14 @@ impl Display {
         ysrc: i32,
         rop: u32,
     ) -> HResult<()> {
+        // `IDisplay::BitBlt` is `void`: a null source is a caller mistake with no error channel,
+        // and a handset paints nothing. Aborting here turned a failed image load in the pack into
+        // a host fault, because the pack kept running and the next blit handed us the null it had
+        // stored.
+        if src == 0 || src == u32::MAX {
+            self.note("IDisplay::BitBlt: a null or poison source bitmap, and nothing to do");
+            return Ok(());
+        }
         // Both sides of a blit are `IDIB`s the app may have restated since it last drew with them, so
         // this is where each one's geometry is read back rather than trusted from creation.
         self.sync_bitmap(mem, src)?;
@@ -3161,9 +3796,16 @@ impl Display {
         let dst = self
             .bitmap(dst.obj)
             .ok_or(HleError::NotAnObject { addr: dst.obj })?;
-        let src = self
-            .bitmap(src)
-            .ok_or(HleError::NotAnObject { addr: src })?;
+        let Some(src) = self.bitmap(src).or_else(|| self.guest_bitmap(mem, src)) else {
+            self.note("IDisplay::BitBlt: a source bitmap this host cannot read, and nothing to do");
+            return Ok(());
+        };
+        if src.px == u32::MAX || !self.readable_pixels(mem, &src) {
+            // BREW's empty-DIB poison can survive in a public `pBmp`, and a pack can restate it to
+            // an address it never decoded; either way there is no pixel to read.
+            self.note("IDisplay::BitBlt: a source bitmap with no readable pixel buffer, and nothing to do");
+            return Ok(());
+        }
         self.copy(
             mem,
             &dst,
@@ -3193,6 +3835,12 @@ impl Display {
         ysrc: i32,
         rop: u32,
     ) -> HResult<u32> {
+        if dst == 0 || dst == u32::MAX || src == 0 || src == u32::MAX {
+            // `IBitmap::BltIn/BltOut` return an `int`; a null or BREW's poison pointer is a caller
+            // mistake and the handset answers a parameter error. Returning `NotAnObject` threw the
+            // pack out of the run instead of letting it handle the failure it had just been given.
+            return Ok(g::AEE_EBADPARM);
+        }
         // Both sides, not just the one the call is made through. `IBitmap::BltIn` arrives with
         // `dst` as `this`, which the runtime's own head has already re-read, but the source is only
         // ever a number in an argument register — and for a pack whose whole art pipeline is
@@ -3208,6 +3856,13 @@ impl Display {
         let src = self
             .bitmap(src)
             .ok_or(HleError::NotAnObject { addr: src })?;
+        if dst.px == u32::MAX
+            || src.px == u32::MAX
+            || !self.readable_pixels(mem, &dst)
+            || !self.readable_pixels(mem, &src)
+        {
+            return Ok(g::AEE_EBADPARM);
+        }
         if !rop_supported(rop)
             && !(rop == g::AEE_RO_BLEND
                 && self.picture_alpha(src.obj, src.width as usize).is_some())
@@ -3226,7 +3881,7 @@ impl Display {
     /// `ITransform::TransformBltSimple`: the same copy, with the source rectangle read through a
     /// reflection or a rotation first.
     ///
-    /// The geometry is melange's `TransformSimple`, which is the same OEM routine a handset runs: it
+    /// The geometry is a reference front end's `TransformSimple`, which is the same OEM routine a handset runs: it
     /// keeps a *step* from one destination column to the next and one to the next row, in source
     /// pixels, and every case below changes only those two steps and where the sampling starts. The
     /// header's one-line rule — "all transformation use the source bitmap's center as the origin" — is
@@ -3235,7 +3890,7 @@ impl Display {
     ///
     /// Scaling is the third family the same routine carries, and it is why the two rules above are not
     /// enough on their own: a scale changes the destination's extent as well as the steps, so it is
-    /// applied *after* the rotation and to the rotated rectangle — the order melange's
+    /// applied *after* the rotation and to the rotated rectangle — the order a reference front end's
     /// `TransformSimple` uses, and the order that keeps a quarter-turned sprite centred.
     #[allow(clippy::too_many_arguments)]
     pub fn transform_in(
@@ -3287,7 +3942,7 @@ impl Display {
         // A scale is a numerator/denominator pair packed into a 3-bit field, which makes it an enum
         // and not a mask: `0x38` means one half, not `SCALE_8 | SCALE_QUARTER | SCALE_HALF`'s bits
         // combined, so the whole field has to be read at once. `0x20` is the single value inside the
-        // field that the header never defines; melange's switch has no case for it either and falls
+        // field that the header never defines; a reference front end's switch has no case for it either and falls
         // through unscaled, which is what is done here — with a note, since nothing may go unsaid.
         let (num, den) = match xform & 0x38 {
             0 => (1, 1),
@@ -3305,7 +3960,7 @@ impl Display {
             }
         };
         if num != 1 || den != 1 {
-            // The rectangle grows or shrinks about its own centre. Melange's rounding is reproduced
+            // The rectangle grows or shrinks about its own centre. a reference front end's rounding is reproduced
             // rather than tidied up, because the two directions floor differently — going up it slides
             // by a floored *half* extent times the extra copies, going down by a floored proportion of
             // the whole extent — and a pack that placed magnified art by eye on a handset was placed
@@ -3354,7 +4009,7 @@ impl Display {
         for j in 0..dy {
             let sy = oy + (j * den / num) * stepy;
             for i in 0..dx {
-                // Nearest source pixel, not an interpolated one. Melange walks its source pointer with
+                // Nearest source pixel, not an interpolated one. a reference front end walks its source pointer with
                 // a counter that only steps it once every `num` destination pixels, and this integer
                 // quotient is the same walk: at 8X a sprite is 64 copies of one pixel, which is the
                 // blocky result a pack that magnified its own art was counting on.
@@ -3533,6 +4188,7 @@ impl Display {
             self.drop_ref(mem, hle, state.dest)?;
         }
         if let Some(b) = self.bitmaps.remove(&addr) {
+            self.pixel_owner.remove(&b.px);
             // A picture's transparency record belongs to the bitmap it was laid out into, so it
             // leaves with it — nothing else can name this object again.
             self.alphas.remove(&addr);
@@ -3542,7 +4198,8 @@ impl Display {
             // null an hour into a session.
             // The palette was taken from the guest arena for this bitmap alone, so it goes back
             // with it. The pixels do not: they live inside the object block (`DIB_NewEx` allocates
-            // `pixel_bytes + 0x6B`), so `forget` above already returned them with the object.
+            // `pixel_bytes + 0x6B` by default; `abi.dib_pixel_offset` moves that header), so
+            // `forget` above already returned them with the object.
             hle.dealloc(mem, b.rgb);
         }
         hle.forget(addr);
@@ -3746,6 +4403,7 @@ fn read_pixel(mem: &Mem, b: &Bitmap, x: i32, y: i32) -> HResult<Option<Native>> 
         // An index, resolved through the bitmap's own palette — the packing of the byte is
         // `Bitmap::index_at`'s business, and so is the nibble order a 4-bpp font depends on.
         8 | 4 | 1 => b.colour_of(mem, b.index_at(mem, x as u32, y as u32)?)?,
+        32 => stored888_to_565(mem.read_u32(b.at(x as u32, y as u32))?),
         _ => mem.read_u16(b.at(x as u32, y as u32))?,
     }))
 }
@@ -3771,6 +4429,7 @@ fn read_stored(mem: &Mem, b: &Bitmap, x: i32, y: i32) -> HResult<Option<Native>>
     Ok(Some(match b.depth {
         0 => 0,
         8 | 4 | 1 => u32::from(b.index_at(mem, x as u32, y as u32)?),
+        32 => mem.read_u32(b.at(x as u32, y as u32))?,
         _ => u32::from(mem.read_u16(b.at(x as u32, y as u32))?),
     }))
 }
@@ -3895,29 +4554,30 @@ fn write_pixel(mem: &mut Mem, b: &Bitmap, x: i32, y: i32, v: Native) -> HResult<
             };
             mem.write_u8(at, byte)?;
         }
+        32 => mem.write_u32(at, v)?,
         _ => mem.write_u16(at, v & 0xffff)?,
     }
     Ok(())
 }
 
-/// The depths this host backs, and the packing each reads and writes. 16 bpp is the device's own screen;
-/// 8, 4 and 1 bpp are what a pack asks for when it wants a device-independent bitmap to decode into and
-/// read back. A pixel reads as the colour its index names
-/// ([`index8_to_native`], [`index4_to_native`], [`index1_to_native`]), so such a bitmap can be blitted
-/// onto the screen rather than merely held.
+/// The depths this host backs, and the packing each reads and writes. 16 and 32 bpp are whole-colour
+/// pixels (RGB565 and `0x00RRGGBB`); 8, 4 and 1 are indices into the bitmap's own table. `ceiling`
+/// is the deepest DIB the device profile says its firmware allocates (`abi.dib_depth`), so a
+/// handset that never hands out a 32-bpp DIB can keep refusing one.
 ///
 /// Zero is a depth BREW itself accepts, which is a different question from whether it is useful:
-/// `DIB_NewEx` in the shipped 3.1.2 source rejects only a
-/// *negative* `nPixelSize`, so `IDISPLAY_CreateDIBitmap(…, 0, …)` returns SUCCESS with `nDepth = 0`,
-/// `nPitch = 0` and no pixels. Refusing it here stopped six shipped packs at their first off-screen
-/// bitmap. Such a DIB carries no pixels to read or write — [`read_pixel`] and [`write_pixel`] answer
-/// that explicitly rather than falling through to the 16-bpp arm at an address past the object.
-fn check_depth(depth: u16) -> HResult<()> {
+/// `DIB_NewEx` in the delivered source rejects only a negative `nPixelSize`, so
+/// `IDISPLAY_CreateDIBitmap(…, 0, …)` returns SUCCESS with `nDepth = 0`, `nPitch = 0` and no
+/// pixels. Refusing it here stopped six guest packs at their first off-screen bitmap. Such a DIB
+/// carries no pixels to read or write — [`read_pixel`] and [`write_pixel`] answer that explicitly
+/// rather than falling through to the 16-bpp arm at an address past the object.
+fn check_depth(depth: u16, ceiling: u16) -> HResult<()> {
     match depth {
         0 | NATIVE_DEPTH | 8 | 4 | 1 => Ok(()),
+        32 if ceiling >= 32 => Ok(()),
         other => Err(HleError::Unsupported {
             what: format!(
-                "{other} bpp host bitmaps are not supported, only {NATIVE_DEPTH}, 8, 4 or 1 (or 0 for an empty DIB)"
+                "{other} bpp host bitmaps are not supported, only 16, 32, 8, 4 or 1 (or 0 for an empty DIB)"
             ),
         }),
     }
@@ -4022,6 +4682,9 @@ fn default_transparent(depth: u16) -> Native {
     } else {
         crate::device::RGB_MASK_COLOR
     };
+    if is_888(depth) {
+        return rgbval_to_888(mask);
+    }
     let native = rgb_to_native(mask);
     match depth {
         1 => u32::from(native_to_index1(native)),
@@ -4038,30 +4701,50 @@ fn row_bytes(width: u16, depth: u16) -> u32 {
     (u32::from(width) * u32::from(depth)).div_ceil(8)
 }
 
-const BITMAP_HEADER: u32 = 0x6B;
-
-fn new_bitmap_object(mem: &mut Mem, hle: &mut Hle, b: &Bitmap) -> HResult<(u32, u32)> {
+fn new_bitmap_object(
+    mem: &mut Mem,
+    hle: &mut Hle,
+    b: &Bitmap,
+    pixel_offset: u32,
+    page_round: bool,
+) -> HResult<(u32, u32)> {
     let at = |field: &str| abi::offset_of("IDIB", field).expect("IDIB is in the tables");
     // A palettized bitmap names its colours through `pRGB`, so its scheme is left empty; the two being
-    // nonzero at once is what the header calls an undefined mapping.
-    let scheme = if b.cnt_rgb == 0 {
-        g::IDIB_COLORSCHEME_565
-    } else {
+    // nonzero at once is what the header calls an undefined mapping. A 32-bpp bitmap is
+    // `IDIB_COLORSCHEME_888`, whose `NativeColor` is `0x00RRGGBB`, not the 5-6-5 word.
+    let scheme = if b.cnt_rgb != 0 {
         0
+    } else if is_888(b.depth) {
+        g::IDIB_COLORSCHEME_888
+    } else {
+        g::IDIB_COLORSCHEME_565
     };
     let span = (b.pitch.max(0) as u32).saturating_mul(u32::from(b.height));
+    let mut want = pixel_offset.saturating_add(span);
+    // The screen is the one bitmap whose block is a reservation rather than an exact size. A panel's
+    // framebuffer is handed out page-granular by the firmware's own allocator, and a pack that walks
+    // the rows it can see sometimes takes one more: reading a row past `pBmp + nPitch * cy` finds the
+    // tail of that reservation on a handset, and a host that packs the block to the byte turns the
+    // same read into the end of the run. Only the screen is rounded — an off-screen DIB is an
+    // allocation like any other, and a pack that over-reads one of those should still be told.
+    if page_round {
+        let page = crate::mem::PAGE_SIZE as u32;
+        want = want.saturating_add(page - 1) & !(page - 1);
+    }
     let obj = hle.new_object_reusing(
         mem,
         "IBitmap",
         g::AEECLSID_BITMAP,
-        BITMAP_HEADER.saturating_add(span),
+        want,
         at("reserved") + 2,
         &[],
     )?;
-    let px = obj + BITMAP_HEADER;
+    let px = obj + pixel_offset;
     // A fresh surface is black, not whatever the arena had in it a moment ago: this used to be a
-    // separate `Hle::alloc` that handed out zeroed space, and the object now carries the pixels.
-    mem.fill(px, span, 0)?;
+    // separate `Hle::alloc` that handed out zeroed space, and the object now carries the pixels. The
+    // whole reservation is cleared, so the tail of a screen reads as the black it looks like rather
+    // than as the picture a reused block last held.
+    mem.fill(px, want - pixel_offset, 0)?;
     mem.write_u32(obj + at("pPaletteMap"), 0)?;
     mem.write_u32(obj + at("pBmp"), px)?;
     mem.write_u32(obj + at("pRGB"), b.rgb)?;
@@ -4114,7 +4797,7 @@ fn default_colors() -> Vec<u32> {
 
 /// Field offsets for the two guest structs the display reads on *every* draw.
 ///
-/// `abi::offset_of` walks `STRUCTS` (594 entries in the shipped tables) doing a string comparison
+/// `abi::offset_of` walks `STRUCTS` (594 entries in the reference tables) doing a string comparison
 /// per entry, then walks that struct's fields the same way. `Rect::read` used to pay four of those
 /// per `IDisplay::DrawRect` — 374,400 walks in a 400-frame run — and `sync_bitmap` six more per
 /// bitmap, twice per `BitBlt`. Resolving them once keeps the ABI table the single source of truth
@@ -4320,6 +5003,8 @@ impl Display {
     pub(crate) fn write_state(&self, out: &mut Vec<u8>) {
         use crate::mem::{put_u32, put_u64, sorted_u32};
         put_bitmap(out, &self.device);
+        put_u32(out, self.dib_pixel_offset);
+        put_u32(out, u32::from(self.dib_depth));
         put_u32(out, self.default);
         let displays = sorted_u32(&self.displays);
         put_u32(out, displays.len() as u32);
@@ -4346,6 +5031,8 @@ impl Display {
     #[allow(dead_code)]
     pub(crate) fn read_state(&mut self, st: &mut crate::mem::State) -> Result<(), String> {
         let device = get_bitmap(st)?;
+        let dib_pixel_offset = st.u32()?;
+        let dib_depth = st.u32()? as u16;
         let default = st.u32()?;
         let count = st.small()?;
         let mut displays = HashMap::with_capacity(count);
@@ -4371,9 +5058,16 @@ impl Display {
         let now = st.u64()?;
 
         self.device = device;
+        self.dib_pixel_offset = dib_pixel_offset;
+        self.dib_depth = dib_depth;
         self.default = default;
         self.displays = displays;
         self.bitmaps = bitmaps;
+        self.pixel_owner = self
+            .bitmaps
+            .iter()
+            .map(|(addr, b)| (b.px, *addr))
+            .collect();
         self.alphas = alphas;
         self.presentations = presentations;
         self.now = now;
@@ -4396,9 +5090,14 @@ impl Display {
                 depth: 0,
                 trans: 0,
             },
+            dib_pixel_offset: DIB_PIXEL_OFFSET,
+            dib_depth: NATIVE_DEPTH,
+            encoding: TextEncoding::Unicode,
+            text_bytes: false,
             displays: HashMap::new(),
             default: 0,
             bitmaps: HashMap::new(),
+            pixel_owner: HashMap::new(),
             alphas: HashMap::new(),
             faces: HashMap::new(),
             face_epoch: 0,

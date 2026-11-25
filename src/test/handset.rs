@@ -106,7 +106,7 @@ fn the_rocker_is_a_cross_and_not_a_list_of_squares() {
 
 #[test]
 fn the_keypad_costs_a_fixed_height_below_the_screen() {
-    // What put a shipped pack's digits off the bottom of the desktop was not its screen: the
+    // What put a guest pack's digits off the bottom of the desktop was not its screen: the
     // keypad is a fixed cost, and a layout that let it grow with the screen's *width* spends
     // more phone below a landscape pack than any window has room for.
     for (wide, high) in [(176, 220), (240, 320), (320, 240), (480, 240)] {

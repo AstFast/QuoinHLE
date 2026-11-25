@@ -21,6 +21,7 @@
 
 use crate::abi::generated as g;
 use crate::bbf;
+use crate::encoding::TextEncoding;
 use crate::makebbf::{self, Cell};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -312,14 +313,19 @@ pub struct Font {
 }
 
 impl Font {
-    /// The face for an `AEEFont`, or `None` for an id this host has no glyphs for — including
-    /// `AEE_FONT_ITALIC` and the user-defined slots, whose real answers come from a MIF resource
-    /// this project does not read.
+    /// The face for an `AEEFont`, or `None` for an id this host has no glyphs for — including the
+    /// two user-defined slots, whose real answers come from a MIF resource this project does not
+    /// read.
+    ///
+    /// The three italic designators are answered with the upright face of the same size and weight.
+    /// This host has no slanted cut, and a handset with a missing private face falls back to the
+    /// designator's own grid rather than refusing to draw; the caller still gets a working
+    /// `IFont`, which is what a pack that only wants to measure or draw its text needs.
     pub const fn of(nfont: u32) -> Option<Font> {
         let (scale, bold) = match nfont {
-            g::AEE_FONT_NORMAL => (1, false),
-            g::AEE_FONT_BOLD => (1, true),
-            g::AEE_FONT_LARGE => (2, false),
+            g::AEE_FONT_NORMAL | g::AEE_FONT_ITALIC => (1, false),
+            g::AEE_FONT_BOLD | g::AEE_FONT_BOLD_ITALIC => (1, true),
+            g::AEE_FONT_LARGE | g::AEE_FONT_LARGE_ITALIC => (2, false),
             _ => return None,
         };
         Some(Font {
@@ -343,10 +349,23 @@ impl Font {
         self.advance()
     }
 
+    /// The width a run of Unicode text occupies, trailing leading excluded.
+    ///
+    /// This is the host's own text — a clock, an HTML page — so its characters are code points and
+    /// no device encoding is involved. Guest `AECHAR` runs go through [`Face::measure_text`], which
+    /// is given the device's encoding.
+    pub fn measure_text(self, text: &str) -> u32 {
+        let units: Vec<u16> = text
+            .chars()
+            .map(|ch| bmp_key(ch).unwrap_or(u16::MAX))
+            .collect();
+        self.measure_chars(&units)
+    }
+
     /// The width a run of characters occupies, trailing leading excluded — so one `H` is five
     /// pixels wide and an empty run is nothing, which is what an alignment calculation has to see.
     ///
-    /// Per character rather than `count * advance`: the corpus is mixed, and a Chinese menu whose
+    /// Per character rather than `count * advance`: the sample set is mixed, and a Chinese menu whose
     /// every code unit was measured as a Latin one comes out at a fifth of its real width - which
     /// is what a caller then centres and clips by.
     pub fn measure_chars(self, chars: &[u16]) -> u32 {
@@ -435,6 +454,22 @@ impl Font {
     }
 }
 
+/// The upright designator an italic one falls back to, or `None` for any other id.
+const fn upright_designator(nfont: u32) -> Option<u32> {
+    match nfont {
+        g::AEE_FONT_ITALIC => Some(g::AEE_FONT_NORMAL),
+        g::AEE_FONT_BOLD_ITALIC => Some(g::AEE_FONT_BOLD),
+        g::AEE_FONT_LARGE_ITALIC => Some(g::AEE_FONT_LARGE),
+        _ => None,
+    }
+}
+
+/// A character as the `u16` a Unicode-keyed face can address, or `None` above the BMP.
+fn bmp_key(ch: char) -> Option<u16> {
+    let cp = ch as u32;
+    (cp <= u32::from(u16::MAX)).then_some(cp as u16)
+}
+
 /// A resolved face: one of the built-in grids, or a bitmap font decoded from a BBF file.
 ///
 /// The built-in ASCII grid is encoded once into [`bbf::Bbf`]; this variant only keeps the
@@ -500,11 +535,53 @@ impl Face {
         }
     }
 
-    /// Columns one code unit steps forward.
-    pub fn advance_of(&self, ch: u16) -> u32 {
+    /// Columns one character steps forward.
+    ///
+    /// `enc` is the encoding the run arrived in. A Unicode-keyed face looks the character up by
+    /// its code point; a handset's own face is keyed by `AECHAR` units, so the character is
+    /// converted to the device's unit first. A character the device cannot name still advances by
+    /// the face's undefined-glyph width, which is what a handset does with it.
+    pub fn advance_of_char(&self, ch: char, enc: TextEncoding) -> u32 {
         match self {
-            Face::Builtin(font) => font.advance_of(ch),
-            Face::Bbf(face) => u32::from(face.advance(ch)),
+            Face::Builtin(font) => font.advance_of(bmp_key(ch).unwrap_or(u16::MAX)),
+            Face::Bbf(face) => {
+                let key = self.glyph_key(ch, enc).unwrap_or(u16::MAX);
+                u32::from(face.advance(key))
+            }
+        }
+    }
+
+    /// The width `text` occupies in this face, without the trailing gap.
+    ///
+    /// Host text — an HTML page, a clock — passes [`TextEncoding::Unicode`] because its characters
+    /// are already code points. A guest `AECHAR` run passes the device's encoding, which is what
+    /// lets a face dumped from a handset answer the units it is actually keyed by.
+    pub fn measure_text(&self, text: &str, enc: TextEncoding) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        let mut total = 0u32;
+        let mut last = 0u32;
+        for ch in text.chars() {
+            let step = self.advance_of_char(ch, enc);
+            total += step;
+            last = step;
+        }
+        total.saturating_sub(last.min(self.trailing_leading()))
+    }
+
+    /// The key this face's glyph table is addressed by for `ch`.
+    ///
+    /// `None` when the character has no key in the face's space: a non-BMP character on a Unicode
+    /// face, or a character the device encoding cannot name on a handset-keyed face. Both draw the
+    /// face's undefined glyph, which is the handset's own answer.
+    pub fn glyph_key(&self, ch: char, enc: TextEncoding) -> Option<u16> {
+        match self {
+            Face::Builtin(_) => bmp_key(ch),
+            Face::Bbf(face) => match face.key_space() {
+                bbf::KeySpace::Unicode => bmp_key(ch),
+                bbf::KeySpace::Device => enc.char_to_unit(ch),
+            },
         }
     }
 
@@ -517,11 +594,16 @@ impl Face {
         }
     }
 
-    /// Width of a run, without the trailing gap.
-    pub fn measure_chars(&self, chars: &[u16]) -> u32 {
+    /// A copy with every ink pixel one column wider, which is what this host can offer a CJK face
+    /// under `AEE_FONT_BOLD` when the source font has no bold cut. The built-in grid already has a
+    /// bold policy of its own; this returns that.
+    pub fn emboldened(&self) -> Face {
         match self {
-            Face::Builtin(font) => font.measure_chars(chars),
-            Face::Bbf(face) => face.measure(chars),
+            Face::Builtin(font) => Face::Builtin(Font {
+                bold: true,
+                ..*font
+            }),
+            Face::Bbf(face) => Face::Bbf(Arc::new(face.emboldened())),
         }
     }
 
@@ -581,11 +663,18 @@ impl<'a> Faces<'a> {
     }
 
     /// The face a designator names: the installed one first, the built-in table after — the same
-    /// order, and the same answer, as [`crate::display::Display::face`].
+    /// order, and the same answer, as [`crate::display::Display::face`]. An italic designator
+    /// falls back to the installed upright face of the same weight and size before the built-in
+    /// grid, so a CJK face installed under `AEE_FONT_NORMAL` still answers italic text.
     pub fn face(self, nfont: u32) -> Option<Face> {
-        self.installed
+        let installed = self.installed;
+        installed
             .and_then(|faces| faces.get(&nfont))
             .cloned()
+            .or_else(|| {
+                let upright = upright_designator(nfont)?;
+                installed.and_then(|faces| faces.get(&upright)).cloned()
+            })
             .or_else(|| Face::builtin(nfont))
     }
 }

@@ -1,4 +1,4 @@
-// The clock's own arithmetic: the shipped hand geometry, the square the face becomes, and the two
+// The clock's own arithmetic: the reference hand geometry, the square the face becomes, and the two
 // byte triples an `RGBVAL` turns into. No guest, no display — these are the numbers a screenshot is
 // made of, so they are worth pinning without one.
 
@@ -6,7 +6,7 @@ use super::*;
 
 #[test]
 fn an_rgb_value_becomes_the_three_bytes_the_setters_keep() {
-    // `MAKE_RGB(r, g, b)` puts red at bits 8-15, green at 16-23 and blue at 24-31, and the shipped
+    // `MAKE_RGB(r, g, b)` puts red at bits 8-15, green at 16-23 and blue at 24-31, and the reference
     // macros read them back in that order.
     assert_eq!(rgb_parts(crate::device::make_rgb(1, 2, 3)), [1, 2, 3]);
     assert_eq!(rgb_parts(0), [0, 0, 0]);

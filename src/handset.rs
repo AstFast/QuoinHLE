@@ -176,7 +176,7 @@ impl Handset {
         y += rocker + ROW_GAP;
         keys.push(placed("AVK_CLR", Rect::new(left + cell, y, cell, key_h)));
         y += key_h + ROW_GAP;
-        // The digit grid, in the order the SDK's own keypad diagram reads it.
+        // The digit grid, in the order the platform's own keypad diagram reads it.
         for (row, line) in [
             ["AVK_1", "AVK_2", "AVK_3"],
             ["AVK_4", "AVK_5", "AVK_6"],
@@ -229,7 +229,7 @@ impl Handset {
     }
 }
 
-/// A key by its SDK name, in the cell `rect`, with the face this file chose for it. Panics on an
+/// A key by its platform name, in the cell `rect`, with the face this file chose for it. Panics on an
 /// unknown name: the list above is a claim about the handset, and a claim that stops matching
 /// [`keymap::KEYS`] should stop the build rather than draw a phone with a hole in it.
 fn placed(name: &'static str, rect: Rect) -> Placed {

@@ -1,19 +1,19 @@
 //! The database store: the file `IDBMgr`, `IDatabase` and `IDBRecord` are a front for.
 //!
 //! A handset's database *is* a file in the app's own directory, and those three interfaces are a
-//! thin shell over the OEM layer the firmware supplied: `OEM_DBOpenEx`/`OEM_DBCreate` on the way in,
+//! thin shell over the platform layer the firmware supplied: `OEM_DBOpenEx`/`OEM_DBCreate` on the way in,
 //! then `OEM_DBRecord{Add,Update,Get,Next,Delete,Count,Free}` for the records. What *is* observable
-//! through the API is the record body the shipped `AEEDBRecord_Update` assembles before it hands
+//! through the API is the record body the reference `AEEDBRecord_Update` assembles before it hands
 //! the bytes down: the `AEEDBFileBasicField`/`AEEDBFileField` array from the header with its padding
 //! and its zero terminator. This module stores that verbatim.
 //!
-//! The container around those bodies is no longer a guess either. BREW 3.1.2 ships the OEM layer's
-//! source, and real database files in the corpus match it byte for byte: an
+//! The container around those bodies is no longer a guess either. BREW 3.1.2 ships the platform layer's
+//! source, and real database files in the sample set match it byte for byte: an
 //! eight-byte `oemdb_header`, a run of `oemdb_rec_header` + body records, and an index at the end
 //! (`index_header` plus `index_entry` per live record, sorted by id). [`encode_file`] writes that
 //! shape, so a file this host saves is one a handset would read. [`decode_file`] reads it, falls
 //! back to scanning the data area when the index is missing or short — which is exactly what the
-//! shipped `LoadIndex` does — and still accepts the older `QBDB` container
+//! reference `LoadIndex` does — and still accepts the older `QBDB` container
 //! this host used before the OEM source turned up, so existing saves do not disappear.
 //!
 //! Deleted records stay in the data area with `wRecID = AEE_DB_RECID_NULL`; the index is what says
@@ -42,7 +42,7 @@
 //! `AEEDBField` is **eight** bytes on the target and sixteen in this host's generated tables. The
 //! header makes the difference itself: `AEEDBFieldType` and `AEEDBFieldName` are `int8` off
 //! `_WIN32` and `unsigned` on it, so the target gets `fType@0, fName@1, wDataLen@2, pBuffer@4` while
-//! the simulator's reading pads both enums to four. The shipped body walks the caller's array in
+//! the simulator's reading pads both enums to four. The documented behaviour walks the caller's array in
 //! steps of eight (`AEEDBRecord_Update`, `ADD r5, #8`), so a pack compiled for a handset hands over
 //! eight-byte records and that is what the runtime reads. [`FIELD_STRIDE`] is that number, and the
 //! offsets beside it are the ones the body uses.
@@ -140,9 +140,9 @@ pub struct FieldView {
 
 /// The field at `at`, or `None` when that offset is not a field.
 ///
-/// `None` covers both answers the shipped code gives: the zero terminator (which is how a record
+/// `None` covers both answers the platform code gives: the zero terminator (which is how a record
 /// ends) and an offset past the bytes this record has. The body does not distinguish them because
-/// it read through an OEM layer that had already validated the buffer; here the buffer is ours, so
+/// it read through a platform layer that had already validated the buffer; here the buffer is ours, so
 /// the same two answers arrive as one.
 pub fn field_at(rec: &[u8], at: usize) -> Option<FieldView> {
     let kind = *rec.get(at)?;
@@ -313,7 +313,7 @@ pub fn read_string(payload: &[u8]) -> Vec<u16> {
     units
 }
 
-/// One record: the id the OEM layer assigned it, and the bytes it holds.
+/// One record: the id the platform layer assigned it, and the bytes it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub id: u16,
@@ -330,9 +330,9 @@ pub struct Open {
     pub cursor: u16,
     /// Whether the last walk ran off the end of the records.
     ///
-    /// It is a separate flag because the shipped body cannot tell the two states apart: it stores
+    /// It is a separate flag because the documented behaviour cannot tell the two states apart: it stores
     /// the same `0xFFFF` when it resets and when `OEM_DBRecordNext` answers [`RECID_NULL`], and
-    /// passes it back as the "where I got to" argument. A real OEM layer kept a file position of its
+    /// passes it back as the "where I got to" argument. A real platform layer kept a file position of its
     /// own, so a walk that reached the end stayed there — which is what makes the canonical
     /// `Reset; while (GetNextRecord)` loop terminate, and therefore what this store reproduces.
     /// `Reset` clears it; nothing else does.
@@ -398,7 +398,7 @@ impl Databases {
     /// Forget an `IDatabase` object, answering what it was so the caller can write it back.
     ///
     /// The record objects that came out of it are left alone: they hold guest blocks that their own
-    /// releases free, and a record of a database that is no longer open is a state the shipped body
+    /// releases free, and a record of a database that is no longer open is a state the documented behaviour
     /// has too — `Update` on one answers `AEE_DB_EBADREC`, because the handle it writes through is
     /// gone.
     pub fn detach(&mut self, addr: u32) -> Option<Open> {
@@ -418,7 +418,7 @@ impl Databases {
     /// Whether a name is already open. A database file may only be removed when it is not.
     ///
     /// Asked as a yes-or-no rather than "which handle", because one name may have several: the
-    /// shipped body answers each `OpenDatabase` with a fresh object, so naming *one* of them would be
+    /// documented behaviour answers each `OpenDatabase` with a fresh object, so naming *one* of them would be
     /// a choice this store has no reason to make (and, over a hash map, a nondeterministic one).
     pub fn is_open(&self, name: &str) -> bool {
         self.open.values().any(|open| open.name == name)
@@ -543,10 +543,10 @@ impl Databases {
     }
 }
 
-/// The bytes of a database file, in the shipped OEM format.
+/// The bytes of a database file, in the reference OEM format.
 ///
 /// The record bodies are opaque here — this layer only frames them — which is the same division the
-/// OEM layer had, and the reason a change to the field codec does not invalidate a save file.
+/// platform layer had, and the reason a change to the field codec does not invalidate a save file.
 pub fn encode_file(records: &[Record]) -> Vec<u8> {
     // `DB_WriteIndex` seeks to EOF, records that offset in `dwIndexOffset`, then writes the index
     // there. So the index starts just past the last record.
@@ -567,7 +567,7 @@ pub fn encode_file(records: &[Record]) -> Vec<u8> {
         let offset = out.len() as u32;
         out.extend_from_slice(&record.id.to_le_bytes());
         // `wRecSize` is a word on the target too. A body longer than that has no representation in
-        // this format; the shipped allocator would have refused it long before it got here.
+        // this format; the reference allocator would have refused it long before it got here.
         out.extend_from_slice(&(record.bytes.len() as u16).to_le_bytes());
         out.extend_from_slice(&record.bytes);
         placed.push((record.id, offset));
@@ -688,7 +688,7 @@ fn decode_oem(bytes: &[u8]) -> Option<Vec<Record>> {
 }
 
 /// Walk `oemdb_rec_header` + body pairs from `at` to `end`, skipping the records a handset marked
-/// deleted with `AEE_DB_RECID_NULL`, and answer them in id order like the shipped `QSORT` does.
+/// deleted with `AEE_DB_RECID_NULL`, and answer them in id order like the reference `QSORT` does.
 fn scan_oem_data(bytes: &[u8], at: usize, end: usize) -> Option<Vec<Record>> {
     let mut records = Vec::new();
     let mut at = at;

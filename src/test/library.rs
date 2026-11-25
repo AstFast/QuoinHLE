@@ -17,7 +17,7 @@ fn a_build_directory_says_which_screen_the_pack_was_built_for() {
     // A directory that merely has an `x` in it is not a screen size.
     assert_eq!(screen_of("0x0"), None);
     assert_eq!(screen_of("axb"), None);
-    // Four of the ten shipped builds are filed under a bracketed, space-separated name that
+    // Four of the ten guest builds are filed under a bracketed, space-separated name that
     // carries the size as `[240×320]` — a full-width multiplication sign, because whoever typed it
     // was typing Chinese. The old `-`/`_` anchor plus an ASCII-only separator found nothing in
     // any of them, so the list loaded all four at the default screen without saying so.
@@ -75,7 +75,7 @@ fn an_unreadable_root_is_an_empty_library_rather_than_a_refusal() {
 
 #[test]
 fn a_png_only_container_gives_the_pack_its_own_picture() {
-    // Ten of the corpus's thirty-five builds carry three `image/png` images and no BMP, and the list
+    // Ten of the sample set's thirty-five builds carry three `image/png` images and no BMP, and the list
     // showed a blank space for each of them. The host already had a PNG reader; the library was asking
     // only for BMPs.
     let root = library_dir("png-icon");
@@ -152,9 +152,9 @@ fn the_smallest_decodable_picture_wins_whichever_order_it_is_stored_in() {
 }
 
 #[test]
-fn a_row_lists_every_witness_and_says_what_it_cannot_back() {
-    // `<root>/mygame-240x320/1001/mygame.mod` with its manifest one level up, the way the corpus files
-    // a pack. Two witnesses now claim 240x320 for it, and the row has to show both, folder first: P1's
+fn a_row_lists_every_evidence_and_says_what_it_cannot_back() {
+    // `<root>/mygame-240x320/1001/mygame.mod` with its manifest one level up, the way the sample set files
+    // a pack. Two records now claim 240x320 for it, and the row has to show both, folder first: P1's
     // picker offers them as equals and boots with whichever one a player picks.
     let root = library_dir("rows");
     let build = root.join("mygame-240x320");
@@ -182,13 +182,13 @@ fn a_row_lists_every_witness_and_says_what_it_cannot_back() {
             Candidate {
                 width: 240,
                 height: 320,
-                witness: Witness::Folder,
+                claim: Claim::Folder,
                 evidence: "from the directory: mygame-240x320".to_string()
             },
             Candidate {
                 width: 240,
                 height: 320,
-                witness: Witness::Art,
+                claim: Claim::Art,
                 // The same sentence the report line carries, from `Screen::evidence` — no bar in this
                 // fixture, so the fallback rule is named as the width's source rather than a bar.
                 evidence: "width from the narrowest width at the shared height of the large pictures; 1 picture(s) at that width, the tallest gives 320"
@@ -218,7 +218,7 @@ fn a_row_lists_every_witness_and_says_what_it_cannot_back() {
 
 #[test]
 fn an_icon_is_not_offered_as_a_screen() {
-    // The case for 17 of the corpus's 35 builds: all that mounts is the icon set, so the widest picture
+    // The case for 17 of the sample set's sample builds: all that mounts is the icon set, so the widest picture
     // is 65x42. Offering that as a screen candidate would be a number looking like evidence, which is
     // the shape this repository keeps being bitten by; the row reports it through `caution` instead.
     let root = library_dir("rows-thin");
@@ -239,7 +239,7 @@ fn an_icon_is_not_offered_as_a_screen() {
         vec![Candidate {
             width: 240,
             height: 320,
-            witness: Witness::Folder,
+            claim: Claim::Folder,
             evidence: "from the directory: mygame-240x320".to_string()
         }],
         "the folder still speaks, the art does not get a vote"
@@ -254,7 +254,7 @@ fn an_icon_is_not_offered_as_a_screen() {
 }
 
 #[test]
-fn a_pack_with_no_witness_at_all_offers_nothing() {
+fn a_pack_with_no_evidence_at_all_offers_nothing() {
     // No size in the directory name and nothing decodable beside it: `default screen` in the subtitle and an
     // empty candidate list, rather than a row that implies the host knows.
     let root = library_dir("rows-blind");
@@ -282,7 +282,7 @@ fn arm_image() -> Vec<u8> {
     out
 }
 
-/// A row with two witnesses that **disagree**, built by hand so no pack is read. The art claims a wider
+/// A row with two records that **disagree**, built by hand so no pack is read. The art claims a wider
 /// canvas than the directory does: a test whose two claims are the same number cannot tell which one a
 /// boot used.
 fn two_claim_row() -> Row {
@@ -300,13 +300,13 @@ fn two_claim_row() -> Row {
             Candidate {
                 width: 240,
                 height: 320,
-                witness: Witness::Folder,
+                claim: Claim::Folder,
                 evidence: "from the directory: g-240x320".to_string(),
             },
             Candidate {
                 width: 320,
                 height: 240,
-                witness: Witness::Art,
+                claim: Claim::Art,
                 evidence: "width from a 320-pixel-wide bar; 2 picture(s) at that width, the tallest gives 240".to_string(),
             },
         ],
@@ -405,7 +405,7 @@ fn a_half_typed_size_is_not_a_screen() {
 
 #[test]
 fn a_sound_or_a_caption_under_the_image_kind_is_still_not_an_icon() {
-    // The corpus files MIDI and text under `RESTYPE_IMAGE`, so the kind is not the test of what a
+    // The sample set files MIDI and text under `RESTYPE_IMAGE`, so the kind is not the test of what a
     // picture is. A container holding only those answers "no icon"; one holding them beside a real
     // picture answers with the picture; and a declared format this host has no reader for — the
     // private `image/zbm` class — is refused rather than guessed at.
@@ -493,7 +493,7 @@ fn png_of(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
     out
 }
 
-/// A 24-bit bottom-up BMP, which is the shape every `image/bmp` resource in the corpus is.
+/// A 24-bit bottom-up BMP, which is the shape every `image/bmp` resource in the sample set is.
 fn bmp_of(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
     let stride = (w as usize * 3 + 3) & !3;
     let mut rows = Vec::new();
@@ -723,5 +723,166 @@ fn a_game_booted_from_the_library_arms_the_jit_backend() {
         icon: None,
     };
     let rt = boot_at(&entry, None).expect("the library boots the pack");
-    assert!(rt.cpu.jit_enabled(), "a pack launched from the GUI must use the JIT backend");
+    assert!(
+        rt.cpu.jit_enabled(),
+        "a pack launched from the GUI must use the JIT backend"
+    );
+}
+
+#[test]
+fn installing_a_pack_copies_it_into_the_device_tree_with_its_mif_beside_the_mod_directories() {
+    let root = std::env::temp_dir().join(format!("quoin-install-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let source = root.join("Game/title/1073744343");
+    std::fs::create_dir_all(source.join("res")).unwrap();
+    std::fs::write(source.join("twins.mod"), b"image").unwrap();
+    std::fs::write(source.join("program.bin"), b"program").unwrap();
+    std::fs::write(source.join("res/data.bin"), b"data").unwrap();
+    std::fs::write(root.join("Game/title/1073744343.mif"), b"mif").unwrap();
+
+    let device = root.join("device");
+    let installed = install_pack(&source.join("twins.mod"), &device).unwrap();
+    assert_eq!(installed.id, "1073744343");
+    assert_eq!(installed.files, 3);
+    assert_eq!(
+        std::fs::read(device.join("fs/mod/1073744343/twins.mod")).unwrap(),
+        b"image"
+    );
+    assert_eq!(
+        std::fs::read(device.join("fs/mod/1073744343/program.bin")).unwrap(),
+        b"program"
+    );
+    assert_eq!(
+        std::fs::read(device.join("fs/mod/1073744343/res/data.bin")).unwrap(),
+        b"data"
+    );
+    assert_eq!(
+        std::fs::read(device.join("fs/mif/1073744343.mif")).unwrap(),
+        b"mif"
+    );
+    assert_eq!(
+        app_info_of(&device.join("fs/mod/1073744343/twins.mod")),
+        Some(device.join("fs/mif/1073744343.mif"))
+    );
+    let found = scan(&device.join("fs/mod"));
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].mod_path,
+        device.join("fs/mod/1073744343/twins.mod")
+    );
+    assert!(
+        source.join("twins.mod").is_file(),
+        "the source pack is left in place"
+    );
+    assert!(
+        install_pack(&source.join("twins.mod"), &device).is_err(),
+        "a second install of the same id must not overwrite the first one's saves"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `.mif` with one `BINARY` row, the shape an `AEEAppInfo` lives in.
+fn app_mif(cls: u32) -> Vec<u8> {
+    let mut raw = vec![0u8; 20];
+    let at = usize::try_from(
+        crate::abi::offset_of("AEEAppInfo", "cls").expect("AEEAppInfo has a cls field"),
+    )
+    .unwrap();
+    raw[at..at + 4].copy_from_slice(&cls.to_le_bytes());
+    let bodies = vec![raw];
+    let (map, entries) = (0x20usize, 1usize);
+    let offsets = map + entries * 8;
+    let data = offsets + (entries + 1) * 4;
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x11, 0]);
+    for word in [1u16, 1, entries as u16] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [
+        map as u32,
+        (entries * 8) as u32,
+        offsets as u32,
+        entries as u32,
+        data as u32,
+        bodies.iter().map(|b| b.len()).sum::<usize>() as u32,
+    ] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [crate::resource::RESTYPE_BINARY, 2u16, 0u16, 0u16] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut at = data;
+    out.extend_from_slice(&(at as u32).to_le_bytes());
+    for b in &bodies {
+        at += b.len();
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+    }
+    for b in &bodies {
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// An ARM image whose entry returns immediately, with the class it aims at written as a literal.
+fn image_naming(marker: Option<u32>) -> Vec<u8> {
+    let mut out = vec![0u8; 64];
+    out[..4].copy_from_slice(&0xe92d_00f0u32.to_le_bytes()); // push {r4, r5, r6, r7, lr}
+    if let Some(cls) = marker {
+        out[16..20].copy_from_slice(&cls.to_le_bytes());
+    }
+    out[60..64].copy_from_slice(&0xe12f_ff1eu32.to_le_bytes()); // bx lr
+    out
+}
+
+/// `<root>/bundle/{app,other}`, with `other.mif` present only when it claims to be an applet.
+fn two_app_bundle(
+    tag: &str,
+    other_cls: Option<u32>,
+    marker: Option<u32>,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let root = scratch(tag);
+    let bundle = root.join("bundle");
+    std::fs::create_dir_all(bundle.join("app")).unwrap();
+    std::fs::create_dir_all(bundle.join("other")).unwrap();
+    std::fs::write(bundle.join("app.mif"), app_mif(0x0100_0001)).unwrap();
+    let app_mod = bundle.join("app/app.mod");
+    let other_mod = bundle.join("other/other.mod");
+    std::fs::write(&app_mod, image_naming(marker)).unwrap();
+    std::fs::write(&other_mod, image_naming(None)).unwrap();
+    if let Some(cls) = other_cls {
+        std::fs::write(bundle.join("other.mif"), app_mif(cls)).unwrap();
+    }
+    (root, app_mod, other_mod)
+}
+
+#[test]
+fn an_unrelated_game_in_the_bundle_is_not_loaded_as_a_library() {
+    let (root, app_mod, _other_mod) =
+        two_app_bundle("sibling-unrelated", Some(0x0103_46d4), Some(0x0180_00fe));
+    let mut rt = Runtime::with_device(DeviceProfile::standard());
+    let loaded = load_sibling_modules(&mut rt, &app_mod);
+    assert!(loaded.is_empty(), "{loaded:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_shim_loads_the_app_whose_applet_class_it_names() {
+    let cls = 0x0107_f149;
+    let (root, app_mod, other_mod) = two_app_bundle("sibling-named", Some(cls), Some(cls));
+    let mut rt = Runtime::with_device(DeviceProfile::standard());
+    let loaded = load_sibling_modules(&mut rt, &app_mod);
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert_eq!(std::path::Path::new(&loaded[0]), other_mod, "{loaded:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_sibling_with_no_applet_class_is_still_loaded_as_a_library() {
+    let (root, app_mod, other_mod) = two_app_bundle("sibling-library", None, None);
+    let mut rt = Runtime::with_device(DeviceProfile::standard());
+    let loaded = load_sibling_modules(&mut rt, &app_mod);
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert_eq!(std::path::Path::new(&loaded[0]), other_mod, "{loaded:?}");
+    let _ = std::fs::remove_dir_all(root);
 }

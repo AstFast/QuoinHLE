@@ -59,8 +59,8 @@ pub enum Error {
         addr: u32,
         cls: u32,
         /// The words read at `m_pIShell` for each shape in [`crate::runtime::AppletLayout::ALL`],
-        /// in that order: the SDK's, the widened and Brew MP's.
-        seen: [u32; 3],
+        /// in that order: the platform's, the widened, the 1.x compact and Brew MP's.
+        seen: [u32; 4],
         /// The word read at `m_pIModule` for a shape whose shell matched but whose module did not,
         /// or 0 when no shape's shell matched.
         module: u32,
@@ -137,9 +137,9 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "{addr:#010x} (class {cls:#010x}) is not an AEEApplet object this host knows: \
-                     m_pIShell read {:#010x}/{:#010x}/{:#010x} at the SDK's, the widened and Brew \
-                     MP's layouts, m_pIModule {:#010x}",
-                    seen[0], seen[1], seen[2], module
+                     m_pIShell read {:#010x}/{:#010x}/{:#010x}/{:#010x} at the classic, the \
+                     widened, the compact and the later layouts, m_pIModule {:#010x}",
+                    seen[0], seen[1], seen[2], seen[3], module
                 )
             }
             Error::Unimplemented { id, label, this } => write!(
@@ -269,7 +269,7 @@ pub fn advice(text: &str) -> Option<String> {
     let line: &'static str = if hits("is not a host object") {
         "This pointer is not an object this host handed out: the pack is calling another address as an interface object, or it already released that object. The this= field in the report is that pointer; --watch it to see when it changed."
     } else if hits("is not an AEEApplet object this host knows") {
-        "The module did build an object for this class, but it is not laid out like any applet shape this host knows — the SDK's, the widened one some modules build, or Brew MP's — because none of those offsets holds the shell pointer, or the module pointer beside it names a different module. BREW 4.0 / Brew MP actors, extensions and service factories look exactly like this — they are libraries, not applets to start. `--start auto` can only pick a class from this module's own image; look in the pack's .mif for its real applet class, or run the game .mod that loads this one."
+        "The module did build an object for this class, but it is not laid out like any applet shape this host knows — the platform's, the widened one some modules build, or Brew MP's — because none of those offsets holds the shell pointer, or the module pointer beside it names a different module. BREW 4.0 / Brew MP actors, extensions and service factories look exactly like this — they are libraries, not applets to start. `--start auto` can only pick a class from this module's own image; look in the pack's .mif for its real applet class, or run the game .mod that loads this one."
     } else if hits("spent its whole --session-ceiling") {
         "The run reached its instruction ceiling without finishing, and it kept asking the host for something — it did not finish, it is not stuck. Use --window to keep playing, or raise --session-ceiling to let it run further."
     } else if hits("still has not returned") {
@@ -292,8 +292,6 @@ pub fn advice(text: &str) -> Option<String> {
         "Host-to-guest nesting hit the stack ceiling: the pack answered one call by asking the host for the same thing again. The address in the report is the entry point being re-entered."
     } else if hits("load failed") || hits("module image is empty") {
         "This .mod was not loaded: the file or its header is wrong, and it has nothing to do with the code inside."
-    } else if hits("holds no NUL byte in") {
-        "The first argument holds no zero byte in 4096, so it does not name a NUL-terminated string. Read what the call was handed rather than the host: `--args strlen` prints the argument words, and the report's this= field is the first of them (r0), with the next three after `then`."
     } else if hits("unsupported:") {
         "This approach is one the host explicitly does not implement (not one it has not implemented yet): the representation we chose cannot carry what it asks for, and the report names which part."
     } else {
@@ -498,6 +496,14 @@ pub struct Hle {
     pub dropped: (u64, u64),
 }
 
+/// Where an address sits relative to an object's allocated span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanGap {
+    Inside,
+    Before(u32),
+    After(u32),
+}
+
 impl Hle {
     pub fn new() -> Self {
         Hle {
@@ -594,7 +600,7 @@ impl Hle {
     /// `.constdata` both put `SelectNetwork` at slot 11 and `OpenEx` at 12, where
     /// the header has them the other way round. A guest call lands on a *byte offset*, so the
     /// order in the table this host hands out is the thing that decides which rule runs, and the
-    /// shipped order is what this method exists to deliver. The dispatch side reads the slot number
+    /// reference order is what this method exists to deliver. The dispatch side reads the slot number
     /// back out of the id, so the two ends cannot drift apart silently.
     pub fn vtable_ordered(&mut self, mem: &mut Mem, name: &str, order: &[u32]) -> MResult<u32> {
         let index = iface_index(name).ok_or(Fault::Unmapped { addr: 0 })?;
@@ -701,6 +707,78 @@ impl Hle {
 
     pub fn object(&self, addr: u32) -> Option<&Object> {
         self.objects.get(&addr)
+    }
+
+    /// The object whose allocated span is nearest `addr`, with the direction of the miss.
+    ///
+    /// Nearest by **span**, not by base: a 64 KiB bitmap that ends just below a fault is the object
+    /// that explains it, even when a later eight-byte object happens to start closer to the address.
+    pub fn nearest_span(&self, addr: u32) -> Option<(&Object, SpanGap)> {
+        self.spans_within(addr, u32::MAX).into_iter().next()
+    }
+
+    /// Every allocated object span within `window` bytes of `addr`, nearest first.
+    ///
+    /// A single "nearest" can be the eight-byte sound object that happens to start after a 64 KiB
+    /// bitmap's end, which hides the bitmap. The caller wants the short list.
+    pub fn spans_within(&self, addr: u32, window: u32) -> Vec<(&Object, SpanGap)> {
+        let mut out: Vec<(&Object, SpanGap)> = self
+            .objects
+            .values()
+            .filter(|object| object.len != 0)
+            .filter_map(|object| {
+                let start = object.addr;
+                let end = start.saturating_add(object.len);
+                let gap = if addr < start {
+                    SpanGap::Before(start - addr)
+                } else if addr >= end {
+                    SpanGap::After(addr - end)
+                } else {
+                    SpanGap::Inside
+                };
+                let distance = match gap {
+                    SpanGap::Inside => 0,
+                    SpanGap::Before(gap) | SpanGap::After(gap) => gap,
+                };
+                (distance <= window).then_some((object, gap))
+            })
+            .collect();
+        out.sort_by_key(|(_, gap)| match gap {
+            SpanGap::Inside => 0,
+            SpanGap::Before(gap) | SpanGap::After(gap) => *gap,
+        });
+        out
+    }
+
+    /// The freed object block that contains `addr`, if any. A write into one is the shape of a
+    /// stale bitmap: the record is gone from [`Hle::objects`], but the arena still knows the span.
+    pub fn freed_object_at(&self, addr: u32) -> Option<(u32, u32)> {
+        self.freed_objects
+            .iter()
+            .copied()
+            .find(|(base, len)| addr >= *base && addr < base.saturating_add(*len))
+    }
+
+    /// The freed block whose span is nearest `addr`, with the same direction the live objects use.
+    pub fn nearest_freed_span(&self, addr: u32) -> Option<((u32, u32), SpanGap)> {
+        self.freed_objects
+            .iter()
+            .copied()
+            .map(|(base, len)| {
+                let end = base.saturating_add(len);
+                let gap = if addr < base {
+                    SpanGap::Before(base - addr)
+                } else if addr >= end {
+                    SpanGap::After(addr - end)
+                } else {
+                    SpanGap::Inside
+                };
+                ((base, len), gap)
+            })
+            .min_by_key(|(_, gap)| match gap {
+                SpanGap::Inside => 0,
+                SpanGap::Before(gap) | SpanGap::After(gap) => *gap,
+            })
     }
 
     /// [`Hle::new_object_reusing`] for an interface whose vtable the caller built, because the
@@ -871,7 +949,7 @@ impl Hle {
         }
     }
 
-    /// How many call records each history keeps before it starts dropping the oldest. A shipped game
+    /// How many call records each history keeps before it starts dropping the oldest. A guest game
     /// reaches the host tens of thousands of times a minute, which is far more than anyone reads, and
     /// keeping all of them is what grew the process until Windows fast-failed it. The counts beside it
     /// stay exact, so a report can still say how many there were.
@@ -880,7 +958,7 @@ impl Hle {
     /// How many distinct `(addr, a1, a2)` keys the folded table holds before it stops taking new
     /// ones.
     ///
-    /// Unlike [`Hle::HISTORY`] this is a ceiling on *kinds* of call rather than on records: a shipped
+    /// Unlike [`Hle::HISTORY`] this is a ceiling on *kinds* of call rather than on records: a reference
     /// game reaches a few dozen, and the ones that could grow without bound are the callees handed a
     /// fresh pointer every time. Past it the counts already held keep accumulating, new keys are
     /// refused, and `folded_full` says so.

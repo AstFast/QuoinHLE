@@ -112,6 +112,29 @@ impl Runtime {
                     return Ok(0);
                 };
                 let colors = img.palette.as_ref().map_or(0, |p| p.len() / 3);
+                if img.height <= 1 {
+                    // A strip is legal, but it is also what a misread BMP header looks like. The
+                    // fault context names the bitmap; this names the decode, and the header words
+                    // beside it say whether the file itself claimed one row.
+                    let word32 = |at: usize| {
+                        head.get(at..at + 4)
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    };
+                    let word16 = |at: usize| {
+                        head.get(at..at + 2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    };
+                    self.display.note(format!(
+                        "SetupNativeImage decoded a {}x{} BMP at {buf:#010x} (header {}x{}, {} bpp, \
+                         compression {})",
+                        img.width,
+                        img.height,
+                        word32(18).unwrap_or(0),
+                        word32(22).unwrap_or(0),
+                        word16(28).unwrap_or(0),
+                        word32(30).unwrap_or(0)
+                    ));
+                }
                 let obj = self.raster(&img)?;
                 self.put_image_info(info, img.width, img.height, colors, &ImageParm::default())?;
                 if prealloc != 0 {
@@ -119,6 +142,23 @@ impl Runtime {
                     // that could convert in place would answer FALSE. The app then releases it with
                     // `SYSFREE`, which this arena cannot honour because it never gives memory back.
                     self.cpu.mem.write_u8(prealloc, g::TRUE as u8)?;
+                }
+                if self.device.ktf && self.oem_native_images && img.height == 1 {
+                    if img.palette.is_some() {
+                        let bmp = self.display.new_bitmap(
+                            &mut self.cpu.mem,
+                            &mut self.hle,
+                            img.width as u16,
+                            1,
+                            8,
+                        )?;
+                        if let Some(b) = self.display.bitmap(bmp) {
+                            for (i, ix) in img.pixels.iter().enumerate() {
+                                self.cpu.mem.write_u8(b.px + i as u32, *ix)?;
+                            }
+                            return Ok(b.px);
+                        }
+                    }
                 }
                 Ok(obj)
             }
@@ -129,7 +169,7 @@ impl Runtime {
                 self.heap_alloc(request).map_err(Error::from)
             }
             // `REALLOC(p, size)` is the helper twin of `IHeap::Realloc`, and both are `heap_realloc`.
-            // A pack may be shipped built against a debug heap and ask for this one directly, which is
+            // A pack may be reference built against a debug heap and ask for this one directly, which is
             // how a pack ends up wanting both spellings of the same call.
             "realloc" => {
                 let (block, size) = (self.arg(0)?, self.arg(1)?);
@@ -248,7 +288,7 @@ impl Runtime {
                 // caller can read, so nothing is claimed here.
                 Ok(0)
             }
-            // The two slots whose **names** swap between the shipped tables: BREW 3.1.2 has
+            // The two slots whose **names** swap between the reference tables: BREW 3.1.2 has
             // `AEEOS_IsBadPtr` at index 100 and `dbgevent` at 101, while 4.0.2 has `dbgevent` at 100
             // and `aee_IsBadPtr` at 101 — and no delivered object contains the table instance itself
             // (the largest data section any delivered object carries is 84 bytes, which cannot hold
@@ -297,25 +337,19 @@ impl Runtime {
             }
             "strlen" => {
                 let s = self.arg(0)?;
-                // The terminator has to be inside the guest's own mapping; a run past 4 KiB
-                // means the pointer is not a string. Said as what it is rather than as an
-                // unimplemented slot: `strlen` is implemented, and the old wording sent the reader
-                // looking for a missing host feature and told them it was "not a broken game".
-                //
-                // In the three packs that reach this, `s` is a heap address whose 4096 bytes hold no
-                // zero, and the *second* argument is 0x01ffc014 — `STUB_BASE + 4*0x3ff005`, the strlen
-                // stub's own address, i.e. a host function pointer. Why those calls carry one is not
-                // settled: a helper-table offset, or a helper that takes a callback and landed here.
-                // The report says the pointer is not a string; it does not guess what the pack meant.
-                let n = self.cpu.mem.read_cstr(s, 4096)?.len();
-                if n == 4096 {
-                    return Err(Error::Hle(HleError::Unsupported {
-                        what: format!(
-                            "AEEHelperFuncs::strlen was given {s:#010x}, which holds no NUL byte in 4096"
-                        ),
-                    }));
+                // `aee_strlen` has no ceiling of its own, and a fixed 4 KiB one was not a property of
+                // the body: a 22 KiB HTML page with its NUL after the last byte read as "not a
+                // string" and ended the run. The bound that belongs here is the guest's mapping — the
+                // read faults at the first page the guest does not own, which is where a handset
+                // would have faulted too. Same shape as `OEMStrLen` below, for the same reason.
+                if s == 0 {
+                    return Ok(0);
                 }
-                Ok(n as u32)
+                let mut n = 0u32;
+                while self.cpu.mem.read_u8(s.wrapping_add(n))? != 0 {
+                    n += 1;
+                }
+                Ok(n)
             }
             "OEMStrLen" => {
                 let s = self.arg(0)?;
@@ -477,7 +511,7 @@ impl Runtime {
             }
             // `WSTRLOWER`/`WSTRUPPER` change a string where it stands and answer nothing, so the
             // whole job is knowing which characters move. This is the ASCII range on purpose: what
-            // reaches it in this corpus is option names and MIME-ish keys, all of which are ASCII,
+            // reaches it in this sample set is option names and MIME-ish keys, all of which are ASCII,
             // and a wide character outside it is left exactly as it was rather than run through a
             // case table this host has no measurement for. CJK, which several packs do pass
             // through here, has no case to change, so the same rule answers it correctly.
@@ -723,7 +757,7 @@ impl Runtime {
                 if s == 0 {
                     // The body's own odd guard, kept exactly: it reads the byte the caller's
                     // end-pointer names and zeroes that pointer **only if the byte is not already NUL**.
-                    // Both reads are unconditional in the shipped code, so they are unconditional here —
+                    // Both reads are unconditional in the platform code, so they are unconditional here —
                     // a caller that handed over a null `ppszEnd` faults on a handset too.
                     let at = self.cpu.mem.read_u32(endp)?;
                     if self.cpu.mem.read_u8(at)? != 0 {
@@ -863,8 +897,8 @@ impl Runtime {
                 }
                 let mut want: Vec<u8> = dir.clone();
                 // ⚠ The body tests `dir[strlen(dir) - 1]` before it tests `dir[0] != 0`, so an empty
-                // directory text reads the byte in front of the caller's buffer. That is the shipped
-                // code's own out-of-bounds read rather than a rule with a witness behind it, so this
+                // directory text reads the byte in front of the caller's buffer. That is the reference
+                // code's own out-of-bounds read rather than a rule with a record behind it, so this
                 // host asks the two questions in the other order and adds no separator for an empty one.
                 if !dir.is_empty() && dir[dir.len() - 1] != b'/' {
                     want.push(b'/');
@@ -948,11 +982,7 @@ impl Runtime {
                 // `STREXPAND` is the narrow-to-wide half of the pair, and it is encoding-aware:
                 // on a Shift-JIS device two bytes name one character, and widening them one per
                 // byte is the mojibake a menu shows when its text is read as Latin.
-                let units = if u32::from(self.device.encoding) == g::AEE_ENC_S_JIS {
-                    resource::decode_shift_jis(&bytes)
-                } else {
-                    bytes.iter().map(|b| u16::from(*b)).collect()
-                };
+                let units = self.text_encoding().bytes_to_units(&bytes);
                 let room = (size as usize).saturating_sub(2) / 2;
                 let keep = units.len().min(room);
                 for (i, u) in units[..keep].iter().enumerate() {
@@ -978,11 +1008,7 @@ impl Runtime {
                 let (src, nchars, dst, size) =
                     (self.arg(0)?, self.arg(1)?, self.arg(2)?, self.arg(3)?);
                 let units = self.cpu.mem.read_u16str(src, nchars as usize)?;
-                let bytes = if u32::from(self.device.encoding) == g::AEE_ENC_S_JIS {
-                    resource::encode_shift_jis(&units)
-                } else {
-                    units.iter().map(|u| *u as u8).collect()
-                };
+                let bytes = self.text_encoding().units_to_bytes(&units);
                 let room = (size as usize).saturating_sub(1);
                 let keep = bytes.len().min(room);
                 for (i, b) in bytes[..keep].iter().enumerate() {
@@ -1001,7 +1027,7 @@ impl Runtime {
                 let (src, nlen, dst, size) =
                     (self.arg(0)?, self.arg(1)?, self.arg(2)?, self.arg(3)?);
                 let units = self.cpu.mem.read_u16str(src, nlen.max(1) as usize)?;
-                let bytes = String::from_utf16_lossy(&units).into_bytes();
+                let bytes = self.text_encoding().units_to_string(&units).into_bytes();
                 // `nSize` is the destination's capacity in bytes with nothing reserved: the
                 // handset's own `OEM_WStrToUTF8` writes while a byte still fits and stops the moment
                 // one does not, and never writes a terminator - the caller is told the length
@@ -1028,7 +1054,7 @@ impl Runtime {
                     Ok(s) => s,
                     Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
                 };
-                let units = text.encode_utf16().collect::<Vec<u16>>();
+                let units = self.text_encoding().string_to_units(text);
                 // A character at a time, the way `OEM_UTF8ToWStr` does it: `nSize` counts bytes,
                 // each `AECHAR` takes two of them, and no terminator is written or reserved for -
                 // the caller was told the length separately. A module that passes exactly the room
@@ -1123,7 +1149,7 @@ impl Runtime {
             // `TChType chartype(AECHAR ch)`: the 3.1.2 header names the whole answer language —
             // `SC_UNKNOWN`, `SC_ALPHA`, `SC_DIGIT`, `SC_WHITESPACE` — and the body that produces it
             // (`OEM_GetCHType`) is referenced once and defined nowhere in the 235, so the table it
-            // consults is the OEM layer's. What is left for this host is the range the enum is
+            // consults is the platform layer's. What is left for this host is the range the enum is
             // about: ASCII classes, and `SC_UNKNOWN` for everything else — which is the enum's own
             // name for "none of the three", not an invented fourth answer.
             "chartype" => {
@@ -1138,7 +1164,7 @@ impl Runtime {
             // `uint32 JulianToSeconds(JulianType *pDate)`: the header defines the answer as
             // "seconds elapsed since CDMA reference time", and the delivered body
             // (`AEEOS_JulianToSeconds` in the delivered body, 30 bytes) is one `bridle_SystemCall` — the
-            // conversion itself lives in the OEM layer. So the formula is the host's, read off the
+            // conversion itself lives in the platform layer. So the formula is the host's, read off the
             // contract: a civil date-time minus 1980-01-06 00 UTC, which is what "CDMA
             // reference time" names. A null or unreadable pointer answers 0, the epoch itself.
             "aee_JulianToSeconds" => {
@@ -1177,7 +1203,7 @@ impl Runtime {
                 Ok(g::TRUE)
             }
             // `IQueryInterface *GetALSContext(void)`: the ambient-light-sensor context. Nothing in
-            // the 235 names this symbol, no class in the corpus asks for a light sensor, and this
+            // the 235 names this symbol, no class in the sample set asks for a light sensor, and this
             // host has none to expose, so the null is the same shape every other absent device gets.
             "GetALSContext" => {
                 self.display
@@ -1198,7 +1224,7 @@ impl Runtime {
             }
             // The per-region error a module polls is its own bookkeeping. This host has no error
             // state for the helper to report, so refuse it rather than inventing a zero.
-            // `aee_getlasterror(errRegion)` (the delivered body, 18 bytes; word 99 of the shipped
+            // `aee_getlasterror(errRegion)` (the delivered body, 18 bytes; word 99 of the reference
             // `AEEHelperFuncs`, at table offset 392 — the header publishes the same field
             // as `int (*getlasterror)(int errRegion)`). Region 0 is `ERR_REGION_FLOAT`, and it is the
             // only region the header's own `GETLASTFPERROR`  ever passes: for it the
@@ -1231,7 +1257,7 @@ impl Runtime {
             // `swaps` takes and answers a 16-bit value, so only the low half travels.
             "swaps" => Ok(u32::from((self.arg(0)? as u16).swap_bytes())),
             // ---- and its wide half --------------------------------------------------------------
-            // `AECHAR` is UTF-16 on every handset this host models, and the corpus writes those units
+            // `AECHAR` is UTF-16 on every handset this host models, and the sample set writes those units
             // with `LoadResString`, so these are reached as soon as an applet draws a label.
             "wstrcpy" => {
                 let (dst, src) = (self.arg(0)?, self.arg(1)?);
@@ -1322,24 +1348,31 @@ impl Runtime {
             }
             // A debug build's `MALLOC` is `dbgheapmark(malloc(size), __FILE__, __LINE__)`, and the helper's
             // whole job is to hand the pointer back after noting where it came from. A pack may be
-            // shipped built that way, which is how it ends up asking a handset for a debugger's
+            // reference built that way, which is how it ends up asking a handset for a debugger's
             // bookkeeping — and a handset with no debugger attached answers with the pointer all the same.
             "dbgheapmark" => Ok(self.arg(0)?),
             "aee_GetTimeMS" | "aee_GetUpTimeMS" => Ok(self.clock_ms),
             "aee_GetSeconds" => Ok(self.clock_ms / 1000),
             // `void aee_GetRand(byte *pDest, int nSize)` — fill the caller's buffer with random bytes.
-            // The header says the sequence is *seeded by the current time* and warns that two calls
-            // closer together than a few milliseconds may come out identical, so the stream is derived
-            // from the virtual clock instead of from a counter that keeps advancing: a scripted run
-            // replays byte for byte, and two asks inside one virtual millisecond answer the same, which
-            // is the handset's documented behaviour rather than a defect of ours.
+            //
+            // The header's "seeded by the current time" is about the *seed*, not about every call:
+            // a handset's generator is a stream that the clock starts and that then advances on its
+            // own. Re-seeding from `clock_ms` here read that sentence the other way, and the cost was
+            // not academic — two asks inside one virtual millisecond came back with identical bytes,
+            // and a pack that draws a number as its loop condition never terminated, because the
+            // virtual clock only moves when the guest calls the host and such a loop never does.
+            // Three guest packs (sample packs) each burned a
+            // billion instructions on `aee_GetRand` before the per-function ceiling stopped them.
+            //
+            // The seed is [`Runtime::rand_state`], taken at boot, so a scripted run still replays
+            // byte for byte: the seed is a constant and the call order is the script's.
             "aee_GetRand" => {
                 let (dest, size) = (self.arg(0)?, self.arg(1)? as i32);
                 if dest != 0 && size > 0 {
-                    let mut state = splitmix_seed(self.clock_ms);
                     let mut written = 0u32;
                     while written < size as u32 {
-                        state = splitmix_next(state);
+                        self.rand_state = splitmix_next(self.rand_state);
+                        let state = self.rand_state;
                         for i in 0..8 {
                             if written == size as u32 {
                                 break;
@@ -1357,7 +1390,7 @@ impl Runtime {
             // system time", and this host's current time is the same virtual clock every other entry
             // in the table answers from — reading the machine's wall clock here would make a scripted
             // run depend on the day it was run. The layout is read through `AEEDateTime` because that
-            // is the struct the SDK headers actually declare; `JulianType` is the same seven
+            // is the struct the interface declarations actually declare; `JulianType` is the same seven
             // `uint16`s under its older name, documented but never defined.
             "aee_GetJulianDate" => {
                 let (secs, at) = (self.arg(0)?, self.arg(1)?);
@@ -1386,12 +1419,11 @@ impl Runtime {
                 // what decides how many of them are consumed — the contract a handset's printf has.
                 let buf = self.arg(0)?;
                 let fmt_at = self.arg(1)?;
-                let fmt =
-                    String::from_utf8_lossy(&self.cpu.mem.read_cstr(fmt_at, 1024)?).into_owned();
+                let fmt = Runtime::latin1_text(&self.cpu.mem.read_cstr(fmt_at, 1024)?);
                 let mut next = 2;
-                let text = self.format(&fmt, &mut next, 0)?;
-                let bytes = text.as_bytes();
-                self.cpu.mem.write_bytes(buf, bytes)?;
+                let text = self.format_raw(&fmt, &mut next, 0)?;
+                let bytes = Runtime::narrow_bytes(&text);
+                self.cpu.mem.write_bytes(buf, &bytes)?;
                 self.cpu.mem.write_u8(buf + bytes.len() as u32, 0)?;
                 Ok(bytes.len() as u32)
             }
@@ -1406,10 +1438,15 @@ impl Runtime {
                 let fmt_at = self.arg(2)?;
                 let units = self.cpu.mem.read_u16str(fmt_at, 1024)?;
                 let keep = units.iter().position(|u| *u == 0).unwrap_or(units.len());
-                let fmt = String::from_utf16_lossy(&units[..keep]);
+                let fmt = self.text_encoding().units_to_string(&units[..keep]);
                 let mut next = 3;
                 let text = self.format(&fmt, &mut next, 0)?;
-                let written = text.encode_utf16().take(room).collect::<Vec<u16>>();
+                let written = self
+                    .text_encoding()
+                    .string_to_units(&text)
+                    .into_iter()
+                    .take(room)
+                    .collect::<Vec<u16>>();
                 for (i, u) in written.iter().enumerate() {
                     self.cpu.mem.write_u16(buf + i as u32 * 2, u32::from(*u))?;
                 }
@@ -1426,10 +1463,9 @@ impl Runtime {
             "snprintf" => {
                 // `int32 snprintf(char *buf, uint32 f, const char *format,...)`.
                 let (buf, room, fmt_at) = (self.arg(0)?, self.arg(1)? as usize, self.arg(2)?);
-                let fmt =
-                    String::from_utf8_lossy(&self.cpu.mem.read_cstr(fmt_at, 1024)?).into_owned();
+                let fmt = Runtime::latin1_text(&self.cpu.mem.read_cstr(fmt_at, 1024)?);
                 let mut next = 3;
-                let text = self.format(&fmt, &mut next, 0)?;
+                let text = self.format_raw(&fmt, &mut next, 0)?;
                 self.put_bounded(buf, room, &text).map_err(Error::from)
             }
             "vsprintf" => {
@@ -1437,16 +1473,15 @@ impl Runtime {
                 // like C's, so the buffer the caller named is trusted exactly as on `sprintf`.
                 let (buf, fmt_at, list) = (self.arg(0)?, self.arg(1)?, self.arg(2)?);
                 let va = self.va_words(list)?;
-                let fmt =
-                    String::from_utf8_lossy(&self.cpu.mem.read_cstr(fmt_at, 1024)?).into_owned();
+                let fmt = Runtime::latin1_text(&self.cpu.mem.read_cstr(fmt_at, 1024)?);
                 let mut next = 0;
-                let text = self.format(&fmt, &mut next, va)?;
+                let text = self.format_raw(&fmt, &mut next, va)?;
                 self.put_bounded(buf, usize::MAX, &text)
                     .map_err(Error::from)
             }
             "vsnprintf" => {
                 // `int32 vsnprintf(char *buf, uint32 f, const char *format, AEEOldVaList list)` — the
-                // one a shipped pack reaches for, out of its allocator's trace hook.
+                // one a guest pack reaches for, out of its allocator's trace hook.
                 let (buf, room, fmt_at, list) = (
                     self.arg(0)?,
                     self.arg(1)? as usize,
@@ -1454,10 +1489,9 @@ impl Runtime {
                     self.arg(3)?,
                 );
                 let va = self.va_words(list)?;
-                let fmt =
-                    String::from_utf8_lossy(&self.cpu.mem.read_cstr(fmt_at, 1024)?).into_owned();
+                let fmt = Runtime::latin1_text(&self.cpu.mem.read_cstr(fmt_at, 1024)?);
                 let mut next = 0;
-                let text = self.format(&fmt, &mut next, va)?;
+                let text = self.format_raw(&fmt, &mut next, va)?;
                 self.put_bounded(buf, room, &text).map_err(Error::from)
             }
             // `AECHAR *wwritelong(AECHAR *pszBuf, long n)` — the decimal of `n`, terminated, and the
@@ -1644,7 +1678,10 @@ impl Runtime {
                 // worth having, and silently dropping the line is the failure mode to avoid.
                 let addr = self.arg(0)?;
                 let raw = self.cpu.mem.read_cstr(addr, 256)?;
-                let fmt = String::from_utf8_lossy(&raw).into_owned();
+                // The template is a narrow string in the device's own encoding. Its `%s`
+                // arguments are decoded by the same engine below; a literal Japanese word in the
+                // template has to arrive the same way.
+                let fmt = crate::encoding::stream_text(u32::from(self.device.encoding), &raw);
                 let mut next = 1;
                 // Keep what could be formatted. `unwrap_or_else(|_| the delivered bodylone)` used to reprint the
                 // whole template the moment one argument could not be read, so `fileName %s` arrived
@@ -1652,7 +1689,7 @@ impl Runtime {
                 // that ran out of argument registers. Naming the argument is the part that makes the
                 // line actionable.
                 let mut text = String::new();
-                if let Err(e) = self.format_into(&fmt, &mut next, 0, &mut text) {
+                if let Err(e) = self.format_into(&fmt, &mut next, 0, &mut text, false) {
                     text.push_str(&format!(" [argument {next} could not be read: {e}]"));
                 }
                 let line = format!(
@@ -1668,5 +1705,4 @@ impl Runtime {
             _ => Err(Error::Hle(unimplemented())),
         }
     }
-
 }

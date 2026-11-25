@@ -13,377 +13,183 @@ use quoin::cpu::{Samples, Trace, SAMPLE_CAP};
 use quoin::device::DeviceProfile;
 use quoin::hle::ArgText;
 use quoin::runtime::{AcceptedClass, Dispatched, Outcome, PadInput, Runtime, ThreadState};
+use quoin::virtual_lib::LibraryPlan;
 use quoin::{disasm, symbol};
 
 const USAGE: &str = "\
 QuoinHLE — BREW HLE emulator
 
-  quoin <file.mod> [options]
-  quoin --make-bbf FONT [--out FILE.bbf] [--size N] [--face-index N] [--half-widths N]
-                                   convert a system TrueType/OpenType font into the bitmap container
-                                   the guest reads. `--version 1` writes the variable-width layout
-                                   (one row, each glyph's own advance; `wWidth` is u16, so small
-                                   repertoires only); `--version 2` (default) writes the single-cell
-                                   layout with 256 glyphs per row. A build-time tool, not a run.
-  quoin                            open the game library: the packs under BREW_GAME_DIR, or under
-                                   Game/ beside the working directory. Pick one to play it, and
-                                   Esc goes back to the list.
+  quoin <file.mod> [options]        run one pack
+  quoin                             open the game library (BREW_GAME_DIR, or Game/ beside the
+                                    working directory); pick a pack to play, Esc goes back
+  quoin --make-bbf FONT [options]   convert a TrueType/OpenType font into the bitmap container
+                                    the guest reads. A build-time tool, not a run.
+  quoin --info <file.mod|dir>       report what a pack is without running it
 
-  --dev              enable developer options. Diagnostics, tracing, network scripts, recording
-                     and static inspection are refused without it.
-  Developer options (require --dev):
-                     --trace --sample --trace-limit --trace-range --trace-events --disasm --dump
-                     --break --watch --watch-stop --watch-chain --coverage --flame --args --verbose
-                     --info --color-depth --encoding --thumb-entry --bmp --dump-audio --dump-wav
-                     --record-input --input-log --serve --net-proxy --net-script --scripts --script-writes
+Every option below is available on every run; there is no separate \"developer\" tier.
 
-  --trace            print every retired guest instruction and every HLE dispatch
-  --trace-limit N    stop printing after N instructions, and say so when it stops: a run that goes
-                     wrong early fills a terminal faster than it can be read
-  --trace-range LO,HI
-                     print only the instructions of that span, which is the question that gets asked
-                     when something branched somewhere unexpected. Each bound takes a number or a
-                     region offset (`heap+0x…`, `stack-0x…`)
-  --trace-events FILE
-                     write every IApplet::HandleEvent delivery to FILE as TSV: virtual
-                     milliseconds, event, wParam, dwParam, result. Flushed per event, so a run that
-                     faults still leaves the sequence that led to it.
-  --thumb-entry      the image begins in Thumb state (default: ARM)
-  --device WxH       answer that screen size to the module, for a pack compiled for
-                     another handset screen. A pack is built for one screen and lays its art out for
-                     it, so on a different size it draws misaligned rather than failing — match the
-                     pack. What was answered is printed at the start and in the window's title.
-  --device-json FILE
-                     read the handset from FILE instead of the built-in one: screen, keypad, identity
-                     strings, storage, timers. Every field of the device profile has a key of the same
-                     name, and a key left out keeps the built-in value, so a file with two lines is a
-                     valid device. A FILE that does not exist is written there with the built-in
-                     handset, which is how the template is made. `--device`, `--ram-mb`,
-                     `--color-depth` and `--encoding` still override it.
-  --save-device      write the profile back to the file --device-json named, after those flags have
-                     applied. That is how a set of flags that described a handset becomes a file:
-                     run once with the flags and this, then edit from there.
-  --heap-mb N        give the guest heap an N MiB span above the arena base. Default 240, the
-                     delivery's own. This is the ceiling `Sbrk` may grow to, so a pack that asks for
-                     more than the default can still get it; `GetModuleMemStats`'s allowance follows.
-  --heap-initial-kb N
-                     how many KiB the heap's first free node covers. Default 256. It moves the point
-                     where an allocation stops fitting and starts growing the heap, not the ceiling:
-                     the `heap: … reached` line starts lower, and no address changes.
-  --ram-mb N         answer N as `AEEDeviceInfo::dwRAM`, the total RAM a handset reports. Default 64.
-                     This is the figure a pack plans against; it is not the span the heap can really
-                     reach.
-  --color-depth N    answer N as AEEDeviceInfo::nColorDepth, to see which code path a pack takes on it.
-                     A DIAGNOSTIC, not a screen: the frame stays RGB565 and AEEBitmapInfo::nDepth keeps
-                     saying 16, so the two answers stop agreeing and a pack that composites straight
-                     into IDisplay::GetDestination's pBmp will lay out wrong. Wrong art there is the
-                     pack showing you its branch, not this host losing pixels.
-  --encoding N       answer N as AEEDeviceInfo::wEncoding (an AEE_ENC_*: 2 UTF8, 0xFC EUC_CN, 0xFD
-                     S_JIS, 0xFF UNICODE). Cleanest device A/B here, because this host only publishes
-                     the number — no text path of ours reads it, so only the pack's branches move.
-  --run-for N        pump the dispatch loop for up to N milliseconds of virtual time after the
-                     scripted input: queued events, then whatever the applet armed for itself,
-                     until nothing is left to run or the window is spent
-  --steps N          how many instructions the guest may retire *without reaching the host* before
-                     the run says it is waiting on something that will not arrive (default 2000000,
-                     or 32000000 for a pack being played — see GAME_STEP_LIMIT, which measures it
-                     across the corpus). Reaching the host restarts the count, so this catches a
-                     guest-only spin without calling a shipped game's expensive frame a hang.
-  --steps-ceiling N  the total one guest function may retire however often it reaches the host
-                     (default 1000000000 for a pack being played). This is what still gives a
-                     scripted run an end when a loop is long *and* never finishes; a function that
-                     hits it is reported as working-but-endless, not as stuck.
-  --session-ceiling N
-                     the total the WHOLE run may retire, across every function and every downcall
-                     nested inside it, from the run's first instruction. Both bounds above restart,
-                     so a pack that returns from each function it was given but never finishes its
-                     task runs out of neither; this is the one that ends such a run and says where.
-                     Off by default.
-  --verbose          also print the volume: the HLE call log, every text run, every note, the list
-                     of every audio source named. What comes out without it is what a run was asked
-                     for — the counts, the one-line resource and audio summaries, and whatever a
-                     watchpoint, --break, --disasm, --dump or --coverage wanted answered — and a run
-                     that ends in a fault says so either way.
+Running
   --start CLS        create and start that applet once the module is loaded
-  --start auto       ask the module which class id in its own image it builds an applet for,
-                     and start that one.
-                     A run that --break or --watch-stop asked for stopped during the load does NOT
-                     start it: the report would otherwise be a machine from after the stop while its
-                     first line still says「stopped」. The run says `--start skipped` when that happens.
+  --start auto       ask the module which class in its own image it builds an applet for
   --event E[,WP[,DWP]]
                      post an event to the running applet (repeatable)
-  --pointer KIND,X,Y post one pointer contact: KIND is `down`, `move`, `up`, or `tap` for the
-                     whole press (repeatable). This is what a touchscreen pack waits on, and it is
-                     NOT reachable through --event: EVT_POINTER_* carries its coordinates as a
-                     guest-memory string, `x=00000078,y=000000fa,time=…,clkcnt=1`, whose address is
-                     dwParam and whose length is wParam. Passing packed numbers there instead makes
-                     the module parse an integer as text and fault inside its own hex decoder.
-                     X and Y may be negative or hex, because a handset reports them signed.
+  --pointer KIND,X,Y post one pointer contact: KIND is down, move, up, or tap (repeatable).
+                     Not reachable through --event: EVT_POINTER_* carries its coordinates as a
+                     guest-memory string whose address is dwParam
   --key CODE         press and release one key, e.g. --key AVK_DOWN (repeatable)
-  --hold MS          how long a --key holds the key down before releasing it, in virtual
-                     milliseconds (default 150). Apps that poll which keys are currently held, as
-                     a pack does, cannot see a press and a release that land in the same turn.
-  --pad TARGET,STATE move one control of the virtual joystick this console answers through `IHID`
-                     (repeatable, and queued in the same order as --key and --wait). A title
-                     that reads its pad from `IHIDDevice` rather than from keys is only reachable
-                     this way, and --key cannot stand in for it: such a pack asks what is *down*, so
-                     the answer has to be state the host holds and not just an event it was sent.
-                     TARGET is a button by the name this host publishes for it — BACK, START,
-                     DPAD_UP, DPAD_LEFT, DPAD_DOWN, DPAD_RIGHT, BUTTON_1..BUTTON_4,
-                     LEFT_SHOULDER_UPPER, RIGHT_SHOULDER_UPPER, LEFT_SHOULDER_LOWER,
-                     RIGHT_SHOULDER_LOWER, LEFT_THUMBSTICK, RIGHT_THUMBSTICK — or its id 0..15, or an
-                     axis: LEFT_X, LEFT_Y, RIGHT_X, RIGHT_Y. Names ignore case, and a name in none
-                     of those tables is an error that lists them. STATE is `down`, `up` or `tap` for
-                     a button, or a number — or `center` — for an axis, which the pad clamps into its
-                     own published range. `tap` is TWO turns, down now and released by the next pump,
-                     for the same reason --hold exists: a pack that polls the buttons currently down
-                     cannot see a press that opens and closes inside one dispatch, and says so by
-                     simply not moving. A --pad named before the pack has created `AEECLSID_HID` is
-                     not an error and does nothing, because there is no device there yet to hear it —
-                     so when a run looks like it ignored this flag, read --coverage's classes for
-                     whether the pack ever asked for the pad at all.
-  --wait MS          let MS of virtual time pass before the input after it, so a key can be
-                     pressed in a state the app reaches seconds in (repeatable)
+  --hold MS          how long a --key stays down (default 150 ms of virtual time)
+  --pad TARGET,STATE move one control of the virtual joystick read through IHID (repeatable).
+                     TARGET is a button name (BACK, START, DPAD_UP, BUTTON_1..4, LEFT_X, …) or
+                     its id; STATE is down, up, tap, or a number for an axis
+  --wait MS          let MS of virtual time pass before the input after it (repeatable)
+  --run-for N        pump the dispatch loop for up to N ms of virtual time after the scripted
+                     input, until nothing is left to run or the window is spent
+  --window [egui|raw]
+                     show the screen and play from the keyboard: arrows move, Enter is SELECT,
+                     Z/X are the soft keys, Backspace is CLR, Esc quits. Both follow the wall
+                     clock, so these are the runs that are not reproducible to the byte
+  --fps / --no-fps   show or hide the guest presentation-rate overlay (default: show)
+  --speed R          run the game clock at R times real time (0.25–4); audio resamples with it
+  --align-clock      the 1x spelling of --speed
+  --skin NAME        the handset the egui window draws: graphite (default), silver, candy
+  --lang TAG         language for the host's own words: en (default), zh, ja, ko, fr, de
+
+Device and platform
+  --device WxH       answer that screen size to the module, for a pack built for another handset
+  --device-json FILE read the handset from FILE instead of the built-in one. A missing FILE is
+                     written there with the built-in profile, which is how the template is made
+  --gl-preset NAME   answer GL as a firmware family: w64sa, w64s or host
+  --platform NAME    the BREW generation this run answers as: classic-1.1, classic-1.2.3,
+                     classic-2.0, classic-3.1.2, classic-4.0.2 (default) or mp-7.12.5
+  --carrier NAME     the operator whose private classes sit beside the public ABI:
+                     generic (default), ktf, kddi, zeebo
+  --list-platforms   print the platform and carrier names a flag may use, then exit
+  --save-device      write the profile back to the file --device-json named
+  --color-depth N    answer N as AEEDeviceInfo::nColorDepth. A diagnostic: the frame keeps the
+                     profile's frame_bpp, so the two answers can disagree on purpose
+  --frame-bpp N      back the screen at N bits per pixel: 16 (RGB565) or 32 (0x00RRGGBB)
+  --dib-depth N      deepest off-screen DIB to allocate: 16 or 32
+  --encoding N       answer N as AEEDeviceInfo::wEncoding (an AEE_ENC_*: 2, 0xFC, 0xFD, 0xFF)
+  --ram-mb N         answer N as AEEDeviceInfo::dwRAM (default 8)
+  --heap-mb N        the guest heap's span above the arena base, 1–240 (default 8)
+  --heap-initial-kb N
+                     how much the heap's first free node covers (default 256)
+  --thumb-entry      the image begins in Thumb state (default: ARM)
+
+Execution and budget
+  --steps N          instructions the guest may retire without reaching the host before the run
+                     is called stuck (default 2M, 128M when playing a pack, 400M inside
+                     AEEMod_Load). Reaching the host restarts the count
+  --steps-ceiling N  the total one guest function may retire, however often it reaches the host
+  --session-ceiling N
+                     the total the whole run may retire, across every function (off by default)
+  --jit / --no-jit   arm or disarm the Rynarmic backend (a default build arms it). Diagnostic
+                     runs still step one instruction at a time
+  --jit-budget N     new basic blocks the backend may compile in one turn (default 512, ~2 ms)
+  --jit-arena N      compiled blocks held before the cache is thrown away (default 65536, or
+                     `auto` to size it from the module; 0 removes the ceiling)
+
+Compatibility
+  --compat NAME[,NAME]
+                     trade one host safety check for \"let the pack keep going\". Off by default,
+                     and each name is refused rather than ignored if unknown. The run says what
+                     it gave up on stderr before anything executes.
+                     unmapped-read  answer an unmapped READ with zero instead of faulting.
+                                    A handset's map is continuous RAM, so a pack that reads past
+                                    the end of its own image gets zeros there and never a data
+                                    abort; this host maps exactly what it was asked to. The
+                                    answer comes from guest memory, so both engines give it.
+                                    Stores still fault — this does not invent memory to write
+                                    into.
+                                    Use it when a pack faults on an address that looks like
+                                    \"past the end of something\" and the same pack runs on a
+                                    handset. It is not a fix: a fault it hides is a bug the pack
+                                    still has.
+
+Saves and installation
+  --save-dir DIR     where the app's own writes go. Default: back into the pack's own directory,
+                     as a handset does. `--save-dir none` turns it off, which is what a
+                     regression run wants
+  --install PACK     copy PACK into the device tree (data/device/fs/mod/<modid>/ and its .mif)
+                     and run it from there, leaving the original alone
+  --record-input PATH
+                     write keys and pointer contacts of a windowed run to PATH as TSV
+  --input-log PATH   replay a TSV written by --record-input
+
+Libraries and authorisation
+  --lib PATH|NAME    load a library .mod beside the pack's own image (repeatable)
+  --lib-path DIR     search DIR for --lib and manifest entries that are not paths
+  --lib-manifest FILE
+                     read a JSON run manifest: lib_paths, libs, virtual_libs
+  --virtual-class NAME,CLASS,IFACE
+                     declare one class a virtual library serves (repeatable)
+  --auth-profile FILE
+                     let this run open paid/premium titles named in FILE. Default deny; every
+                     decision is logged. Use only for content you are entitled to run
+  --app-id NAME      the title this run is, for --auth-profile's allowlist
+
+Picture, font and sound
   --bmp PATH         write the framebuffer to PATH as a 24-bit BMP
-  --dump-audio DIR   write every audio source the run named into DIR, one file per clip, and list
-                     them. No clip is decoded into samples here, so this is what a run can show for `ISoundPlayer`:
-                     a game names its clips rather than handing them over, and this follows the name
-                     — a file for `SDT_FILE`, guest memory for `SDT_BUFFER` — out to the bytes.
-  --dump-wav DIR     render the clips this host can play into DIR as 16-bit stereo WAV, through the
-                     same mixer the sound card is fed, and write nothing for the ones it cannot play.
-                     `--dump-audio` gives you the pack's bytes; this gives you something to listen to on
-                     a machine with no sound card, which is the only way a headless run's audio can be
-                     checked by a person at all. Clips longer than 60 s are cut and said to be cut.
-  --font FILE.bbf    draw with that bitmap font (made by `--make-bbf`) instead of the built-in face.
-                     Installed as `AEE_FONT_NORMAL`; bold and large keep the built-in face unless
-                     `--font-bold`/`--font-large` name their own files. A run without this flag is
-                     unchanged. BBF version 2 is what `--make-bbf` emits, because a CJK-sized
-                     repertoire does not fit the older one-row layout.
+  --font FILE.bbf    draw with that bitmap font instead of the built-in face
   --font-bold FILE.bbf
   --font-large FILE.bbf
-                     the same for `AEE_FONT_BOLD` / `AEE_FONT_LARGE`. Each file is its own face at
-                     its own size, so a pack that asks for the large system font gets the size the
-                     file was rasterized at, not a magnification of the normal one.
-  --lib PATH         load a library `.mod` beside the pack's own image. A handset's system
-                     libraries (a 3D runtime, a billing module) are preloaded before an applet
-                     starts, and a pack that calls CreateInstance for one of their classes gets
-                     that object. Repeatable; loaded in the order given, each at its own base.
-  --soundfont PATH   play the run's clips through that SoundFont (.sf2) while `--window` is up,
-                     instead of the tone tables this host carries. The usual General MIDI banks are
-                     GPL and this crate is not, so none is vendored: what a run without this flag
-                     hears is the built-in bank — eight waveform tables generated at start-up and a
-                     mapping of the 128 program numbers onto them that is ours, not a sound
-                     register's. A *headless* run still has no sound, because there is no device
-                     there to hear it, and the run says which bank it opened.
+                     the same for AEE_FONT_BOLD / AEE_FONT_LARGE
+  --font-normal-size N
+  --font-large-size N
+                     cell height at which the built-in face is rasterized (default 16 and 32)
+  --soundfont PATH   play clips through that SoundFont (.sf2) while --window is up
   --audio-backend NAME
-                     decoder backend for compressed audio: `rust` (default; QCP + Symphonia) or
-                     `ffmpeg` (reserved optional backend, not built into this binary; selecting it
-                     is an explicit error rather than a silent fallback to rust).
-  --record-input PATH
-                     write the keys and pointer contacts made in a windowed run to PATH. Each line
-                     is tab-separated: virtual ms, wall ms, event, key, held ms, detail. The manager
-                     uses the same recorder when `QUOIN_INPUT_LOG` names a path before it starts.
-  --input-log PATH
-                     replay a TSV written by --record-input. Key down/up edges keep their logged
-                     virtual times, and the run waits five seconds after the last event. Pair it
-                     with `--start auto`; pointer records are ignored by this replay.
-  --jit / --no-jit  arm / disarm the optional Rynarmic execution backend. A default build
-                     arms it; `--no-jit` keeps the interpreter.
-                     A build without that feature has no backend, so asking for `--jit`
-                     is an explicit error rather than a silently slower run. Diagnostic runs
-                     (--trace, --sample, --break, --watch) still step one instruction at a time.
-  --jit-budget N     how many new basic blocks the backend may compile in one turn (default 512,
-                     about 2 ms of work). The guest reaches new code constantly — a level load or
-                     a scene change can want thousands of blocks at once — and compiling them all
-                     inside one turn freezes the picture for as long as it takes. Over the cap the
-                     blocks run interpreted for the rest of that turn and are compiled by the turns
-                     after it, so a scene change costs many slightly slow frames instead of one long
-                     stall. `0` removes the cap (compile as much as the guest asks for), which is
-                     how the backend behaved before this flag. Needs a build with `--features jit`.
-  --jit-arena N      how many compiled blocks the backend may hold before it throws the whole cache
-                     away and starts again (default 65536). Too small is the expensive mistake: a
-                     ceiling below the pack's own working set is met again on every pass, which is
-                     what made the old 16384 flush for 3.2 s at 17000 blocks. Too large only spends
-                     code arena (the 32 MiB of machine memory is reserved once and committed as
-                     blocks are written), so the default is generous on purpose. `0` removes the
-                     ceiling and leaves that arena as the only limit. `auto` sizes it from the pack
-                     itself instead: one block per 4 bytes of module image — an ARM instruction's
-                     width, so no ARM pack can want more than this hands it — floored at 4096 and
-                     never above 65536. The packs in this tree run from 4.5 KiB to 351 KiB, so the
-                     default is sized for the widest one and hands the narrowest 58 times the room
-                     its own code could need. It is a bound, not a reading of what a pack uses, which
-                     is why it is off unless asked for. Needs a build with `--features jit`; the game
-                     library reads the same choice from QUOIN_JIT_ARENA (`auto` or a count) because it
-                     has no command line.
-  --window [egui|raw]
-  --fps / --no-fps  show or hide the guest presentation-rate overlay (default: show).
-                     show the screen in a window and play it from the keyboard: the arrows move,
-                     Enter is SELECT, Z and X are the soft keys, Backspace is CLR and Esc quits.
-                     `egui` is the default and draws the handset's keys as buttons as well; `raw` is
-                     the dependency-free window for a machine with no usable GPU. Both follow the
-                     wall clock, so these are the runs that are not reproducible to the byte — the
-                     scripted forms above still are.
-  --speed R          run the game's clock at R times real time: 0.25 to 4. Above 1 the worker opens
-                     a turn more often (2x = every 8 ms) and still advances one 16 ms frame; below 1
-                     it keeps one turn per frame and advances less (0.5x = 8 ms). Audio is resampled
-                     with the same factor, so a faster game is also a higher-pitched one. The actual
-                     rate is capped by how fast this host can run the guest; QUOIN_STATS shows the
-                     measured rate beside the requested one. Off by default: without it every turn is
-                     a fixed 16 ms and a scripted run replays byte for byte; with it the run depends
-                     on host speed and does not. Window runs only — a headless --serve run is driven
-                     by POST /advance and has no wall-clock turn to align. For the game library (no
-                     arguments), set QUOIN_SPEED=2000 (or QUOIN_ALIGN_CLOCK=1 for 1x).
-  --align-clock      the 1x spelling of --speed: follow the wall clock and pay a stall back, at most
-                     8 extra virtual ms per turn. Kept for scripts that already use it.
-  --skin NAME        the handset the egui window draws around the screen: graphite (default),
-                     silver or candy. The keys are placed from the device's own screen size, so a
-                     176x220 pack and a 320x240 one get different bodies, not different layouts.
-  --lang TAG         the language this host's own words come in: a date control's weekday and month
-                     names, and the order a whole date is written in. en (default), zh, ja, ko, fr,
-                     de. A tag with a region is answered by its language (en-GB is English); a tag
-                     this build does not carry is an error rather than a silent fallback.
-  --serve [ADDR]     listen for the control interface, so a script can drive a run that is already
-                     going: post keys and events, ask for the screen, read what the pack has said.
-                     ADDR is a port (`8765`) or host:port (default 127.0.0.1 on any free port, which
-                     is printed at the start), and `GET /` lists the verbs. With a window the guest
-                     still follows the wall clock; without one it moves only when asked
-                     (`POST /advance`), so a session driven this way stays reproducible.
+                     decoder for compressed audio: rust (default) or ffmpeg (not built in)
+  --dump-audio DIR   write every audio source the run named into DIR, one file per clip
+  --dump-wav DIR     render the clips this host can play into DIR as 16-bit stereo WAV
+
+Automation and network
+  --serve [ADDR]     listen for the control interface: post keys and events, ask for the screen,
+                     read what the pack has said. Without a window the guest moves only when
+                     asked (POST /advance), so a session driven this way stays reproducible
   --net-proxy HOST:PORT
-                     send the pack's own network requests to that local proxy for real, and hand what
-                     comes back to the guest through `IWebResp`. A developer flag: it is how the
-                     requests a pack makes are watched, and answered by a proxy of your own. Without
-                     it a run answers every network question the way a handset with no data
-                     connection does, and stays reproducible to the byte; with it the answers come
-                     from the wall clock. The requests and the answers both show up as the `net` kind
-                     of the log `--serve` serves, in the order they happened.
-  --net-script FILE  answer the pack's requests from a local route table instead of a socket. Each
-                     route is one tab-separated line:
-                     `METHOD<TAB>/path<TAB>status<TAB>content-type<TAB>body-file`; `*` matches any
-                     method, a trailing `*` on the path is a prefix, and `-` means an empty body.
-                     Unmatched requests get a normal 404. A line whose method is `SOCKET` answers a
-                     raw socket instead: `SOCKET<TAB>host:port<TAB>reply-file` (host is an IPv4
-                     literal or `*`), so a pack that speaks its own protocol gets its bytes too.
-                     This is the offline-server flag: the origin no longer has to exist.
-                     Mutually exclusive with --net-proxy.
-  --scripts DIR      root of per-application Lua 5.4 packages. The package selected for the started
-                     applet is DIR/<app-class-in-hex>/manifest.lua; a missing package is not an
-                     error. Read-only by default: io/os/package/debug/dofile/loadfile/require are
-                     removed, memory/register writes are refused, and each hook has an instruction
-                     budget.
-  --script-writes    opt the Lua package into destructive guest access: mem.write*/reg.set. Use only
-                     for trusted local scripts; without this flag they are safe-mode readers.
-  --info             ask the pack what it is, without running it: its module header and entry state,
-                     what the loader would say about it, the app's own `AEEAppInfo` record, every
-                     container mounted beside it with a kind/MIME census and what could not be decoded,
-                     its language strings and audio, the files a run cannot reach, and the screen size
-                     argued for by the pack's own art. Pointed at a directory it reports every pack in
-                     it and ends with where the art and the directory name disagree. Builds no runtime
-                     and retires no instruction, so this is safe to run over a whole corpus — which is
-                     the point: `--device` answered wrongly is silent, and the only cheap witness is
-                     the picture the pack was drawn for.
-  --save-dir DIR     where the app's own writes go. Everything the run creates or edits is mirrored
-                     into DIR as it happens, and what an earlier run left there is loaded first, so a
-                     game remembers its save between runs. The default is a `saves/<pack>-<hash>`
-                     directory beside this executable, one per pack, because a save that vanishes
-                     with the run is what 'the game keeps starting over' reads as. `--save-dir none`
-                     turns it off, which is what a regression run wants: a run with a home directory
-                     is only reproducible from the save it started with. The pack's own directory is
-                     never written to, either way.
-  --watch ADDR       record every read and store of the four bytes at ADDR, saying which way it went
-                     and who did it, and print the record at the end of the run. Whoever did it is
-                     said twice: the guest instruction, and — when the host was the one writing — the
-                     method and every argument word it was handed. Below the accesses, the same span
-                     gets its **arena** history: every `alloc` that handed this space out (naming the
-                     instruction the block was given back at, when an earlier free names it), every `free`
-                     that put it back, and every `free-refused` where `FREE(p)` named space this arena
-                     never owned — a second release of one block, which is what a stale pointer looks
-                     like from the outside. Each carries the host call responsible. `alloc` and `free`
-                     move no bytes, so without that half a watchpoint cannot tell a live block from
-                     one somebody already returned. ADDR takes a number
-                     or a region offset (`heap+0x2c`, `stack-0x10`). When the host made the access it
-                     names the method and its argument words too, because the call log that would
-                     otherwise say so is a capped window and drops the oldest entries
-  --watch ADDR,LEN   record accesses across a span of LEN bytes instead, armed after the load,
-                     because the loader's own copy is not in the record
-                     Repeatable, and the addresses accumulate rather than replacing one another: the
-                     question a watchpoint is asked is usually `which of these did the guest touch`,
-                     and one run per address cannot tell a shared cause from a coincidence. The report
-                     prints a section per address, including the ones that saw nothing
-  --watch-stop       stop the run the first time the watchpoint is reached, instead of only recording
-                     it, and print the registers and the instruction there. What someone watches a byte
-                     for is the state at the access, and by the end of a run those registers hold
-                     whatever came last
-  --watch-chain      with `--watch`, also walk the heap's free chain at every recorded arena handover
-                     and put the first disagreement on that line. It is the reading that dates heap
-                     damage — the event whose chain already disagrees is the one just after the write
-                     — but one walk covers the whole arena and a pack allocates every frame, so it is
-                     asked for rather than paid by default
-  --break ADDR[,N]   stop the run before the instruction at ADDR, which takes the same forms as
-                     --watch's: a number, a region offset, or a method. Repeatable. A breakpoint is a
-                     place to stand *before* something happens, which is the difference between it and
-                     --watch-stop: one names an instruction, the other names the data it touches.
-                     `,N` waits for the N-th arrival at that address — the call that explains a pack is
-                     often the third one through a function that runs once per record — and the report
-                     says which arrival stopped the run.
-                     `,rX=VAL` waits instead for the arrival where a register holds VAL (r0…r12, sp,
-                     lr; 0x… or decimal). Counting is the wrong instrument when a function runs
-                     thousands of times and one call is the failing one, because every step of that
-                     binary search is a whole boot of the pack. The two combine: `,2,r0=0` ignores the
-                     first arrival and stops at the next one that holds zero. Either way the report
-                     prints the arrival tally, including zero, so a breakpoint that never fired cannot
-                     read as a run that stopped where it was told to.
-  --sample N         record where the guest was every N retired instructions (at least 64), keeping the
-                     last 4096, and print them at the end: the busiest addresses in that window and the
-                     last twenty in time order. This is the one that answers where it was stuck while
-                     you keep PLAYING — unlike --break it never stops the run, and unlike --trace it
-                     prints nothing while it goes. A hang inside one pack function shows up as one
-                     address holding most of the window; a pack that still returns to the shell and
-                     simply never gets what it waits for shows a spread instead, and then its host
-                     calls are the lines to read next.
-  --args PATTERN     in the call log, also spell out the argument words of every call whose name
-                     contains PATTERN, e.g. --args BitBlt for what a blit was told to copy.
-                     Repeatable, and the patterns add up: --args BitBlt --args FillRect answers both
-                     questions in one report. Asking for arguments implies the log that carries them,
-                     so this alone is enough — --verbose is only needed for the rest of the volume.
+                     send the pack's own requests to that local proxy for real
+  --net-script FILE  answer requests from a local route table instead of a socket
+  --scripts DIR      root of per-application Lua 5.4 packages, read-only by default
+  --script-writes    opt the Lua package into destructive guest access (trusted scripts only)
+
+Diagnostics and forensics
+  --verbose          also print the volume: the HLE call log, every text run, every note
+  --info             ask the pack what it is, without running it. Builds no runtime and retires
+                     no instruction, so it is safe over a whole corpus
+  --trace            print every retired guest instruction and every HLE dispatch
+  --trace-limit N    stop printing after N instructions, and say so
+  --trace-range LO,HI
+                     print only that span (`module+0x…`, `heap+0x…`, or a number)
+  --trace-events FILE
+                     write every IApplet::HandleEvent delivery to FILE as TSV, flushed per event
   --disasm [ADDR][,N]
-                     disassemble N instructions (default 16) at ADDR, which may be a number, a
-                     region offset written the way the reports print one (`module+0x174`,
-                     `heap+0x2c`, `stack-0x10`) or a method (`IShell::CreateInstance`). Leave ADDR
-                     out to list where the run stopped: a fault's program counter, or the stop a
-                     `--break` / `--watch-stop` recorded. A run that neither faulted nor stopped on
-                     purpose, with no ADDR given, says there is nothing to list rather than going
-                     silent. The register dump names the values that have names.
-  --dump ADDR[,LEN]
-                     print LEN bytes (default 64) at ADDR as hex and text, and — the part a hex dump
-                     cannot give you — name every word in them that is a pointer or a stub address.
-                     ADDR takes the same forms as --disasm's, and one more: a register name (r0…r12,
-                     sp, lr) dumps what that register points at, which is how an object the pack holds
-                     gets read without anyone copying a heap address from an earlier run into a shell.
-                     A register reads the same machine the report above it prints: the copy taken at a
-                     fault, or the one a `--break` / `--watch-stop` left behind, and only when the run
-                     left no copy the live registers after the last instruction. Every line a register
-                     dump prints — the dump and the refusal to read it — names which of the three.
-  --coverage         print what the run asked the host for: every interface method and helper it
-                     reached, with a call count and the busiest first, plus the classes and resources
-                     nobody served. A pack describes its own work list this way — it reached 7 of 117
-                     helpers and stopped at sprintf — where a guess at what it might use cannot.
-  --flame            fold the run into a call tree and print it at the end: one row per frame,
-                     indented by depth, with wall clock, instruction count, call count and how much
-                     of the row was its own work. This is the run's own account of where it spent
-                     itself: a host method is wide here even though the guest retires no instructions
-                     while it runs, which is the half `--coverage`'s call counts cannot show. It costs
-                     an `Instant::now()` per frame, so a run that did not ask for it does not pay it.
-                     The window's developer page draws the same tree, from the same records.
+                     disassemble N instructions (default 16) at ADDR, or where the run stopped
+  --dump ADDR[,LEN]  hex and text at ADDR (default 64 bytes), naming every word that is a
+                     pointer or a stub address. ADDR also takes a register name
+  --break ADDR[,N][,rX=VAL]
+                     stop before that instruction: the N-th arrival, or the first arrival where a
+                     register holds VAL. Repeatable
+  --watch ADDR[,LEN] record every read and store of that span, and its arena history (repeatable)
+  --watch-stop       stop the run the first time the watchpoint is reached
+  --watch-chain      with --watch, also walk the heap's free chain at every arena handover
+  --coverage         print every interface method and helper the run reached, busiest first
+  --flame            fold the run into a call tree and print it at the end
+  --sample N         sample the program counter every N retired instructions (min 64), and print
+                     the busiest addresses plus the last twenty
+  --args PATTERN     in the call log, spell out the argument words of calls whose name matches
+  --gl-log [N]       keep the last N GL rows and print them at the end
+  --call-fingerprint FILE
+                     write one TSV line per host call, so two runs can be diffed into the first
+                     call they disagree on
 
-A class id, event or key may be given as a number (0x… or decimal) or, when the SDK publishes the
-name in a header, by that name: --event EVT_APP_STOP and --key AVK_DOWN are read exactly as
---event 0x1 and --key 0xe031. Events and keys are queued in the order they appear on the command
-line, after --start, and delivered by one turn of the dispatch loop — so an applet that answers a
-key by arming a timer or posting an event to itself is heard in the same run.
+  A class id, event or key may be a number (0x… or decimal) or, when published definitions give it a name,
+  that name: --event EVT_APP_STOP and --key AVK_DOWN read exactly as --event 0x1 and --key 0xe031.
+  Events and keys are queued in command-line order, after --start, and delivered by one turn.
 
-A .mod is entered at offset 0 as int AEEMod_Load(IShell*, void* ph, IModule** ppMod), where the
-second argument is the helper table. An SDK build is the linker's ER_RO segment as a flat blob; a
-shipped pack carries a BREW-headered image that relocates itself, and both are read the same way.";
+  A .mod is entered at offset 0 as int AEEMod_Load(IShell*, void* ph, IModule** ppMod), where the
+  second argument is the helper table. A platform build is the linker's ER_RO segment as a flat blob;
+  a shipped pack carries a BREW-headered image that relocates itself, and both are read alike.";
 
 /// Which front end shows the run, when a person is watching rather than a script.
 #[derive(Clone, Copy)]
@@ -494,6 +300,65 @@ fn main() -> ExitCode {
         println!("{}", USAGE);
         return ExitCode::FAILURE;
     }
+    // `--list-platforms`: the names a declaration or a flag may use, and nothing else. It runs no
+    // pack, so it answers before the module path is even looked at — the one query a person should
+    // never have to read the source for.
+    if args.iter().any(|a| a == "--list-platforms") {
+        for spec in quoin::spec::specs() {
+            let tag = if spec.id == quoin::spec::DEFAULT_SPEC {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("{}", format!("{:<16}{tag}", spec.label).trim_end());
+            if !spec.aliases.is_empty() {
+                println!("    also: {}", spec.aliases.join(", "));
+            }
+        }
+        println!();
+        for carrier in quoin::spec::carriers() {
+            let tag = if carrier.id == quoin::spec::DEFAULT_CARRIER {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("{}", format!("{:<16}{tag}", carrier.label).trim_end());
+            if !carrier.aliases.is_empty() {
+                println!("    also: {}", carrier.aliases.join(", "));
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--install") {
+        let Some(pack) = args.get(pos + 1) else {
+            eprintln!("error: --install needs a .mod path");
+            return ExitCode::FAILURE;
+        };
+        let Some(device) = quoin::library::device_root() else {
+            eprintln!("error: this host cannot name its data directory");
+            return ExitCode::FAILURE;
+        };
+        return match quoin::library::install_pack(std::path::Path::new(pack), &device) {
+            Ok(done) => {
+                println!("installed {} into {}", done.id, done.pack.display());
+                match &done.manifest {
+                    Some(mif) => println!("app info: {}", mif.display()),
+                    None => println!("app info: none found beside the pack"),
+                }
+                println!(
+                    "{} file(s) copied; {} entr{} skipped",
+                    done.files,
+                    done.skipped.len(),
+                    if done.skipped.len() == 1 { "y" } else { "ies" }
+                );
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                eprintln!("error: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Nothing to run and nothing asked for is a person who double-clicked this: they expect a list of
     // games, not a usage message. `quoin <file.mod>` is untouched, so a script sees no change. The
     // one exception is `--align-clock` on its own: that is a person asking the library for the
@@ -546,14 +411,27 @@ fn main() -> ExitCode {
 /// Where the library looks for packs.
 ///
 /// `BREW_GAME_DIR` first — the same variable the gated integration tests use, so a person who has already
-/// pointed this project at a corpus does not have to point it at it twice — and `Game` beside the working
-/// directory otherwise, which is how this repository lays one out.
+/// pointed this project at a sample set does not have to point it at it twice — then the device tree
+/// (`data/device/fs/mod`) when `--install` has put packs there, and `Game` beside the working
+/// directory otherwise, which is how this repository lays a sample set out.
 #[cfg(feature = "ui")]
 fn library_root() -> std::path::PathBuf {
-    match std::env::var_os("BREW_GAME_DIR") {
-        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => std::path::PathBuf::from("Game"),
+    if let Some(dir) = std::env::var_os("BREW_GAME_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
     }
+    // An installed pack lives under the device tree; that is the library a person who used
+    // `--install` expects to see. An empty tree falls back to the sample set.
+    if let Some(mods) = quoin::library::device_mods() {
+        let populated = std::fs::read_dir(&mods)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if populated {
+            return mods;
+        }
+    }
+    std::path::PathBuf::from("Game")
 }
 
 /// `--make-bbf FONT[.ttf] [--out FILE.bbf] [--size N] [--face-index N] [--half-widths N]`.
@@ -696,70 +574,25 @@ fn install_bbf(rt: &mut Runtime, path: &str, designator: u32) -> Result<(), Stri
     Ok(())
 }
 
-/// Flags that expose diagnostics, tracing or developer-only plumbing. They are accepted only with
-/// an explicit `--dev`; ordinary runs stay on the short, stable surface.
-const DEVELOPER_FLAGS: &[&str] = &[
-    "--trace",
-    "--sample",
-    "--trace-limit",
-    "--trace-range",
-    "--trace-events",
-    "--disasm",
-    "--dump",
-    "--break",
-    "--watch",
-    "--watch-stop",
-    "--watch-chain",
-    "--coverage",
-    "--flame",
-    "--args",
-    "--verbose",
-    "--info",
-    "--heap-mb",
-    "--heap-initial-kb",
-    "--ram-mb",
-    "--color-depth",
-    "--encoding",
-    "--thumb-entry",
-    "--bmp",
-    "--dump-audio",
-    "--dump-wav",
-    "--record-input",
-    "--input-log",
-    "--serve",
-    "--net-proxy",
-    "--net-script",
-    "--scripts",
-    "--script-writes",
-];
-
-fn developer_flag(args: &[String]) -> Option<&str> {
-    args.iter()
-        .map(String::as_str)
-        .find(|arg| DEVELOPER_FLAGS.contains(arg))
-}
-
 fn run(args: &[String]) -> Result<ExitCode, String> {
     // A font conversion runs before any run state exists, so it works on a machine with no pack and
     // no display.
     if let Some(at) = args.iter().position(|a| a == "--make-bbf") {
         return make_bbf(&args[at + 1..]);
     }
-    if !args.iter().any(|arg| arg == "--dev") {
-        if let Some(flag) = developer_flag(args) {
-            return Err(format!(
-                "{flag} is a developer option; add --dev (run `quoin --dev ...`)"
-            ));
-        }
-    }
     let mut path: Option<&str> = None;
     let mut trace = Trace::default();
+    // `--call-fingerprint FILE`: one line per host call, so two runs can be diffed into the first
+    // call they disagree on. See `Runtime::fingerprint`.
+    let mut call_fingerprint: Option<String> = None;
     // `--sample N`: keep one program counter every N retired instructions. 0 is not armed.
     let mut sample: u64 = 0;
     // `--flame`: fold the run's dispatches and downcalls into a call tree, and report it at the end.
     // Off unless asked for, because an armed tree costs an `Instant::now()` per frame (see
     // `quoin::profile`), and a run that did not ask should not pay for the instrument.
     let mut flame = false;
+    // `--gl-log`: the last N GL rows, kept in `Egl` and printed at the end. None means never armed.
+    let mut gl_log: Option<usize> = None;
     let mut thumb = false;
     let mut verbose = false;
     let mut steps: Option<u64> = None;
@@ -770,12 +603,22 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     // `--device-json FILE`: the handset read from a file instead of from `DeviceProfile::standard`.
     // Absent means the built-in one, so no run changes shape by not naming a file.
     let mut device_json: Option<String> = None;
+    // `--platform` / `--carrier`: which generation and which operator's private ABI this run is
+    // pretending to be. Both are resolved to a table entry here, so an unknown name fails before any
+    // pack is read, and the rest of the run never re-parses a string.
+    let mut platform: Option<&'static quoin::spec::BrewSpec> = None;
+    let mut carrier: Option<&'static quoin::spec::Carrier> = None;
+    // `--gl-preset`: apply a firmware GL/overlay family after the device file has been read.
+    let mut gl_preset: Option<String> = None;
+    // `--auth-profile FILE`: paid-content authorization, and the title it is for.
+    let mut auth_profile: Option<String> = None;
+    let mut app_id: Option<String> = None;
     // `--save-device`: write the profile *after* every flag has had its say, which is how a person
     // turns a set of flags they got right into a file they can edit.
     let mut save_device = false;
     // `--heap-mb` / `--heap-initial-kb` / `--ram-mb`: the three memory figures a run is given.
-    // `None` keeps each one at the delivery's own value (240 MiB, 256 KiB, 64 MiB), so a run that
-    // names none of them is the machine it always was.
+    // `None` keeps each one at its default (8 MiB, 256 KiB, 8 MiB), so a run that names none of
+    // them is the machine it always was.
     let mut heap_mb: Option<u32> = None;
     let mut heap_initial_kb: Option<u32> = None;
     let mut ram_mb: Option<u32> = None;
@@ -787,14 +630,28 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     // for `--jit-arena auto`, which is the whole point of the flag being off unless asked for.
     let mut jit_arena: Option<quoin::cpu::JitArena> = None;
     let mut color_depth: Option<u16> = None;
+    let mut frame_bpp: Option<u16> = None;
+    let mut dib_depth: Option<u16> = None;
     let mut encoding: Option<u16> = None;
+    let mut font_normal_size: Option<u16> = None;
+    let mut font_large_size: Option<u16> = None;
     let mut bmp: Option<String> = None;
     let mut dump_audio: Option<String> = None;
     let mut dump_wav: Option<String> = None;
     let mut soundfont: Option<String> = None;
+    // `--compat NAME`: trade one of this host's safety checks for "let the pack keep going".
+    // Named modes only, so a run says exactly which accuracy it gave up. See `Mem::compat_read_zero`.
+    let mut compat_read_zero = false;
     // `--lib PATH`: a library `.mod` (no applet class) the pack expects the handset to have
     // loaded already. Repeatable, and loaded in the order given.
     let mut libraries: Vec<String> = Vec::new();
+    // `--lib-path DIR`: where a `--lib` name is looked up when it is not a path.
+    let mut lib_paths: Vec<String> = Vec::new();
+    // `--lib-manifest FILE`: a JSON run manifest, merged under the command line.
+    let mut lib_manifest: Option<String> = None;
+    // `--virtual-class NAME,CLASS,IFACE`: classes the host builds in place of a preinstalled
+    // library. One entry per flag; entries with the same NAME are one library.
+    let mut virtual_classes: Vec<String> = Vec::new();
     // `--font FILE.bbf`: a bitmap face made by `--make-bbf`, installed as `AEE_FONT_NORMAL`.
     let mut font: Option<String> = None;
     let mut font_bold: Option<String> = None;
@@ -846,7 +703,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let mut debug = Debug::default();
     let mut run_for: u32 = 0;
     // How long a scripted `--key` holds the key down, in virtual milliseconds. A human tap is
-    // tens of them; this is one tick of the clocks the shipped packs arm.
+    // tens of them; this is one tick of the clocks the guest packs arm.
     let mut hold: u32 = 150;
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut it = args.iter();
@@ -857,13 +714,35 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match a.as_str() {
+            // Kept as a no-op so commands written before the gate came down keep working: `--dev`
+            // used to unlock the diagnostics below it, and it no longer has anything to unlock. It
+            // is not advertised in `--help`, and a run behaves identically with or without it.
             "--dev" => {}
+            // `--compat NAME[,NAME]`: a named accuracy trade. Each name is one specific check, and
+            // an unknown one is refused by name rather than ignored — a run that thinks it widened
+            // the machine and did not is worse than one that failed to start.
+            "--compat" => {
+                let value = take(&mut it, "--compat")?;
+                for name in value.split(',') {
+                    match name.trim() {
+                        "" => {}
+                        "unmapped-read" => compat_read_zero = true,
+                        other => {
+                            return Err(format!(
+                                "--compat {other}: no such mode. This host has `unmapped-read` \
+                                 (answer unmapped reads with zero instead of faulting)"
+                            ))
+                        }
+                    }
+                }
+            }
             // `main` installed these as QUOIN_SPEED before parsing; the worker reads it there.
             "--align-clock" => {}
             "--speed" => {
                 let _ = take(&mut it, "--speed")?;
             }
             "--trace" => trace.limit = u64::MAX,
+            "--call-fingerprint" => call_fingerprint = Some(take(&mut it, "--call-fingerprint")?),
             "--sample" => {
                 // Instructions between two samples. The floor is there because a person typing a small
                 // number means "fine-grained", and at 1 this is a full trace kept in memory: 4096
@@ -924,6 +803,25 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             }
             "--coverage" => debug.coverage = true,
             "--flame" => flame = true,
+            "--gl-log" => {
+                // The count is optional: `--gl-log --bmp out.bmp` must not eat `out.bmp` as a row
+                // limit. Only consume the next token when it really is a positive number.
+                const DEFAULT_ROWS: usize = 20_000;
+                let n = match it.as_slice().first() {
+                    Some(v) => match v.parse::<usize>() {
+                        Ok(n) if n > 0 => {
+                            it.next();
+                            n
+                        }
+                        Ok(_) => {
+                            return Err("--gl-log needs a positive row count".to_string());
+                        }
+                        Err(_) => DEFAULT_ROWS,
+                    },
+                    None => DEFAULT_ROWS,
+                };
+                gl_log = Some(n);
+            }
             "--watch-stop" => watch_stop = true,
             "--watch-chain" => watch_chain = true,
             "--break" => break_at.push(take(&mut it, "--break")?),
@@ -961,7 +859,16 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 });
             }
             "--device-json" => device_json = Some(take(&mut it, "--device-json")?),
+            "--platform" => {
+                platform = Some(quoin::spec::spec_by_name(&take(&mut it, "--platform")?)?)
+            }
+            "--carrier" => {
+                carrier = Some(quoin::spec::carrier_by_name(&take(&mut it, "--carrier")?)?)
+            }
+            "--gl-preset" => gl_preset = Some(take(&mut it, "--gl-preset")?),
             "--save-device" => save_device = true,
+            "--auth-profile" => auth_profile = Some(take(&mut it, "--auth-profile")?),
+            "--app-id" => app_id = Some(take(&mut it, "--app-id")?),
             "--heap-mb" => {
                 let v = take(&mut it, "--heap-mb")?;
                 let n: u32 = v.parse().map_err(|_| format!("not a size in MiB: {v}"))?;
@@ -1013,6 +920,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 }
                 color_depth = Some(n);
             }
+            "--frame-bpp" => {
+                let v = take(&mut it, "--frame-bpp")?;
+                let n: u16 = v.parse().map_err(|_| format!("not a frame depth: {v}"))?;
+                if !matches!(n, 16 | 32) {
+                    return Err(format!(
+                        "--frame-bpp: this host backs a 16- or 32-bpp frame, got {n}"
+                    ));
+                }
+                frame_bpp = Some(n);
+            }
+            "--dib-depth" => {
+                let v = take(&mut it, "--dib-depth")?;
+                let n: u16 = v.parse().map_err(|_| format!("not a DIB depth: {v}"))?;
+                if !matches!(n, 16 | 32) {
+                    return Err(format!(
+                        "--dib-depth: off-screen DIBs are backed at 16 or 32 bpp, got {n}"
+                    ));
+                }
+                dib_depth = Some(n);
+            }
             "--encoding" => {
                 // `AEEDeviceInfo::wEncoding`, an `AEE_ENC_*` number. This host advertises it and never
                 // converts by it, so overriding the number asks the pack what *it* does with that
@@ -1053,9 +980,32 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             "--dump-wav" => dump_wav = Some(take(&mut it, "--dump-wav")?),
             "--soundfont" => soundfont = Some(take(&mut it, "--soundfont")?),
             "--lib" => libraries.push(take(&mut it, "--lib")?),
+            "--lib-path" => lib_paths.push(take(&mut it, "--lib-path")?),
+            "--lib-manifest" => lib_manifest = Some(take(&mut it, "--lib-manifest")?),
+            "--virtual-class" => virtual_classes.push(take(&mut it, "--virtual-class")?),
             "--font" => font = Some(take(&mut it, "--font")?),
             "--font-bold" => font_bold = Some(take(&mut it, "--font-bold")?),
             "--font-large" => font_large = Some(take(&mut it, "--font-large")?),
+            "--font-normal-size" => {
+                let v = take(&mut it, "--font-normal-size")?;
+                let n: u16 = v.parse().map_err(|_| format!("not a number: {v}"))?;
+                if !(4..=128).contains(&n) {
+                    return Err(format!(
+                        "--font-normal-size {v}: expected a cell of 4..=128 pixels"
+                    ));
+                }
+                font_normal_size = Some(n);
+            }
+            "--font-large-size" => {
+                let v = take(&mut it, "--font-large-size")?;
+                let n: u16 = v.parse().map_err(|_| format!("not a number: {v}"))?;
+                if !(4..=128).contains(&n) {
+                    return Err(format!(
+                        "--font-large-size {v}: expected a cell of 4..=128 pixels"
+                    ));
+                }
+                font_large_size = Some(n);
+            }
             "--audio-backend" => {
                 let v = take(&mut it, "--audio-backend")?;
                 audio_backend = AudioBackend::parse(&v)
@@ -1183,6 +1133,21 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         (false, _) => None,
     };
     let path = path.ok_or("no .mod given")?;
+    let app_id_given = app_id.is_some();
+    if app_id_given && auth_profile.is_none() {
+        return Err("--app-id names the title --auth-profile authorizes, so it needs one".into());
+    }
+    let auth = match auth_profile.as_deref() {
+        Some(file) => Some(quoin::auth::Profile::read(std::path::Path::new(file))?),
+        None => None,
+    };
+    let app_id = app_id.unwrap_or_else(|| {
+        std::path::Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
     if args.iter().any(|a| a == "--align-clock" || a == "--speed") && gui.is_none() && !info {
         // These shape the windowed worker's turn length; a headless run has no such turn. Accepting
         // them and then doing nothing is the "taken, then silent" shape this CLI refuses. `--info`
@@ -1205,14 +1170,25 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             ("--lang", lang.is_some()),
             ("--device", device.is_some()),
             ("--device-json", device_json.is_some()),
+            ("--gl-preset", gl_preset.is_some()),
             ("--save-device", save_device),
+            ("--auth-profile", auth_profile.is_some()),
+            ("--app-id", app_id_given),
             ("--heap-mb", heap_mb.is_some()),
             ("--jit-budget", jit_budget.is_some()),
             ("--jit-arena", jit_arena.is_some()),
             ("--heap-initial-kb", heap_initial_kb.is_some()),
             ("--ram-mb", ram_mb.is_some()),
+            ("--platform", platform.is_some()),
+            ("--carrier", carrier.is_some()),
             ("--color-depth", color_depth.is_some()),
+            ("--frame-bpp", frame_bpp.is_some()),
+            ("--dib-depth", dib_depth.is_some()),
             ("--encoding", encoding.is_some()),
+            (
+                "--font-normal-size/--font-large-size",
+                font_normal_size.is_some() || font_large_size.is_some(),
+            ),
             ("--start", start.is_some()),
             ("--key/--event/--pointer/--pad", !cmds.is_empty()),
             ("--run-for", run_for > 0),
@@ -1248,6 +1224,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 debug.coverage || debug.disasm.is_some() || debug.dump.is_some(),
             ),
             ("--flame", flame),
+            ("--gl-log", gl_log.is_some()),
             (
                 "--steps/--steps-ceiling/--session-ceiling",
                 steps.is_some() || steps_ceiling.is_some() || session_ceiling.is_some(),
@@ -1319,16 +1296,38 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
         None => DeviceProfile::standard(),
     };
+    let profile = match gl_preset.as_deref() {
+        Some(name) => profile.with_gl_preset(name)?,
+        None => profile,
+    };
     let profile = match device {
         Some((w, h)) => profile.with_screen(w, h),
         None => profile,
     };
-    // The two diagnostics override *answers*, not the machine: the frame stays RGB565 and the text
-    // helpers stay the ones this host implements. Applied after the screen so a run that gave both gets
-    // both, and reported below so a reader of the log cannot mistake this for a different handset.
+    // The two diagnostics override *answers*, not the machine: `--color-depth` leaves frame_bpp
+    // alone, and the text helpers stay the ones implemented here. Applied after the screen so a run
+    // that gave both gets both, and reported below so a reader of the log cannot mistake this for a
+    // different handset.
     let profile = match (color_depth, encoding) {
         (None, None) => profile,
         (d, e) => profile.with_advertised(d, e),
+    };
+    // These two move the machine, not just its answer: the frame's storage and the deepest DIB the
+    // host will allocate. A 32-bpp frame also forces the DIB ceiling up to 32 in `with_backing`.
+    let profile = match (frame_bpp, dib_depth) {
+        (None, None) => profile,
+        (f, d) => profile.with_backing(f, d),
+    };
+    // The system face sizes are a device property: a carrier body names 20 and 24, while the
+    // built-in handset keeps 16 and 32. The guest never sees these numbers; they are the cells the
+    // host rasterizes from the machine's own font.
+    let profile = match (font_normal_size, font_large_size) {
+        (None, None) => profile,
+        (normal, large) => quoin::device::DeviceProfile {
+            font_normal: normal.unwrap_or(profile.font_normal),
+            font_large: large.unwrap_or(profile.font_large),
+            ..profile
+        },
     };
     // `--ram-mb`: the total a pack is told the handset has. It is a different question from the
     // heap's span, which is why the two are separate flags.
@@ -1336,6 +1335,19 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         Some(mb) => quoin::device::DeviceProfile {
             ram: mb * 1024 * 1024,
             ..profile
+        },
+        None => profile,
+    };
+    // A profile's simulated The carrier identity is the handset's own number for the run: the guest asks
+    // `AEE_DEVICEITEM_CARRIER_KDDI_SUBSCRIBER_NO` for it, and the authorization decision names the
+    // same subscriber.
+    let profile = match &auth {
+        Some(auth) => match &auth.subscriber_number {
+            Some(number) => quoin::device::DeviceProfile {
+                subscriber_number: number.clone(),
+                ..profile
+            },
+            None => profile,
         },
         None => profile,
     };
@@ -1348,7 +1360,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     }
     let heap_bytes = heap_mb
         .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(quoin::layout::HEAP_LIMIT - quoin::layout::HEAP_BASE);
+        .unwrap_or(quoin::layout::HEAP_DEFAULT);
     let heap_initial = heap_initial_kb
         .map(|kb| kb * 1024)
         .unwrap_or(quoin::heap::INITIAL);
@@ -1359,7 +1371,54 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             heap_bytes / 1024
         ));
     }
+    // The declaration beside the module is data; a pack without one keeps every modern answer. It is
+    // read before the machine is built because a generation it names decides part of that machine —
+    // the `AEEDeviceInfo` size — and a number chosen after the struct is laid out never reaches it.
+    let compat = quoin::compat::load(std::path::Path::new(&path))?;
+    // Which generation answers behind this pack, and where that decision came from. Resolving it
+    // here — after the declaration is read, before anything acts on it — is what makes an unknown
+    // name in a sidecar fail with the sidecar's path in the message.
+    let resolved = quoin::spec::resolve(platform, carrier, &compat, std::path::Path::new(&path))?;
+    let profile = resolved.apply_to(profile);
     let mut rt = Runtime::with_device_and_heap(profile, heap_bytes, heap_initial);
+    // Arm before the pack is loaded: its early texture uploads are the evidence worth keeping.
+    if let Some(n) = gl_log {
+        rt.enable_gl_draw_log(n);
+    }
+    rt.oem_native_images = compat.convertbmp == quoin::compat::ConvertBmp::Pixels;
+    rt.oem_until_applet = compat.scope == quoin::compat::Scope::Constructor;
+    rt.cpu
+        .mem
+        .set_slack_newline(compat.slack_fill == quoin::compat::SlackFill::Newline);
+    if compat_read_zero {
+        rt.cpu.mem.set_compat_read_zero(true);
+        // Said on stderr and before anything runs: a run that reports a fault it would otherwise
+        // have hidden, or hides one it would otherwise have reported, has to say which machine it
+        // pretended to be. The report's own lines stay on stdout for the scripts that parse them.
+        eprintln!(
+            "compat: unmapped reads answer zero (--compat unmapped-read) — a pack that runs past \
+             the end of its image now keeps going with zeros instead of faulting"
+        );
+    }
+
+    if let Some(path) = call_fingerprint {
+        let file =
+            std::fs::File::create(&path).map_err(|e| format!("--call-fingerprint {path}: {e}"))?;
+        rt.fingerprint = Some(quoin::runtime::Fingerprint {
+            out: std::io::BufWriter::new(file),
+            seq: 0,
+        });
+    }
+    if let Some(auth) = auth {
+        let decision = auth.decision_for(&app_id);
+        println!(
+            "auth: app={app_id} subscriber={} default={} -> {}",
+            auth.subscriber_number.as_deref().unwrap_or("<unset>"),
+            auth.default.name(),
+            decision.name()
+        );
+        rt.set_authorization(auth, app_id.clone());
+    }
     #[cfg(feature = "jit")]
     if jit.unwrap_or(true) {
         rt.cpu.enable_jit();
@@ -1457,14 +1516,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     rt.cpu.mem.watch_chain = watch_chain;
     // A run that named a number meant it. Otherwise this is a pack being *played* — which a scripted
     // `--wait`/`--key` run is just as much as a windowed one, since both drive the same guest through
-    // the same frames — so it gets the bound measured from the corpus rather than the 2-million probe
+    // the same frames — so it gets the bound measured from the sample set rather than the 2-million probe
     // default a unit test wants. A bound that depends on whether a window is open leaves the scripted
     // form under a limit smaller than one frame of guest work, so the same pack played two ways
     // answers two different questions. See `GAME_STEP_LIMIT`.
     rt.step_limit = steps.unwrap_or(quoin::runtime::GAME_STEP_LIMIT);
     rt.step_ceiling = steps_ceiling.unwrap_or(quoin::runtime::GAME_STEP_CEILING);
     // Off unless asked for: a pack that returns from every function it was given has not done
-    // anything this bound has to say about it, and a default would be one more number the corpus has
+    // anything this bound has to say about it, and a default would be one more number the sample set has
     // to be measured against.
     rt.session_ceiling = session_ceiling.unwrap_or(u64::MAX);
     // A run told where to send its requests gets the one thread and the one socket this host has.
@@ -1529,24 +1588,32 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         );
     }
     let files = rt.volume.mount_beside(std::path::Path::new(path));
-    // Where the app's own writes go. The default is a per-pack directory beside the emulator, because
-    // a save that vanishes with the run is exactly what "the game keeps starting over" reads as.
-    // `--save-dir DIR` puts it somewhere else and `--save-dir none` turns it off, which is what a
-    // regression run wants: a run with a home directory is not reproducible from the same starting
+    // Where the app's own writes go. A handset keeps the module's files and its saves in the same
+    // directory, so the default is the pack's own directory. `--save-dir DIR` keeps them elsewhere
+    // and loads what an earlier run left there; `--save-dir none` turns mirroring off, which is what
+    // a regression run wants: a run with a home directory is not reproducible from the same starting
     // state, so a baseline taken with one would only describe the save it started from.
-    let home = match save_dir.as_deref() {
-        Some("none") => None,
-        Some(dir) => Some(std::path::PathBuf::from(dir)),
-        None => quoin::library::default_save_dir(std::path::Path::new(path)),
-    };
-    if let Some(dir) = &home {
-        let loaded = rt.volume.persist_to(dir);
-        println!(
-            "app files: keeping what the app writes in {} ({} entr{} loaded from it)",
-            dir.display(),
-            loaded.len(),
-            if loaded.len() == 1 { "y" } else { "ies" }
-        );
+    let mod_path = std::path::Path::new(path);
+    match save_dir.as_deref() {
+        Some("none") => {}
+        Some(dir) => {
+            let loaded = rt.volume.persist_to(std::path::Path::new(dir));
+            println!(
+                "app files: keeping what the app writes in {} ({} entr{} loaded from it)",
+                dir,
+                loaded.len(),
+                if loaded.len() == 1 { "y" } else { "ies" }
+            );
+        }
+        None => {
+            let dir = quoin::store::dir_of(mod_path);
+            if rt.volume.write_back_to(&dir) {
+                println!(
+                    "app files: writing back into the pack's own directory, as a handset does: {}",
+                    dir.display()
+                );
+            }
+        }
     }
     if !files.is_empty() && verbose {
         let shown = if files.len() > 6 {
@@ -1560,24 +1627,44 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             shown
         );
     }
+    // Which generation is answering behind that screen. Printed before the device line because it is
+    // the coarser fact of the two: the device says what the handset is, the platform says which
+    // firmware a pack was built against — and therefore which of several answers it will get.
+    println!("{}", resolved.line());
     // The first thing a module is given is the screen it will lay its art out for, and the one thing
-    // a shipped pack cannot be trusted to have guessed right: built for another size, it draws
+    // a guest pack cannot be trusted to have guessed right: built for another size, it draws
     // misaligned rather than failing, so the number goes on the record before the load does.
     println!(
-        "device: {}x{} {}bpp, model {:?} — a pack built for another screen wants --device{}",
+        "device: {}x{} {}bpp, {}bpp frame, model {:?} — a pack built for another screen wants --device{}",
         rt.device.width,
         rt.device.height,
         rt.device.color_depth,
+        rt.device.frame_bpp,
         rt.device.model_name,
-        // Say out loud when the advertised depth is not this host's screen, because the frame under it
-        // did not change: a run that draws wrong here has shown a code path, not a pixel format.
-        if rt.device.color_depth != quoin::display::NATIVE_DEPTH {
+        // Say out loud when the advertised depth is not the frame this host backs: the screen is
+        // still real, and a pack that draws wrong here has shown a branch, not a pixel format.
+        if rt.device.color_depth != rt.device.frame_bpp {
             format!(
-                " (advertised only: the frame stays {}bpp RGB565)",
-                quoin::display::NATIVE_DEPTH
+                " (advertised only: the frame is {}bpp)",
+                rt.device.frame_bpp
             )
         } else {
             String::new()
+        }
+    );
+    // The two numbers the guest never sees but every glyph the host draws does, and the character
+    // set they are drawn from — which a carrier now decides, so a garbled run can be read off this
+    // line instead of guessed at from the pack.
+    println!(
+        "fonts: system face rasterized at {}px normal / {}px large; text units {:?} (0x{:02x}), DrawText takes {}",
+        rt.device.font_normal,
+        rt.device.font_large,
+        quoin::encoding::TextEncoding::of(u32::from(rt.device.encoding)),
+        rt.device.encoding,
+        if rt.device.text_bytes {
+            "the device's 8-bit string"
+        } else {
+            "AECHAR"
         }
     );
     // A module that never comes up is a run whose diagnosis is the report, not the sentence the
@@ -1591,12 +1678,53 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     // `--lib` images are read before any of them is loaded, because `--jit-arena auto` sizes the
     // code cache from the total bytes of module code and has to be applied before the first library
     // entry point runs: setting the ceiling flushes the cache, which is only free while it is empty.
-    let lib_images: Vec<(&String, Vec<u8>)> = libraries
+    //
+    // The command line is the base and the manifest fills in what it did not name: a package's
+    // own library must win over a shared fallback. The sample set runner can therefore pass the
+    // package's libs and a shared manifest in one run.
+    // A run started from the device tree gets the device's shared middleware by default. The
+    // sample runner passes the same manifest explicitly; an explicit --lib-manifest still wins.
+    let lib_manifest = lib_manifest.or_else(|| {
+        if quoin::library::is_installed_pack(std::path::Path::new(path))
+            && quoin::library::local_library_names(std::path::Path::new(path)).is_empty()
+        {
+            quoin::library::device_libs_manifest().map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    });
+    let mut plan = LibraryPlan::default();
+    for dir in lib_paths {
+        plan.search_paths.push(std::path::PathBuf::from(dir));
+    }
+    for lib in libraries {
+        plan.libs.push(lib);
+    }
+    if let Some(path) = &lib_manifest {
+        plan.merge(LibraryPlan::read_manifest(std::path::Path::new(path))?)?;
+    }
+    // A library the installed pack ships itself is the version it was built against; a shared
+    // manifest entry with the same name is only a fallback and must not shadow it.
+    if quoin::library::is_installed_pack(std::path::Path::new(path)) {
+        let local = quoin::library::local_library_names(std::path::Path::new(path));
+        plan.libs.retain(|lib| {
+            let name = std::path::Path::new(lib)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            !local.contains(name)
+        });
+    }
+    for spec in virtual_classes {
+        plan.add_virtual_class(&spec)?;
+    }
+    let real_libs = plan.resolved_libs()?;
+    let lib_images: Vec<(&std::path::PathBuf, Vec<u8>)> = real_libs
         .iter()
         .map(|lib| {
             std::fs::read(lib)
                 .map(|bytes| (lib, bytes))
-                .map_err(|e| format!("--lib {lib}: {e}"))
+                .map_err(|e| format!("--lib {}: {e}", lib.display()))
         })
         .collect::<Result<_, _>>()?;
     if let Some(choice) = jit_arena {
@@ -1610,8 +1738,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     for (lib, bytes) in &lib_images {
-        rt.load_library(bytes, false)
-            .map_err(|e| format!("--lib {lib}: {e}"))?;
+        rt.load_library_from(lib, bytes, false)
+            .map_err(|e| format!("--lib {}: {e}", lib.display()))?;
+    }
+    // Virtual libraries need no guest entry point: they are class providers the shell consults
+    // after the real libraries, so registering them is an ordinary state change.
+    for lib in plan.virtual_libs {
+        rt.load_virtual_library(lib);
     }
     // The rest of the bundle, so a launcher shim can start the class it names: `Refresher.mod`'s whole
     // `EVT_APP_START` is `StartApplet(monopoly.mod's class)`. An explicit `--lib` still covers a module
@@ -1694,17 +1827,25 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         rt.shell
     );
 
+    // A default run gives `AEEMod_Load` more room than a handler gets: self-unpacking modules are
+    // one guest function, not an event handler, and this sample set' J2B runtime needs ~227 million
+    // instructions with a ~160-million gap between host calls. A bound the caller named stays.
+    let keep_limit = rt.step_limit;
+    if steps.is_none() {
+        rt.step_limit = rt.step_limit.max(quoin::runtime::LOAD_STEP_LIMIT);
+    }
     let outcome = match rt.run() {
         Ok(outcome) => outcome,
         // Same reason as the load above: the fault, its registers and the call it happened inside
         // are the run's answer, and a `?` would drop them on the floor.
         Err(e) => return Err(failed(&rt, verbose, bmp.as_deref(), &debug, e)),
     };
+    rt.step_limit = keep_limit;
     // Whether the applet phase still happens after this phase — see [`start_after_load`]. Whether it was
     // asked for at all is a different question, and the two answers are needed apart below.
     let load_stop = matches!(outcome, Outcome::Stopped { .. });
     // A load that spent its instruction budget did not return, so there is no `IModule*` yet. It is
-    // not the module refusing to publish one: a self-unpacking loader in this corpus needs 4–18
+    // not the module refusing to publish one: a self-unpacking loader in this sample set needs 4–18
     // million instructions before `AEEMod_Load` returns, and a headless run with a small ceiling
     // cuts it off mid-unpack. Starting an applet on that machine would report both a false error and
     // a second, unrelated machine state.
@@ -2104,11 +2245,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 permille as f32 / 1000.0
             );
         }
-    // `--fps` names the HUD line, and only the egui window draws one. A build without the window
-    // still parses and validates the flag; reading it once is what keeps that from turning into
-    // four "never used" warnings that would hide a real one.
-    #[cfg(not(feature = "ui"))]
-    let _ = show_fps;
+        // `--fps` names the HUD line, and only the egui window draws one. A build without the window
+        // still parses and validates the flag; reading it once is what keeps that from turning into
+        // four "never used" warnings that would hide a real one.
+        #[cfg(not(feature = "ui"))]
+        let _ = show_fps;
 
         let pumped = match gui {
             #[cfg(feature = "ui")]
@@ -2251,6 +2392,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         report_break(&rt);
         report_samples(&rt);
         report_flame(&rt, flame);
+        report_gl_log(&rt);
         // A clean run's `--disasm` and `--dump`, answered here rather than in `failed`: this is the
         // exit that was not an error, and asking what a run ended *on* is as useful as asking what it
         // died on.
@@ -2302,6 +2444,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         report_break(&rt);
         report_samples(&rt);
         report_flame(&rt, flame);
+        report_gl_log(&rt);
         report_disasm(&rt, debug.disasm.as_ref());
         report_dump(&rt, debug.dump.as_ref());
         report_trace(&rt);
@@ -2326,7 +2469,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 ///
 /// The other case is a load that spent its instruction budget and never returned. There is no
 /// `IModule*` to start from, and blaming the module for not publishing one is the wrong diagnosis:
-/// self-unpacking loaders in the corpus need millions of instructions before they return. Both cases
+/// self-unpacking loaders in the sample set need millions of instructions before they return. Both cases
 /// drop the applet phase; [`start_skip_reason`] keeps the two explanations apart.
 fn start_after_load(start: Option<Start>, load_incomplete: bool) -> (Option<Start>, bool) {
     if load_incomplete {
@@ -2444,7 +2587,26 @@ fn failed_ended(
     // The run that faulted is the one whose tree is worth most, and it never reaches the report at
     // the end of `run` — so, like the samples, the tree comes out on this path too.
     report_flame(rt, rt.profile.on());
+    report_gl_log(rt);
     report_crash(rt);
+    if let Some(chain) = rt.too_deep_chain() {
+        let depth = quoin::runtime::MAX_DOWNCALL_DEPTH as usize;
+        println!("\ndowncall chain at the {depth}-level ceiling (oldest first):");
+        for (level, (addr, from)) in chain.iter().take(depth).enumerate() {
+            println!(
+                "  {level:>2}: {} via {}",
+                symbol::symbolize(&rt.hle, rt.module.as_ref(), *addr),
+                from
+            );
+        }
+        if let Some((addr, from)) = chain.get(depth) {
+            println!(
+                "  refused re-entry: {} via {}",
+                symbol::symbolize(&rt.hle, rt.module.as_ref(), *addr),
+                from
+            );
+        }
+    }
     // `--disasm` with no address means "wherever it stopped", and a run that faulted is the case that
     // was asked about — so both of these are answered here as well as on the way out of a clean run.
     report_disasm(rt, debug.disasm.as_ref());
@@ -2539,7 +2701,7 @@ fn write_bmp(rt: &Runtime, path: &str) -> Result<(), String> {
 /// No clip is decoded into samples here, so the listing is what this path can offer for
 /// `ISoundPlayer`: the clips a pack
 /// asked to play, followed out of the naming the vtable carries. A source that could not be read
-/// is listed with its reason rather than dropped, because "the app wants a file this corpus does
+/// is listed with its reason rather than dropped, because "the app wants a file this sample set does
 /// not have" is the answer to a question somebody is about to ask.
 fn report_audio(rt: &Runtime, verbose: bool) {
     // Where the host's own status callbacks went. Printed before the early return below because it is
@@ -2557,7 +2719,7 @@ notified: {sound} sound, {media} media (each one a real callback into the guest)
     }
     let unreadable = rt.audio.iter().filter(|s| s.problem.is_some()).count();
     // The list grows with the pack's playlist — dozens of clips can cross a game's first screens — so
-    // unsolicited it is one line: how many, and how many of them the corpus cannot supply. The names
+    // unsolicited it is one line: how many, and how many of them the sample set cannot supply. The names
     // themselves are what `--verbose` or `--dump-audio` is for.
     if !verbose {
         println!(
@@ -2796,7 +2958,7 @@ fn safe_stem(name: &str) -> String {
 /// The shape of a module's expectations of us: every dispatch taken, in order.
 /// The label a call into the module gets in the report. A delivery into the applet's own event
 /// handler is the one downcall a person at a keyboard cares about — it is where "I pressed Z" is
-/// either written down or not — so its two words are named the way the SDK names them rather than
+/// either written down or not — so its two words are named the way the published names them rather than
 /// left as hex a reader would have to look up. Any other callee, and any word with no name under
 /// that prefix, keeps its number: the number is the finding when the name is missing.
 fn downcall_label(handle_event: u32, addr: u32, args: &[u32]) -> String {
@@ -3327,7 +3489,7 @@ fn report_display(rt: &Runtime, verbose: bool) {
         println!(
             "  those updates asked the host to show the screen; no host call that can draw completed \
              in this run. (0 here does not prove a blank screen: a pack can write its own `IDIB` \
-             buffer with no host call to witness it.)"
+             buffer with no host call to observe it.)"
         );
     }
     report_refusals(&rt);
@@ -3502,6 +3664,57 @@ fn report_machine(rt: &Runtime, c: &quoin::runtime::Crash) {
     // Two to a line, because some of them carry a name now and four would wrap.
     for row in words.chunks(2) {
         println!(" {}", row.concat());
+    }
+    // The fault address, against the host objects this machine handed out. "0x04021000" alone
+    // cannot tell a walk off the end of a bitmap from a stale pointer into a freed object; the
+    // nearest record and its depth/pitch do.
+    if let Some(addr) = rt.last_fault {
+        use quoin::hle::SpanGap;
+        // A 64 KiB window: wide enough to include the surface whose end a walking write crossed,
+        // narrow enough that the shell 64 MiB away is not offered as an explanation.
+        let near = rt.hle.spans_within(addr, 0x1_0000);
+        if near.is_empty() {
+            println!("\nfault address {addr:#010x}: no sized host object within 64 KiB of it");
+        } else {
+            println!("\nfault address {addr:#010x}: host objects within 64 KiB:");
+            for (object, gap) in near.iter().take(12) {
+                let extent = match gap {
+                    SpanGap::Inside => format!(
+                        "inside, block {:#x}..{:#x}",
+                        object.addr,
+                        object.addr.saturating_add(object.len)
+                    ),
+                    SpanGap::Before(gap) => format!(
+                        "{gap:#x} before block {:#x}..{:#x}",
+                        object.addr,
+                        object.addr.saturating_add(object.len)
+                    ),
+                    SpanGap::After(gap) => format!(
+                        "{gap:#x} past block {:#x}..{:#x}",
+                        object.addr,
+                        object.addr.saturating_add(object.len)
+                    ),
+                };
+                let bitmap = rt.display.bitmap(object.addr).map(|b| {
+                    format!(
+                        "; {}x{} {} bpp pitch {} px {:#010x}",
+                        b.width, b.height, b.depth, b.pitch, b.px
+                    )
+                });
+                println!(
+                    "  {} at {:#010x}: {extent}{}",
+                    object.iface,
+                    object.addr,
+                    bitmap.unwrap_or_default()
+                );
+            }
+        }
+        if let Some((base, len)) = rt.hle.freed_object_at(addr) {
+            println!(
+                "  the address falls inside a freed object block {base:#010x}..{:#010x}",
+                base.saturating_add(len)
+            );
+        }
     }
     // How it got here. ARM keeps no frame chain, so this is a scan rather than a walk: every word on
     // the stack that is an address inside the module is a candidate return address, newest first. It
@@ -3893,7 +4106,7 @@ fn report_probe(reports: &[quoin::probe::Probe]) {
     let agree = both.iter().filter(|p| p.agrees() == Some(true)).count();
     let thin = reports.iter().filter(|p| p.caveat().is_some()).count();
     println!(
-        "  of {} pack(s) with both witnesses, {agree} agree and {} disagree",
+        "  of {} pack(s) with both records, {agree} agree and {} disagree",
         both.len(),
         both.len() - agree
     );
@@ -3928,19 +4141,19 @@ fn report_coverage(rt: &Runtime) {
         for cls in &rt.missing_classes {
             match abi::clsid_name(*cls) {
                 Some(name) => println!("    {cls:#010x}  {name}"),
-                None => println!("    {cls:#010x}  (not a class id the SDK publishes)"),
+                None => println!("    {cls:#010x}  (not a class id the platform publishes)"),
             }
         }
     }
     // The other half of the same question, and the half a run that died on a branch to address zero
-    // needs. A class the host cannot serve is forwarded to the pack's own module, and a shipped
+    // needs. A class the host cannot serve is forwarded to the pack's own module, and a reference
     // `AEEClsCreateInstance` is free to compare nothing and say yes to anything — so an id below is
     // one the *module* claimed, which nothing in the block above can show, and the vtable word count
     // is why that matters: a three-word table answering a class whose interface publishes eight is the
     // crash this run has not got to yet.
     //
     // That last clause is a verdict, though, and only one of the two groups beneath it may carry it.
-    // An id the SDK publishes no interface for has nothing its object's word count can be measured
+    // An id the platform publishes no interface for has nothing its object's word count can be measured
     // against, and that is the ordinary case — every module's own applet class lands there, working
     // ones included. Listing those beside the accused makes a heading that is half noise, and a reader
     // who has learned to skip that half skips the half that is signal. So the list splits in two, and
@@ -4017,7 +4230,7 @@ fn report_coverage(rt: &Runtime) {
     }
 }
 
-/// One accepted class as its report line: the id, the SDK's name for it where it publishes one, what
+/// One accepted class as its report line: the id, the platform's name for it where it publishes one, what
 /// the module answered, the object it published and how long that object's vtable reads. The two
 /// groups in [`report_coverage`] print the same words — what separates them is the heading they sit
 /// under, and the verdict that goes with it, and nothing here.
@@ -4040,7 +4253,7 @@ fn accepted_class_line(a: &AcceptedClass) -> String {
     format!(
         "    {:#010x}  {}  -> {answered}, {object}{asked}",
         a.cls,
-        a.name.unwrap_or("(not a class id the SDK publishes)"),
+        a.name.unwrap_or("(not a class id the platform publishes)"),
     )
 }
 
@@ -4164,10 +4377,31 @@ fn report_samples(rt: &Runtime) {
     }
 }
 
+/// What `--gl-log` saw, printed only when it was armed.
+///
+/// The library formats the rows and never prints: a test can read them from the log, and a run
+/// without the flag pays no formatting cost. Rows already carry their `gl#` prefix, so grepping a
+/// saved log finds the draw and the upload that explain it without reading the surrounding report.
+fn report_gl_log(rt: &Runtime) {
+    let Some(log) = rt.gl_draw_log() else {
+        return;
+    };
+    println!("\n--gl-log: {} rows", log.rows().len());
+    for row in log.rows() {
+        println!("{row}");
+    }
+    if log.total() > log.rows().len() as u64 {
+        println!(
+            "gl# … {} more row(s) omitted; raise --gl-log N to keep more",
+            log.total() - log.rows().len() as u64
+        );
+    }
+}
+
 /// What the run spent itself on, as a tree: `--flame`.
 ///
 /// The report is built by `quoin::profile` rather than here so that the window's developer page and
-/// this both read the same rows, and so that the text has a witness that does not need a pack
+/// this both read the same rows, and so that the text has a record that does not need a pack
 /// (`src/test/profile.rs` asserts a report over a tree it built by hand).
 ///
 /// Silent when nothing was folded, which is a different statement from "nothing happened": an
@@ -4426,7 +4660,7 @@ fn parse_event(v: &str) -> Result<Cmd, String> {
 }
 
 /// A screen coordinate. Negative and hex are both allowed, because the handset's own values are
-/// signed 32-bit — the `AEEEvent.h` example carries `y=FFFFFFFB` for minus five — and a pack that
+/// signed 32-bit — the an interface example carries `y=FFFFFFFB` for minus five — and a pack that
 /// drags a scene can be told to start one off the edge.
 fn parse_coord(v: &str) -> Result<i32, String> {
     let v = v.trim();
@@ -4551,7 +4785,7 @@ fn parse_pointer(v: &str) -> Result<Cmd, String> {
     })
 }
 
-/// A number, or an SDK name for one. Names are resolved through the generated table so that a
+/// A number, or a platform name for one. Names are resolved through the generated table so that a
 /// command line says what the applet saw rather than what a hex digit happened to be.
 fn resolve(v: &str) -> Result<u32, String> {
     if let Some(n) = abi::const_value(v) {

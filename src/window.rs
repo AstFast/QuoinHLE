@@ -7,7 +7,7 @@
 //! `--window` is purely additive: without it, nothing in this file runs.
 //!
 //! It links `user32` and `gdi32` directly instead of taking a windowing crate, for two reasons. The
-//! project's dependency rule is about Qualcomm's SDK, and this is the operating system's own window
+//! project's dependency rule is about The platform's, and this is the operating system's own window
 //! manager; and a crate that pulls in a renderer to blit one rectangle is a larger thing to trust
 //! than the FFI below, which does exactly four jobs — create a window, copy bits, read keys, quit.
 
@@ -156,7 +156,7 @@ extern "system" {
     fn DestroyWindow(hwnd: Hwnd) -> i32;
     fn PostQuitMessage(code: u32);
     fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> usize;
-    /// The x64 way to hang a pointer off a window: the SDK's `GetWindowLongPtrW(hwnd, GWLP_USERDATA)`
+    /// The x64 way to hang a pointer off a window: the platform's `GetWindowLongPtrW(hwnd, GWLP_USERDATA)`
     /// is only a macro over these, and only these are actually exported.
     fn SetPropW(hwnd: Hwnd, name: *const u16, data: *mut c_void) -> i32;
     fn GetPropW(hwnd: Hwnd, name: *const u16) -> *mut c_void;

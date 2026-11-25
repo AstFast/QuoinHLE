@@ -2,7 +2,7 @@
 //!
 //! The object is a handful of colours, one time and two rectangles: the face it draws in and the
 //! picture it draws first. Everything that matters to a caller is either a stored byte or the
-//! shipped geometry in [`hand_point`], which is why this module is arithmetic and state rather than
+//! reference geometry in [`hand_point`], which is why this module is arithmetic and state rather than
 //! a drawing surface — the pixels go through `Display` from the runtime.
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::abi::generated as g;
 use crate::display::Rect;
 
-/// One clock. The five colour triples are the shipped `m_cFace[3]`-style members, kept as the three
+/// One clock. The five colour triples are the reference `m_cFace[3]`-style members, kept as the three
 /// bytes the setters store (`AClock_SetFaceColor`, the delivered body).
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
@@ -66,7 +66,7 @@ impl Clock {
     }
 }
 
-/// An `RGBVAL` as the three bytes the shipped setters keep: `GET_RVAL`/`GET_GVAL`/`GET_BVAL`
+/// An `RGBVAL` as the three bytes the reference setters keep: `GET_RVAL`/`GET_GVAL`/`GET_BVAL`
 /// — red at bits 8-15, then green, then blue.
 pub fn rgb_parts(rgb: u32) -> [u8; 3] {
     [
@@ -86,7 +86,7 @@ pub fn square(rc: Rect) -> Rect {
 /// `AClock_GetX`/`AClock_GetY`, as one point.
 ///
 /// `ticks` is 12 for the hour hand and 60 for the minute and second hands, `value` is the reading
-/// in those units, and `factor` shrinks the reach: the shipped bodies draw the tip of a hand at
+/// in those units, and `factor` shrinks the reach: the platform's own routines draw the tip of a hand at
 /// `diameter / 2.1` (seconds), `2.3` (minutes) and `3` (hours), with the enclosing quad's corners at
 /// 12, 20 and 10/18. The `(int)` casts truncate toward zero, and the source's own `nDiameter / 2`
 /// is integer division — reproduced here rather than tidied, because the two differ by a pixel.

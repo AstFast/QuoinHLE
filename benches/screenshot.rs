@@ -6,7 +6,7 @@
 //! itself rather than in the guest, so a claim about speeding it up has something to stand on.
 //!
 //! `harness = false`: a plain `main`, stable toolchain, no dependency. Run *this target only*;
-//! bare `cargo bench` also builds the corpus-gated integration tests under `tests/`.
+//! bare `cargo bench` also builds the sample-gated integration tests under `tests/`.
 
 use std::hint::black_box;
 use std::time::Instant;

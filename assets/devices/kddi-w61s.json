@@ -1,0 +1,23 @@
+{
+  "_note": "au by KDDI / Sony Ericsson W61S (KCP+, MSM7500). The handset's own panel is 480x854, but an EZ Appli does not get that area: measured with bomberman-08, a 480x854 answer draws the title art at 240-wide coordinates and clips its left half ('UDSON'), while 240x432 shows the full frame with the soft keys at the bottom. So this profile reports the application area the packs are built for, not the panel. No W61S image is on this machine; chip_id is the only identity fact quoted. The carrier's private classes still need --carrier kddi on the command line.",
+  "version": "1.0",
+  "screen": {
+    "width": 240,
+    "height": 432,
+    "color_depth": 16,
+    "frame_bpp": 16
+  },
+  "text": {
+    "encoding": 253,
+    "text_bytes": false,
+    "font_normal": 20,
+    "font_large": 24
+  },
+  "identity": {
+    "chip_id": "MSM7500",
+    "model_name": "W61S",
+    "manufacturer": "Sony Ericsson",
+    "friendly_name": "au W61S",
+    "subscriber_number": "09000000000"
+  }
+}

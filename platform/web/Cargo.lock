@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "quoin"
-version = "0.0.1-alpha"
+version = "0.0.1-beta"
 dependencies = [
  "ab_glyph_rasterizer",
  "android-activity",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "quoin-web"
-version = "0.0.1-alpha"
+version = "0.0.1-beta"
 dependencies = [
  "console_error_panic_hook",
  "eframe",

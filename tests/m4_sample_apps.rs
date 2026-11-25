@@ -1,9 +1,9 @@
-//! M4 against the shipped examples: every official sample module has to load, and its applet has to
+//! M4 against the reference examples: every official sample module has to load, and its applet has to
 //! be reachable at the class id the module itself answers for.
 //!
-//! Skipped unless `BREW_EXAMPLES` names the SDK's `examples` directory, because the images are
+//! Skipped unless `BREW_EXAMPLES` names the platform's `examples` directory, because the images are
 //! linker output from the proprietary samples and are not vendored here — and must not be: this
-//! repository contains no SDK file and does not need one to build or to run the default suite.
+//! repository contains no platform file and does not need one to build or to run the default suite.
 //! The variable is a maintainer's opt-in, not a requirement; unset, every test in this file prints
 //! `skipped` and returns.
 //!
@@ -34,6 +34,11 @@ enum Expect {
     /// was told" and "it crashed in the hole we left" are different facts, and the previous version
     /// of this test accepted both as a pass.
     GapThenFault(&'static str),
+    /// The applet starts and has not put a pixel on the screen yet. Declared separately from
+    /// `Paints` so that the next person can see this is the sample still owed work, rather than a
+    /// pass that would hide it — and so that the day it *does* paint, the declaration turns red and
+    /// gets updated.
+    StartsWithoutPaint(&'static str),
 }
 
 /// How a run ended, as far as the host can account for it.
@@ -53,7 +58,7 @@ enum Stopped {
 
 /// Each module answers `IModule::CreateInstance` by comparing the class the shell asked for with a
 /// literal in its own image, so these ids are the shell's choice for nobody: they are read back out
-/// of the shipped binary, from the `ldr` that feeds the compare at the head of the module's own
+/// of the reference binary, from the `ldr` that feeds the compare at the head of the module's own
 /// `CreateInstance`. The AppGen default `0x0a000001` is what the small samples ship, and the two
 /// Qualcomm apps below carry ids of their own and reject the default.
 struct App {
@@ -76,34 +81,30 @@ const APPS: &[App] = &[
     App {
         name: "expensetracker",
         cls: 0x0a00_0001,
-        // The `(image)` on a resource name is the report's own wording rather than this test's: the
-        // id alone is half the question the pack asked, so `resources the host could not serve`
-        // carries the kind it was filed under too. All three of these packs ask for a table under
-        // the image kind whatever the payload turns out to be.
-        expect: Expect::Gap("ExpenseTracker.bar#0x0010 (image)"),
+        expect: Expect::Paints,
     },
     App {
         name: "netdiagnostics",
         cls: 0x0a00_0001,
-        expect: Expect::Gap("AEECLSID_HTML"),
+        expect: Expect::Paints,
     },
     App {
         name: "whiteboard",
         cls: 0x0a00_0001,
-        expect: Expect::GapThenFault("Whiteboard.bar#0x001a (image)"),
+        expect: Expect::Paints,
     },
     App {
         name: "mediaplayer",
         cls: 0x0101_0ef6,
-        expect: Expect::GapThenFault("MediaPlayer.bar#0x0003 (image)"),
+        // Starts and draws nothing. It is the one sample left owed work; what it waits on is the
+        // media path (its own `.bar` carries the transport art, and the app opens its list view
+        // before anything is painted), not a resource this tree is missing.
+        expect: Expect::StartsWithoutPaint("the media path"),
     },
     App {
         name: "roadwarrior",
         cls: 0x0101_0133,
-        // `IShell::GetPrefs` stood here until that slot was implemented; the pack gets past it now
-        // and stops on the art file this host has no copy of, which is a gap a sample tree without
-        // the app's own `.bar` can do nothing about.
-        expect: Expect::Gap("roadwarrior.bar#0x0016 (image)"),
+        expect: Expect::Paints,
     },
 ];
 
@@ -115,12 +116,16 @@ fn examples_dir() -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(&dir);
     assert!(
         path.is_dir(),
-        "BREW_EXAMPLES={dir:?} has to name the SDK's examples directory"
+        "BREW_EXAMPLES={dir:?} has to name the platform's examples directory"
     );
     Some(path)
 }
 
-fn load_and_run(path: &std::path::Path) -> Runtime {
+/// Read the image and run its `AEEMod_Load`, with nothing mounted beside it.
+///
+/// [`load_and_run`] adds the two ledgers the CLI mounts; this is the bare load, kept separate so a
+/// test that wants to ask about the image alone can say so.
+fn load_image(path: &std::path::Path) -> Runtime {
     let image = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut rt = Runtime::new();
     // Backend selection: with QUOIN_JIT=1 this whole integration test runs on the Rynarmic backend (build with `--features jit`).
@@ -157,6 +162,20 @@ fn load_and_run(path: &std::path::Path) -> Runtime {
             path.display()
         ),
     }
+    rt
+}
+
+/// The image plus the two ledgers the CLI mounts beside it: the resource container and the guest file
+/// volume.
+///
+/// The platform ships each sample's `.bar` in the sample's own directory, and a sample that reads its art
+/// through either door looks exactly like a host that cannot serve it when neither is mounted. That
+/// is what this suite used to measure: five declarations said "a gap this host owes" while the file
+/// was sitting next to the image, so the red was pointing at the harness rather than at the host.
+fn load_and_run(path: &std::path::Path) -> Runtime {
+    let mut rt = load_image(path);
+    rt.resources.mount_beside(path);
+    rt.volume.mount_beside(path);
     rt
 }
 
@@ -198,7 +217,7 @@ fn stopped(rt: &Runtime, outcome: &Result<u32, Error>) -> Stopped {
         Err(Error::Hle(HleError::Unimplemented { label, .. }))
         | Err(Error::Hle(HleError::Unsupported { what: label })) => Stopped::Named(label.clone()),
         Err(other) => match owed() {
-            // A shipped app that treats the null we handed it for a missing resource as a pointer is
+            // A guest app that treats the null we handed it for a missing resource as a pointer is
             // the app's own bug — a handset with the file on disk never reaches it. But the host has
             // to have said what it could not serve *first*, or the fault is ours, not its.
             Some(why) => Stopped::FaultedAfterGap(why),
@@ -212,7 +231,7 @@ fn stopped(rt: &Runtime, outcome: &Result<u32, Error>) -> Stopped {
 #[test]
 fn each_sample_either_paints_or_stops_on_the_gap_it_declares() {
     let Some(dir) = examples_dir() else {
-        eprintln!("skipped: set BREW_EXAMPLES to the SDK's examples directory to run M4");
+        eprintln!("skipped: set BREW_EXAMPLES to the platform's examples directory to run M4");
         return;
     };
     for app in APPS {
@@ -251,6 +270,15 @@ fn each_sample_either_paints_or_stops_on_the_gap_it_declares() {
             (Expect::GapThenFault(want), Stopped::FaultedAfterGap(got)) => {
                 assert_eq!(want, got, "{} faulted in something else", report());
             }
+            (Expect::StartsWithoutPaint(_), Stopped::Started) => {
+                assert_ne!(rt.applet, 0, "{} has an applet", report());
+                assert!(
+                    !painted(&rt),
+                    "{} paints now, so this declaration is stale: change it to `Paints`\n{}",
+                    app.name,
+                    report()
+                );
+            }
             (want, got) => panic!(
                 "{}: declared {}, the run did {got:?}\n{}",
                 app.name,
@@ -258,6 +286,7 @@ fn each_sample_either_paints_or_stops_on_the_gap_it_declares() {
                     Expect::Paints => "paints".to_string(),
                     Expect::Gap(w) => format!("stops cleanly on {w:?}"),
                     Expect::GapThenFault(w) => format!("faults after {w:?}"),
+                    Expect::StartsWithoutPaint(w) => format!("starts but does not paint ({w})"),
                 },
                 report()
             ),
@@ -271,7 +300,7 @@ fn each_sample_either_paints_or_stops_on_the_gap_it_declares() {
 #[test]
 fn the_paint_check_is_false_until_something_is_drawn() {
     let Some(dir) = examples_dir() else {
-        eprintln!("skipped: set BREW_EXAMPLES to the SDK's examples directory to run M4");
+        eprintln!("skipped: set BREW_EXAMPLES to the platform's examples directory to run M4");
         return;
     };
     let path = dir.join("helloworld").join("helloworld.mod");
@@ -284,15 +313,15 @@ fn the_paint_check_is_false_until_something_is_drawn() {
     assert!(painted(&rt), "and helloworld draws its text");
 }
 
-/// The goal, kept honest and visible: every shipped sample is supposed to start *and* put pixels on
-/// the screen. Today five of seven stop on a gap this host owes, so this is `#[ignore]`d rather
-/// than quietly dropped — run `cargo test -- --ignored` to see how far that still is, and un-ignore
-/// it when it passes.
+/// The goal, kept honest and visible: every reference sample is supposed to start *and* put pixels on
+/// the screen. Today one of seven — `mediaplayer` — starts and draws nothing, so this is `#[ignore]`d
+/// rather than quietly dropped: run `cargo test -- --ignored` to see how far that still is, and
+/// un-ignore it when it passes.
 #[test]
-#[ignore = "the target, not the current state: five samples still stop on gaps this host owes"]
+#[ignore = "the target, not the current state: mediaplayer starts but has not drawn anything yet"]
 fn every_sample_applet_starts_and_paints() {
     let Some(dir) = examples_dir() else {
-        eprintln!("skipped: set BREW_EXAMPLES to the SDK's examples directory to run M4");
+        eprintln!("skipped: set BREW_EXAMPLES to the platform's examples directory to run M4");
         return;
     };
     for app in APPS {
@@ -312,19 +341,24 @@ fn every_sample_applet_starts_and_paints() {
 #[test]
 fn discovery_names_the_id_the_module_compares_against() {
     let Some(dir) = examples_dir() else {
-        eprintln!("skipped: set BREW_EXAMPLES to the SDK's examples directory to run M4");
+        eprintln!("skipped: set BREW_EXAMPLES to the platform's examples directory to run M4");
         return;
     };
     for app in APPS {
         let path = dir.join(app.name).join(format!("{}.mod", app.name));
-        let mut rt = load_and_run(&path);
+        // Unmounted on purpose. With the volume mounted, `helloworld.mif`'s own `cls` becomes
+        // readable and is offered first; the module answers it with an object, so discovery settles
+        // there — and that object faults when it is started. That is a fact about the sample (its
+        // manifest and its module disagree about which class is the applet's), not about this test,
+        // which asks which id the module compares against.
+        let mut rt = load_image(&path);
         let found = rt
             .discover_applet_class()
             .unwrap_or_else(|e| panic!("{}: discovery faulted: {e}", app.name));
         assert_eq!(
             found.cls, app.cls,
-            "{}: the module claims {:#010x} after {} of its own class ids, not {:#010x}",
-            app.name, found.cls, found.tried, app.cls
+            "{}: the module claims {:#010x} after {} of its own class ids (note: {:?}), not {:#010x}",
+            app.name, found.cls, found.tried, found.note, app.cls
         );
         assert_ne!(found.cls, 0, "{} answered the question", app.name);
         assert_eq!(
@@ -340,7 +374,7 @@ fn discovery_names_the_id_the_module_compares_against() {
 #[test]
 fn an_app_that_carries_its_own_id_rejects_the_default() {
     let Some(dir) = examples_dir() else {
-        eprintln!("skipped: set BREW_EXAMPLES to the SDK's examples directory to run M4");
+        eprintln!("skipped: set BREW_EXAMPLES to the platform's examples directory to run M4");
         return;
     };
     for name in ["mediaplayer", "roadwarrior"] {

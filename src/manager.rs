@@ -44,7 +44,7 @@ pub(crate) struct Query {
 /// A filter. **It lists only what the host can actually see**.
 ///
 /// There is deliberately no "playable" entry: the host does not know whether a pack can run (only a
-/// small part of the corpus has been confirmed by a person), and a "playable" mark guessed from a
+/// small part of the sample set has been confirmed by a person), and a "playable" mark guessed from a
 /// name or a warning is exactly the kind of silent success this repository fears most; what can be
 /// filtered is these facts read from the bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +60,9 @@ pub(crate) enum Filter {
     WithArt,
     /// Without an icon: the host cannot read its picture, so the list shows a blank.
     WithoutArt,
-    /// With at least one size witness (the directory name, or its own art).
+    /// With at least one size record (the directory name, or its own art).
     Claimed,
-    /// With no size witness.
+    /// With no size record.
     Unclaimed,
 }
 
@@ -149,8 +149,8 @@ impl Filter {
             Filter::Clean => lang.pick("No warnings", "没警告"),
             Filter::WithArt => lang.pick("With art", "有图"),
             Filter::WithoutArt => lang.pick("No art", "没图"),
-            Filter::Claimed => lang.pick("Size witness", "有尺寸证人"),
-            Filter::Unclaimed => lang.pick("No size witness", "没尺寸证人"),
+            Filter::Claimed => lang.pick("Size record", "有尺寸记录"),
+            Filter::Unclaimed => lang.pick("No size record", "无尺寸记录"),
         }
     }
 
@@ -215,10 +215,10 @@ pub(crate) struct Group {
 impl Plan {
     /// Read `rows` through `query`.
     ///
-    /// O(hits × groups) with a linear scan for the group a hit belongs to rather than a map: this corpus
+    /// O(hits × groups) with a linear scan for the group a hit belongs to rather than a map: this sample set
     /// is 35 rows and the number of games is smaller still, so the scan costs less than the hashing and
     /// the groups come out in the order the rows are in, which is the order a person reading a list
-    /// expects. A corpus in the thousands is the point at which that trade flips, and it is not this one.
+    /// expects. A sample set in the thousands is the point at which that trade flips, and it is not this one.
     pub fn of(rows: &[Row], query: &Query) -> Plan {
         let hits: Vec<usize> = rows
             .iter()
@@ -264,7 +264,7 @@ const MANAGER_SIZE: Vec2 = Vec2::new(1240.0, 720.0);
 const NAV_WIDE: f32 = 132.0;
 const NAV_NARROW: f32 = 42.0;
 
-/// The box a pack's own icon is drawn in. A multiple of the 16x16 pictures every build in this corpus
+/// The box a pack's own icon is drawn in. A multiple of the 16x16 pictures every build in this sample set
 /// carries, because the scale below is an integer one and 2.5 would put the pixels back where
 /// nearest-neighbour cannot help them.
 const ICON_BOX: f32 = 48.0;
@@ -638,6 +638,7 @@ pub fn build(root: &Path, skin: &str, soundfont: Option<&str>) -> Result<Manager
         saves_for: None,
         saves: Vec::new(),
         save_dir: None,
+        saves_device: false,
         playing: None,
         loading: None,
         current: None,
@@ -887,6 +888,10 @@ pub struct Manager {
     saves_for: Option<String>,
     saves: Vec<library::Save>,
     save_dir: Option<PathBuf>,
+    /// Whether the selected pack is installed in the device tree. Its saves live beside the module,
+    /// but this pane has no receipt that would tell a save from the pack's own files, so it names the
+    /// directory without offering to delete anything from it.
+    saves_device: bool,
     /// The game, once one is started. Its screen takes this window's main area — or, when it has one of
     /// its own ([`Manager::game_window`]), a second window this one asked `eframe` for. Either way there
     /// is no second event loop: the guest runs on its own thread and the front end draws what it publishes.
@@ -2492,12 +2497,21 @@ impl Manager {
     fn read_saves(&mut self, at: usize) {
         let mod_path = self.rows[at].entry.mod_path.clone();
         let key = manager_data::key_of(&self.root, &mod_path);
-        self.save_dir = library::default_save_dir(&mod_path);
-        self.saves = self
-            .save_dir
-            .as_deref()
-            .map(library::saves_in)
-            .unwrap_or_default();
+        self.saves_device = library::is_installed_pack(&mod_path);
+        if self.saves_device {
+            // The module directory holds the game and its saves together. Listing it would offer
+            // Delete buttons for program.bin and every other pack file, so the pane names the
+            // directory and stops there until an install receipt can tell the two apart.
+            self.save_dir = Some(crate::store::dir_of(&mod_path));
+            self.saves.clear();
+        } else {
+            self.save_dir = library::default_save_dir(&mod_path);
+            self.saves = self
+                .save_dir
+                .as_deref()
+                .map(library::saves_in)
+                .unwrap_or_default();
+        }
         self.saves_for = Some(key);
     }
 
@@ -2522,6 +2536,13 @@ impl Manager {
                 .monospace()
                 .size(11.0),
         );
+        if self.saves_device {
+            ui.label(self.lang.pick(
+                "This game is installed beside its saves; this pane does not list the device directory yet.",
+                "这个游戏和存档在同一个设备目录里；这个面板暂时不列出设备目录里的文件。",
+            ));
+            return;
+        }
         if self.saves.is_empty() {
             ui.label(self.lang.pick(
                 "This pack has saved nothing yet — play a round and something will appear here.",
@@ -2890,7 +2911,7 @@ impl eframe::App for Manager {
     }
 }
 
-/// One pack's screen, side by side: each witness says its own number and none of them is marked until a
+/// One pack's screen, side by side: each record says its own number and none of them is marked until a
 /// person marks one.
 ///
 /// It is why the picker carries each claim's own evidence sentence rather than three bare numbers —
@@ -2910,7 +2931,7 @@ fn picker(
 ) {
     ui.label(
         egui::RichText::new(lang.pick(
-            "Screen size: each witness says its own number and none is selected. Without a pick, the button below starts at the number it names.",
+            "Screen size: each record says its own number and none is selected. Without a pick, the button below starts at the number it names.",
             "屏幕尺寸：每个证人各说各的，没人被选中。不选就按下面按钮上写的那个启动。",
         ))
         .strong(),
@@ -2918,7 +2939,7 @@ fn picker(
     if row.sizes.is_empty() {
         ui.label(
             egui::RichText::new(lang.pick(
-                "Neither witness spoke for this pack: the directory names no size, and the host can read too few pictures from its containers.",
+                "Neither record spoke for this pack: the directory names no size, and the host can read too few pictures from its containers.",
                 "这个包两个证人都没说话：目录里没写尺寸，宿主能从它容器里读出的图又太少。",
             ))
             .weak(),
@@ -2928,7 +2949,7 @@ fn picker(
         ui.selectable_value(
             pick,
             Some(c.pick()),
-            format!("{} {}x{}", c.witness.name(), c.width, c.height),
+            format!("{} {}x{}", c.claim.name(), c.width, c.height),
         );
         // The evidence rides in the same block as its number, so a claim cannot be read without it.
         ui.label(

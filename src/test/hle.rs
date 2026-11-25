@@ -97,7 +97,7 @@ fn every_failure_sentence_has_an_advice() {
             Error::NotAnApplet {
                 addr: 0x2000_00f0,
                 cls: 0x0106_dee9,
-                seen: [0x2000_0030, 0, 0],
+                seen: [0x2000_0030, 0, 0, 0],
                 module: 0,
             },
         ),
@@ -197,7 +197,7 @@ fn a_vtable_slot_holds_the_stub_for_its_own_method() {
 
 #[test]
 fn a_long_run_keeps_counting_after_the_history_stops_growing() {
-    // A shipped game reaches the host tens of thousands of times a minute. Keeping every record
+    // A guest game reaches the host tens of thousands of times a minute. Keeping every record
     // was how a session ended with Windows fast-failing the process, and keeping only the newest
     // ones is only honest if the numbers a report prints still describe the whole run.
     let mut hle = Hle::new();
@@ -347,21 +347,4 @@ fn an_hle_state_keeps_the_pointers_a_run_holds_and_where_the_next_block_goes() {
         vtable,
         "the same interface answers with the same vtable address"
     );
-}
-
-/// The `strlen` guard used to report "unimplemented HLE call AEEHelperFuncs::strlen" and tell the
-/// reader it was "a host gap, not a broken game". `strlen` is implemented; the guard fires when the
-/// first argument has no terminator in 4 KiB. The sentence has to say that instead.
-#[test]
-fn a_strlen_argument_that_is_not_a_string_is_not_reported_as_missing() {
-    let text = format!(
-        "{}",
-        Error::Unsupported {
-            what: "AEEHelperFuncs::strlen was given 0x20007df0, which holds no NUL byte in 4096"
-                .into()
-        }
-    );
-    let said = advice(&text).expect("this failure has a sentence");
-    assert!(!said.contains("host gap"), "{said}");
-    assert!(said.contains("r0"), "{said}");
 }

@@ -97,5 +97,8 @@ fn jit_backend_matches_the_interpreter_call_by_call() {
         );
     }
     assert_eq!(interp.len(), jit.len(), "the number of calls differs");
-    assert_eq!(interp_summary, jit_summary, "call snapshots match but the stop result differs");
+    assert_eq!(
+        interp_summary, jit_summary,
+        "call snapshots match but the stop result differs"
+    );
 }

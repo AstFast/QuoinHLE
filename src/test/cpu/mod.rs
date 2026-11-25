@@ -215,7 +215,7 @@ fn an_armed_cancel_flag_that_is_never_set_stops_nothing() {
 
 /// `--sample` takes one entry per interval and nothing at all when it was not asked for.
 ///
-/// The unarmed half is the one that matters for every other run in the corpus: the check sits in the
+/// The unarmed half is the one that matters for every other run in the sample set: the check sits in the
 /// interpreter's inner loop, so "armed" must be the only case that writes.
 #[test]
 fn samples_are_taken_on_the_interval_and_only_then() {
@@ -315,7 +315,7 @@ fn the_folded_samples_answer_what_was_busyest_first() {
     );
 }
 
-/// The hook is in the interpreter's own loop, so the claim worth witnessing is that a real run fills
+/// The hook is in the interpreter's own loop, so the claim worth recording is that a real run fills
 /// the ring — a `note` nobody calls passes every unit test above it.
 #[test]
 fn a_running_machine_fills_the_sample_window() {

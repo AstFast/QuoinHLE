@@ -1,8 +1,9 @@
 //! The guest's own requests, really sent: what `--net-proxy` turns on.
 //!
 //! Without that flag this host answers every network question the way a handset with no data
-//! connection does — `IWeb::GetResponse` writes a null response and reports the failure through the
-//! caller's own `AEECallback` — and a run stays byte-for-byte reproducible. With
+//! connection does — `IWeb::GetResponse` lays out a response whose `nCode` is the negative
+//! `WEB_ERROR_CONNECT` and reports it through the caller's own `AEECallback` — and a run stays
+//! byte-for-byte reproducible. With
 //! `--net-proxy HOST:PORT` the request is handed to that local proxy for real, and what comes back
 //! is what the log and (through `IWebResp`) the guest are told. It is a developer flag: it exists so
 //! that the requests a pack makes can be *watched*, and answered by a proxy of the developer's own,

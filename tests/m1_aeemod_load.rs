@@ -1,6 +1,6 @@
 //! M1: a real Qualcomm-built `.mod` must come up against the emulated AEE runtime.
 //!
-//! `helloworld.mod` is linker output from the proprietary SDK samples, so it is not vendored
+//! `helloworld.mod` is linker output from the proprietary Sample builds, so it is not vendored
 //! here; point `BREW_TEST_MOD` at a copy to run the test, which then skips silently when the
 //! variable is absent. What it pins down is the part that cannot be faked: the guest has to
 //! decode its own prologue, walk the host-synthesised `IShell` vtable, dispatch slot 0 through

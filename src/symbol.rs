@@ -47,8 +47,9 @@ pub fn symbolize(hle: &Hle, module: Option<&Loaded>, addr: u32) -> String {
         return format!("<vtable+{:#x}>", addr - layout::VTABLE_BASE);
     }
     // Objects the host handed out: an address here is one of ours, and the interface is what the
-    // caller thinks it is holding.
-    if (layout::OBJECT_BASE..layout::MODULE_BASE).contains(&addr) {
+    // caller thinks it is holding. The arena runs up to the guest heap; the module image is a
+    // separate, lower region (A carrier loader puts it at 0x8000).
+    if (layout::OBJECT_BASE..layout::HEAP_BASE).contains(&addr) {
         if let Some(obj) = hle.object(addr) {
             return format!("<{} object>", obj.iface);
         }

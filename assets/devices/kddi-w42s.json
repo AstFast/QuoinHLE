@@ -1,0 +1,24 @@
+{
+  "_note": "au by KDDI / Sony Ericsson W42S (MSM6550, BREW 3.1.2.42). Screen 240x320 is what the firmware itself names: W42S_NOR.bin carries 'QVGA(240x320)' and the WAP profile 'x-up-devcap-screenpixels: 240,268' (268 + status bar + soft keys = 320). An older handoff says 240x400; no firmware string supports it, and the two sizes measure identically on the packs tried, so the firmware's own number is used. The carrier's private classes still need --carrier kddi on the command line: a device file describes the handset, not the operator.",
+  "version": "1.0",
+  "screen": {
+    "width": 240,
+    "height": 320,
+    "color_depth": 16,
+    "frame_bpp": 16
+  },
+  "text": {
+    "encoding": 253,
+    "text_bytes": false,
+    "font_normal": 20,
+    "font_large": 24
+  },
+  "identity": {
+    "chip_id": "MSM6550",
+    "model_name": "W42S",
+    "manufacturer": "Sony Ericsson",
+    "friendly_name": "au W42S",
+    "firmware_version": "BREW/3.1.2.42",
+    "subscriber_number": "09000000000"
+  }
+}

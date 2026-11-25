@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub const CANCEL_LOOK: u64 = 1 << 16;
 /// How many `--sample` entries a run keeps: the tail, at the same 4 096 the other bounded records in
 /// this host use. At the smallest interval this host accepts (64 instructions) that is a window of 256 k
-/// instructions — a few frames of a shipped pack, which is what "where did it stop" is about.
+/// instructions — a few frames of a guest pack, which is what "where did it stop" is about.
 pub const SAMPLE_CAP: usize = 4096;
 
 pub const FLAG_N: u32 = 1 << 31;
@@ -110,7 +110,7 @@ const JIT_ARENA_MAX_ASK: usize = 1 << 20;
 /// estimate hands it, which means the ceiling can never be the thing that flushes the cache.
 ///
 /// A Thumb module is the one shape this under-sizes (two-byte instructions, twice the bound); no pack
-/// in this corpus is driven Thumb-first — the known Thumb case, cod5, does not run — and
+/// in this sample set is driven Thumb-first — the known Thumb case, cod5, does not run — and
 /// `--jit-arena N` is the answer for one that is.
 ///
 /// The bound is loose on real code, deliberately. `pvz.mod` is 351 152 bytes and reports **2 563**
@@ -441,7 +441,7 @@ pub struct Cpu {
     /// What `--trace` was asked to print, if anything.
     ///
     /// Every retired instruction is the single most useful debugging facility in this project — an ABI
-    /// mistake shows up in it immediately — and it is also tens of thousands of lines for a shipped
+    /// mistake shows up in it immediately — and it is also tens of thousands of lines for a reference
     /// pack's startup, which is more than anyone reads. So the request carries *which* instructions and
     /// *how many*, and a run that prints none of them is the default rather than a special case.
     pub trace: Trace,
@@ -780,7 +780,7 @@ impl Cpu {
     pub fn run_interpreter(&mut self, budget: u64) -> Stop {
         // The ordinary windowed/test run has no breakpoints, watchpoints, samples or trace. The
         // diagnostic path below deliberately checks all four once per instruction; keep that cost
-        // out of the quiet path, which is what a shipped pack actually executes.
+        // out of the quiet path, which is what a guest pack actually executes.
         if !self.per_instruction() {
             return self.run_quiet(budget);
         }
@@ -897,7 +897,7 @@ impl Cpu {
 
     /// The ordinary execution loop: no breakpoints, watchpoints, samples or trace. Keeping this
     /// separate from [`Cpu::run`]'s diagnostic loop removes four per-instruction checks from the
-    /// path a shipped pack actually uses.
+    /// path a guest pack actually uses.
     ///
     /// `pub(crate)` for [`backend::Interpreter`], which is reached only through [`Cpu::run`] — the
     /// one caller that has already answered [`Cpu::per_instruction`]. Asking the same five
@@ -1120,7 +1120,7 @@ pub fn shift_imm(value: u32, kind: Shift, amt: u32, carry_in: bool) -> (u32, boo
             } else {
                 // The carry the architecture leaves is the *last bit shifted out*, which is
                 // bit `amt - 1` — not the sign. They coincide only at the extremes, and the
-                // all-ones value the earlier tests used could never tell them apart. A shipped
+                // all-ones value the earlier tests used could never tell them apart. A reference
                 // pack's `ldrblt ip, [ip, r1, asr #15]` was what found it: 0xffff there has to
                 // leave 1 in C, and taking the sign instead said 0.
                 (((value as i32) >> amt) as u32, bit(amt - 1))
@@ -1157,7 +1157,7 @@ pub fn shift_reg(value: u32, kind: Shift, amt: u32, carry_in: bool) -> (u32, boo
                 // Past a whole word there is no bit that left, so the carry is clear. Unicorn
                 // answers this and the old `amt >= 32` arm did not: it kept saying bit 31 for
                 // every amount above 32, which is a word no immediate can encode and nothing in
-                // the corpus was measured to reach.
+                // the sample set was measured to reach.
                 (0, false)
             } else {
                 (value >> amt, bit(amt - 1))
@@ -1165,7 +1165,7 @@ pub fn shift_reg(value: u32, kind: Shift, amt: u32, carry_in: bool) -> (u32, boo
         }
         Shift::Asr => {
             // The carry is the last bit shifted out — bit `amt - 1` — and not the sign, which is what
-            // [`shift_imm`] already does and what a shipped pack's `asr #15` measured. The two
+            // [`shift_imm`] already does and what a guest pack's `asr #15` measured. The two
             // coincide only for an amount of 32 or more, where there is no last bit left to name and
             // the sign is the answer; that arm keeps the reading this had before.
             if amt >= 32 {

@@ -49,9 +49,20 @@ fn metrics_follow_the_grid() {
     let large = Font::of(g::AEE_FONT_LARGE).unwrap();
     assert_eq!(large.height(), 16, "the same face at 2");
     assert_eq!(large.measure(2), 22, "scaled, not interpolated");
-    // The ids with no face here must be refused, not served by the nearest one.
-    assert_eq!(Font::of(g::AEE_FONT_ITALIC), None);
-    assert_eq!(Font::of(g::AEE_FONT_BOLD_ITALIC), None);
+    // The italic designators are answered upright, at the size and weight they name. The user
+    // slots and an id outside the system range are refused rather than served by the nearest face.
+    assert_eq!(
+        Font::of(g::AEE_FONT_ITALIC).map(|f| (f.scale, f.bold)),
+        Some((1, false))
+    );
+    assert_eq!(
+        Font::of(g::AEE_FONT_BOLD_ITALIC).map(|f| (f.scale, f.bold)),
+        Some((1, true))
+    );
+    assert_eq!(
+        Font::of(g::AEE_FONT_LARGE_ITALIC).map(|f| (f.scale, f.bold)),
+        Some((2, false))
+    );
     assert_eq!(Font::of(g::AEE_FONT_USER_1), None);
     assert_eq!(Font::of(0x1234), None);
     assert!(Font::of(g::AEE_FONT_BOLD).unwrap().bold);

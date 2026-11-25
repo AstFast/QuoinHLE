@@ -501,7 +501,7 @@ impl HeapState {
     fn take<A: Arena>(&self, a: &mut A, node: u32) {
         self.unlink(a, node);
         a.write_word(node, Self::size(a, node));
-        // Newly allocated nodes have a lock count of 1 and no sentinel (`AEEkHeap.h`).
+        // Newly allocated nodes have a lock count of 1 and no sentinel (the heap declarations).
         a.write_half(node + 8, 1);
         a.write_word(node + 4, 0);
     }

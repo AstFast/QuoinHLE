@@ -50,7 +50,7 @@ pub fn is_caution(line: &str) -> bool {
     line.contains(CAUTION_MARK)
 }
 
-/// The first word of the fixup routine, on all 14 `BREW`-headered modules in this corpus and on the
+/// The first word of the fixup routine, on all 14 `BREW`-headered modules in this sample set and on the
 /// store sample. `src/loader.rs` clears the range that ends there, so a module whose word differs is
 /// either not this format or something the loader has never been measured against.
 const FIXUP_PUSH: u32 = 0xe92d_00f0;
@@ -176,14 +176,14 @@ pub struct Census {
 /// * [`AudioCensus::playable`] — the payload was recognised by [`crate::audio::sniff`], which
 ///   *parses* it. This is the count that means "this host could make a sound out of it", and it is
 ///   the only one that can see a clip whose property block names nothing (every `.par` leaf) or names
-///   something else (the corpus files MIDI under the image kind).
-/// * [`AudioCensus::declared`] — the property block named a sound (either SDK sound base, per
+///   something else (the sample set files MIDI under the image kind).
+/// * [`AudioCensus::declared`] — the property block named a sound (either platform sound base, per
 ///   [`crate::audio::names_a_sound`]) and the authority did not recognise the bytes. That is an
 ///   inventory fact, not a capability: an AMR or an MP3 clip, or a file whose extension lies. The name
 ///   is stored trimmed, so `"audio/mid "` joins `audio/mid` rather than starting a line of its own.
 /// * [`AudioCensus::recognised`] — within those, the records whose bytes the same module's byte
 ///   authority places ([`crate::audio::recognises`]).
-///   Still an inventory count — the row says so on the line it prints — but a *witnessed* one, which is
+///   Still an inventory count — the row says so on the line it prints — but a *recorded* one, which is
 ///   the difference between "205 records are called `audio/mpeg`" and "205 records are MP3".
 ///
 /// A payload is counted once and once only, under the authority's name when it has one: the full
@@ -227,7 +227,7 @@ impl AudioCensus {
     }
 }
 
-/// The `BREW` header a shipped module reads for itself at load, and the one fact about it that is
+/// The `BREW` header a guest module reads for itself at load, and the one fact about it that is
 /// checkable without running anything. The offsets and the "does this header describe the file" test are
 /// the loader's (`loader::relocation`, `loader::relocation_describes`) — read here, never re-derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +250,8 @@ pub struct AppInfo {
     pub cls: u32,
     pub id_base: u16,
     pub app_type: u16,
+    pub host_lo: u16,
+    pub host_hi: u16,
     pub flags: u16,
 }
 
@@ -293,7 +295,7 @@ pub struct Probe {
     /// `(file, id, how many strings, the first one)`.
     pub strings: Vec<(String, u32, usize, String)>,
     /// The sounds in the pack, grouped by MIME. See [`AudioCensus`] for why one line carries two
-    /// counts and what each of them is a witness of.
+    /// counts and what each of them is a record of.
     pub audio: Vec<AudioCensus>,
     /// Sibling files a run cannot reach, with the size that explains it.
     pub unmounted: Vec<(String, u64)>,
@@ -306,7 +308,7 @@ pub struct Probe {
     /// separately; the screen inference uses both sets.
     pub pictures: Vec<Picture>,
     pub screen: Option<Screen>,
-    /// The size the pack's *directory name* claims, when somebody wrote one. A hint, not a witness:
+    /// The size the pack's *directory name* claims, when somebody wrote one. A hint, not a record:
     /// this host has been wrong about these before.
     pub hint: Option<(u16, u16)>,
     /// What the host would answer with no `--device` at all.
@@ -354,9 +356,9 @@ impl Probe {
                 // the declaration second because it is what the container chose to say about them.
                 // The declaration is filed under its **trimmed** name, because that is how the same
                 // strings are matched in `IShell::GetHandler`: a container that writes `"audio/mid "`
-                // (the SDK's own constants have had trailing spaces) means the one MIME, and two lines
+                // (the platform's own constants have had trailing spaces) means the one MIME, and two lines
                 // for one name would read as two formats.
-                // `names_a_sound` is the authority module's own reading of the SDK's four MIME bases,
+                // `names_a_sound` is the authority module's own reading of the platform's four MIME bases,
                 // so the 1.x `snd/` spelling is not lost the way a local `starts_with("audio/")` lost
                 // it; and the payload is not counted twice when both speak, because the authority's
                 // name is the one the line is filed under.
@@ -495,10 +497,12 @@ impl Probe {
         });
         out.push(match &self.app_info {
             Some(a) => format!(
-                "  AEEAppInfo: cls={:#010x} wIDBase={} wAppType={:#x} wFlags={:#x} (manifest {})",
+                "  AEEAppInfo: cls={:#010x} wIDBase={} wAppType={:#x} host={}.{} wFlags={:#x} (manifest {})",
                 a.cls,
                 a.id_base,
                 a.app_type,
+                a.host_lo,
+                a.host_hi,
                 a.flags,
                 self.manifest.clone().unwrap_or_else(|| "?".into())
             ),
@@ -674,7 +678,7 @@ impl Probe {
         }
     }
 
-    /// Do the art and the directory name say the same screen? `None` when only one of the two witnesses
+    /// Do the art and the directory name say the same screen? `None` when only one of the two records
     /// speaks, which is a different answer from "they disagree" and must not be counted as one.
     ///
     /// "Same" is width-equal and the canvas **fitting** the claimed height, not height-equal: a pack
@@ -698,7 +702,7 @@ impl Probe {
     /// Is the art this host can see too thin for the width answer to be trusted? `Some` is the warning
     /// in the report, `None` is "the evidence is thick enough".
     ///
-    /// This exists because the census found the asymmetry: **20 of the corpus's 35 builds** are flagged
+    /// This exists because the census found the asymmetry: **20 of the sample set's sample builds** are flagged
     /// here, 16 of them holding nothing but their three manifest icons (widest picture 65x42), one
     /// holding only four small pictures up to 50x50 while its real 320x223 background sits in `i0..i42`
     /// slices the resource readers never see, and three with mounted pictures but no picture wide enough
@@ -736,7 +740,7 @@ impl Probe {
     }
 
     /// How the art's answer and the directory's hint compare. Three cases, because "there is no second
-    /// witness" is not the claim that "the two witnesses disagree".
+    /// record" is not the claim that "the two records disagree".
     pub fn verdict(&self) -> String {
         match (&self.screen, self.hint) {
             (Some(s), Some((w, h))) => {
@@ -765,7 +769,7 @@ impl Probe {
             (None, Some((w, h))) => {
                 format!("the art did not answer; only the directory says {w}x{h}")
             }
-            (None, None) => "neither witness".to_string(),
+            (None, None) => "neither record".to_string(),
         }
     }
 }
@@ -855,6 +859,8 @@ fn app_info_of(raw: &[u8]) -> Option<AppInfo> {
         cls: word(raw, at("cls")?),
         id_base: half("wIDBase")?,
         app_type: half("wAppType")?,
+        host_lo: half("wHostLo")?,
+        host_hi: half("wHostHi")?,
         flags: half("wFlags")?,
     })
 }
@@ -869,7 +875,7 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 
 /// Below this, the art the host can see is too thin for a width answer to be trusted.
 ///
-/// Calibrated on this corpus, not read out of a spec: the 64x64 area is above every pack whose mounted
+/// Calibrated on this sample set, not read out of a spec: the 64x64 area is above every pack whose mounted
 /// art is only its icons (the widest thing three of them hold is 65x42 = 2 730 pixels, and one pack's
 /// mounted pictures top out at 50x50) and below every pack whose width answer matched its own build
 /// directory. A pack whose real art lives in a blob the host never mounts, or in a format it has no
@@ -890,7 +896,7 @@ pub fn infer_screen(pictures: &[Picture]) -> Option<Screen> {
     // span across the canvas starts to look like one.
     //
     // **The widest bar wins, and that is a measured choice with a known cost.** Ranking the bars instead
-    // by the tallest picture drawn under them scores worse on this corpus — 5 agreements against 7 — so
+    // by the tallest picture drawn under them scores worse on this sample set — 5 agreements against 7 — so
     // it is not the rule. The cost is a marquee: a pack that mounts a 693x18 ticker, or a 320x36 one
     // over a 176-wide canvas, gets the ticker's width for its answer, and both are on
     // the disagreement list the report prints. `the_widest_bar_wins_and_a_marquee_steals_the_answer`
@@ -909,7 +915,7 @@ pub fn infer_screen(pictures: &[Picture]) -> Option<Screen> {
     let width = match bar_width {
         Some(b) => b,
         None => {
-            // Nothing spans the canvas, so the next best witness is the height the pictures that are
+            // Nothing spans the canvas, so the next best record is the height the pictures that are
             // big in **both** directions agree on, and the narrowest width carried at that height: a
             // pack that scrolls keeps one strip wider than its screen, and reading the widest of those
             // is how a 531-pixel canvas turns into a 531-pixel handset.

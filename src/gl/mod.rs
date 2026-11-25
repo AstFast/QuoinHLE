@@ -5,7 +5,7 @@
 //! — a vertex is transformed by the fixed-function matrices, clipped to the viewport, rasterized
 //! into a host RGBA buffer, and `eglSwapBuffers` copies that buffer into the device bitmap the
 //! guest already owns. Keeping the pixels in host memory is what makes the path testable without a
-//! window, a driver or a corpus pack.
+//! window, a driver or a sample set pack.
 //!
 //! What is implemented is the part a 3D pack actually reaches: EGL display/config/context/surface,
 //! the matrix stacks, immediate mode, vertex arrays, `DrawArrays`/`DrawElements`, depth, blending,
@@ -22,6 +22,7 @@ use crate::mem::Mem;
 
 type HResult<T> = Result<T, HleError>;
 
+mod diag;
 mod dispatch;
 mod egl;
 mod enums;
@@ -33,6 +34,7 @@ mod state;
 mod surface;
 mod texture;
 pub use egl::Egl;
+pub use diag::GlDrawLog;
 pub(crate) use egl::PROC_NAMES;
 pub(crate) use enums::*;
 
@@ -85,6 +87,11 @@ struct Texture {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    /// Whether `rgba` came from the pack. A name that `GenTextures` handed out and
+    /// `BindTexture` named holds a placeholder until an image arrives; an incomplete texture
+    /// samples as opaque black rather than as that placeholder. `--gl-log`'s `img=` field makes
+    /// the two cases distinguishable.
+    uploaded: bool,
     /// Internal format named when level zero was uploaded; used when binding an EGL surface.
     internal: u32,
     /// Levels 1..n of the mip chain. Level 0 lives in `rgba`; each entry is RGBA8 for
@@ -124,6 +131,9 @@ struct Vertex {
     tex: [[f32; 2]; 4],
     /// Third texture coordinate per unit, used by cube-map sampling.
     tex_r: [f32; 4],
+    /// Fourth texture coordinate per unit. The lookup divides s, t and r by it, so a pack that
+    /// never sets it keeps the coordinates it wrote.
+    tex_q: [f32; 4],
     normal: Vec3,
     point_size: f32,
     /// `GL_OES_matrix_palette`: up to four matrix indices and their weights.
@@ -183,6 +193,8 @@ struct Material {
 }
 
 pub struct Gles {
+    /// The extension/version surface the current device profile advertises.
+    caps: crate::device::GlCaps,
     clear_color: [f32; 4],
     clear_depth: f32,
     viewport: [i32; 4],
@@ -250,7 +262,7 @@ pub struct Gles {
     local_viewer: bool,
     matrix_palette: bool,
     current_palette_matrix: usize,
-    palette_matrices: [Mat4; 32],
+    palette_matrices: [Mat4; 48],
     line_width: f32,
     polygon_offset_factor: f32,
     polygon_offset_units: f32,
@@ -265,6 +277,14 @@ pub struct Gles {
     /// `ReadPixels` writes with pack alignment, exactly as `glPixelStorei` sets them.
     pack_alignment: u32,
     unpack_alignment: u32,
+    /// `glHint` modes, in the order perspective correction, point smooth, line smooth, fog,
+    /// generate mipmap. A hint is advice to the implementation, so nothing in the pipeline
+    /// branches on these — but a pack reads them back and picks its next move from the answer,
+    /// which is why the value has to be kept instead of dropped.
+    hints: [u32; 5],
+    /// Guest addresses of the four `glGetString` answers, filled on first use and handed out
+    /// again afterwards: the string is the implementation's storage, not the caller's.
+    string_cache: [u32; 4],
     matrices: [MatrixStack; 3],
     mode: usize,
     current: Vertex,
@@ -311,6 +331,9 @@ pub struct Gles {
     bound_renderbuffer: u32,
     next_renderbuffer: u32,
     error: u32,
+    /// The `--gl-log` probe for the draw being issued: what it was told, and what it wrote. `None`
+    /// unless the flag named it, and taken back by the caller as soon as the draw returns.
+    probe: Option<Box<diag::DrawProbe>>,
 }
 
 #[derive(Clone, Copy)]
@@ -394,8 +417,13 @@ struct TxVertex {
     eye: Vec3,
     inv_w: f32,
     color: [f32; 4],
+    /// The same vertex shaded with the back material, chosen by triangle winding in `raster`.
+    back_color: [f32; 4],
     tex: [[f32; 2]; 4],
     tex_r: [f32; 4],
+    /// Fourth texture coordinate per unit. The lookup divides s, t and r by it, so a pack that
+    /// never sets it keeps the coordinates it wrote.
+    tex_q: [f32; 4],
     fog: f32,
     point_size: f32,
 }
@@ -408,8 +436,12 @@ struct ClipVertex {
     /// Eye-space position, which is the space `ClipPlanef` equations live in.
     eye: Vec3,
     color: [f32; 4],
+    back_color: [f32; 4],
     tex: [[f32; 2]; 4],
     tex_r: [f32; 4],
+    /// Fourth texture coordinate per unit. The lookup divides s, t and r by it, so a pack that
+    /// never sets it keeps the coordinates it wrote.
+    tex_q: [f32; 4],
     fog: f32,
     point_size: f32,
 }

@@ -5,7 +5,7 @@
 //! seventy-odd thousand friends), and [`crate::hle::Hle::downcalls`] is every branch the host made
 //! back into the module (the applet's own event handler, mostly). Those two histories are kept
 //! *flat* and *capped*: `Hle::HISTORY` is 4096 records and half of them are dropped when a run
-//! passes that, which is the price of not letting a shipped game grow the process until Windows
+//! passes that, which is the price of not letting a guest game grow the process until Windows
 //! fast-fails it. So they answer "what happened lately" and they cannot answer "what did this run
 //! spend itself on".
 //!
@@ -55,7 +55,7 @@ pub const MAX_DEPTH: usize = 128;
 
 /// How many distinct nodes one run may build.
 ///
-/// A shipped run reaches a few thousand distinct (parent, callee) pairs — there are 2132 methods in
+/// A reference run reaches a few thousand distinct (parent, callee) pairs — there are 2132 methods in
 /// the ABI table and a pack uses a small fraction of them from a handful of parents. This ceiling
 /// exists for the run that does *not* look like that (a pack computing a dispatch address), and it
 /// is reported rather than silently absorbing the overflow.

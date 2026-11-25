@@ -15,7 +15,7 @@ pub const IID_FORCEFEED: u32 = 0x0101_eb0b;
 /// clears the caller's slot on the way.
 pub const AEE_ECLASSNOTSUPPORT: u32 = 3;
 /// `AEE_EFAILED`(1) — `GetBitmap` with nothing decoded, and `Write(pBuf = 0)` with nothing fed. Both are
-/// the shipped one-byte answers, not this host's choice.
+/// the reference one-byte answers, not this host's choice.
 pub const AEE_EFAILED: u32 = 1;
 /// `AEE_RO_COPY`(2). `JPEGDecoder_GetRop` is a four-byte body — `return 2` — read by nothing at all, and
 /// it is right: a baseline JPEG names no transparent pixel, so the default raster op is a copy.

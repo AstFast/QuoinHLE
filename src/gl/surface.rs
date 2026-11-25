@@ -3,7 +3,7 @@
 use super::*;
 
 impl Surface {
-    pub(super) fn new(width: u32, height: u32, kind: SurfaceKind) -> Self {
+    pub(crate) fn new(width: u32, height: u32, kind: SurfaceKind) -> Self {
         let n = (width.max(1) * height.max(1)) as usize;
         Surface {
             width: width.max(1),

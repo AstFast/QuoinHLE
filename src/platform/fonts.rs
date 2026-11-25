@@ -5,7 +5,7 @@ use std::path::Path;
 /// The font files this host looks for, in the order it prefers them.
 ///
 /// A person's own font comes first — the manager's saved choice, then anything in the host's
-/// `fonts` directory — a face the build shipped in `ui-fonts` comes next, and the OS's own faces
+/// `fonts` directory — a face the build reference in `ui-fonts` comes next, and the OS's own faces
 /// last. The order is a preference rather than a filter: `load_cjk_fonts` reads the first one and,
 /// when that face turns out to be Latin-only (a bundled webfont usually is), keeps going until it
 /// finds one that can draw Chinese and loads that one behind it.

@@ -16,6 +16,13 @@ pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 pub const PAGE_MASK: u32 = (PAGE_SIZE as u32) - 1;
 
+/// The page every unmapped read answers from under `--compat unmapped-read`.
+///
+/// One shared page rather than a mapping: the guest can read it and cannot write it (it is not in
+/// the page table at all — [`Mem::at`] substitutes it on the way out), so a pack that walks off the
+/// end of its image gets zeros for as long as it wants them at no memory cost.
+static COMPAT_ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
 /// Super-page shift: 1 MiB, so 256 4 KiB pages share one contiguous run of storage (see [`Super`]).
 const SUPER_SHIFT: u32 = 20;
 const SUPER_SIZE: usize = 1 << SUPER_SHIFT;
@@ -247,7 +254,7 @@ pub struct WatchHit {
 impl WatchHit {
     /// The call to record for an access attributed to `by`. A downcall runs guest instructions while a
     /// host call is still in flight, and the CPU re-asserts [`WatchBy::Guest`] for each of them — so
-    /// the call in flight is only a true witness for the accesses the *host* made. Naming the outer
+    /// the call in flight is only a true record for the accesses the *host* made. Naming the outer
     /// `IFile::Read` on a store the pack's own code issued would blame the wrong party outright.
     pub(crate) fn call_for(by: WatchBy, in_flight: &Option<WatchCall>) -> Option<WatchCall> {
         match by {
@@ -353,6 +360,10 @@ pub struct Mem {
     /// the free list and the high-water — lives in the guest's own pages, because that is where
     /// `AEEkHeap` keeps it and a pack that peeks at `p - 12` sees the same words a handset wrote.
     heap: HeapState,
+    /// A pack declaration (`compat.json`'s `slack_fill: "newline"`): the unused bytes after a
+    /// payload read as `0x0A`. A line reader that walks past a text block instead of checking its
+    /// length then stops at the block's own boundary. Off unless the pack asks for it.
+    slack_newline: bool,
     /// When each block was given back, by node address, so a report can say whether the space a
     /// later allocation landed on is fresh or recycled. Report-only: nothing in the policy reads it.
     freed_at: std::collections::HashMap<u32, u64>,
@@ -409,6 +420,15 @@ pub struct Mem {
     pub watch_steps: Cell<u64>,
     /// Set once the arena record reached [`WATCH_LIMIT`] and started dropping events.
     pub watch_arena_capped: Cell<bool>,
+    /// `--compat unmapped-read`: answer an unmapped read with zero instead of faulting.
+    ///
+    /// Off unless a run asks for it, and deliberately so. A handset's memory map is a continuous
+    /// RAM: a pack that reads past the end of its own image gets whatever was there, which is
+    /// usually zero and never a data abort. This host maps exactly what it was asked to, so the
+    /// same read faults — correct about the address, wrong about the machine. Turning this on
+    /// trades that accuracy for "let the pack live", which is a decision the operator makes per
+    /// run, not one this file makes for them: see [`Mem::set_compat_read_zero`].
+    pub compat_read_zero: bool,
 }
 
 impl Default for Mem {
@@ -426,6 +446,7 @@ impl Mem {
             map_generation: 0,
             window_generation: 0,
             heap: HeapState::default(),
+            slack_newline: false,
             freed_at: std::collections::HashMap::new(),
             touch_high: 0,
             #[cfg(test)]
@@ -443,7 +464,14 @@ impl Mem {
             watch_arena: RefCell::new(Vec::new()),
             watch_steps: Cell::new(0),
             watch_arena_capped: Cell::new(false),
+            compat_read_zero: false,
         }
+    }
+
+    /// `--compat unmapped-read`: answer unmapped reads with zero. See [`Mem::compat_read_zero`]
+    /// for what that trades away; stores are unaffected and still fault.
+    pub fn set_compat_read_zero(&mut self, on: bool) {
+        self.compat_read_zero = on;
     }
 
     /// Give the guest heap its span, and `AEEkHeap_Init` it: a twenty-byte header and one free node
@@ -466,6 +494,13 @@ impl Mem {
         self.heap = heap;
         #[cfg(test)]
         self.refresh_heads();
+    }
+
+    /// Make the spare bytes after every payload read as `0x0A`, for a pack whose sidecar asks for
+    /// it. This is a declared compatibility answer, not a default: without the declaration the heap
+    /// keeps whatever the arena held.
+    pub fn set_slack_newline(&mut self, on: bool) {
+        self.slack_newline = on;
     }
 
     /// The top of the heap's span, as the run was given it. `AEEHeap_GetRAMFree`-style answers and
@@ -609,7 +644,15 @@ impl Mem {
     /// The byte an address lives in, or the fault the guest would take.
     #[inline]
     fn at(&self, addr: u32) -> MResult<&[u8; PAGE_SIZE]> {
-        self.page(addr).ok_or(Fault::Unmapped { addr })
+        match self.page(addr) {
+            Some(page) => Ok(page),
+            // `--compat unmapped-read`: a handset reads the RAM behind the address, so a pack that
+            // runs off the end of its image keeps going with zeros. Answering from one shared zero
+            // page is the same thing without mapping 4 GiB of it. Stores still fault — this is
+            // about a read the machine would have tolerated, not about inventing memory to write.
+            None if self.compat_read_zero => Ok(&COMPAT_ZERO_PAGE),
+            None => Err(Fault::Unmapped { addr }),
+        }
     }
 
     /// Cap on the page spans handed to the JIT for inlining (aligned with Rynarmic's `MAX_WINDOWS`).
@@ -739,7 +782,9 @@ impl Mem {
         for page in start..=end {
             let si = (page >> (SUPER_SHIFT - PAGE_SHIFT)) as usize;
             self.ensure_super(si);
-            let sup = self.supers[si].as_mut().expect("ensure_super has just created it");
+            let sup = self.supers[si]
+                .as_mut()
+                .expect("ensure_super has just created it");
             let pi = (page & (SUPER_PAGES as u32 - 1)) as usize;
             if !sup.mapped_bit(pi) {
                 // A first mapping clears; mapping the same page again keeps the contents (old
@@ -1436,6 +1481,7 @@ impl Mem {
             // An exact-size realloc hands nothing over, and the watch record must not say it did.
             if handed {
                 self.note_alloc(at, len);
+                self.fill_slack(at, len);
             }
         }
         #[cfg(test)]
@@ -1453,6 +1499,24 @@ impl Mem {
         }
     }
 
+    /// The bytes between the end of the request and the next node header. The allocator rounds a
+    /// payload up to four bytes; those spare bytes belong to this block's node, not to the caller,
+    /// so writing a terminator there cannot damage the next node. A declared `slack_fill` uses them
+    /// to stop a line reader that walks past its own text instead of checking a length.
+    fn fill_slack(&mut self, at: u32, len: u32) {
+        if !self.slack_newline {
+            return;
+        }
+        let slack = (len.saturating_add(3) & !3).saturating_sub(len);
+        if slack == 0 {
+            return;
+        }
+        self.map(at + len, slack);
+        for i in 0..slack {
+            let _ = self.write_u8(at + len + i, 0x0a);
+        }
+    }
+
     /// The one entry point the delivered allocator needs, with refusal bookkeeping around it.
     fn heap_block(&mut self, len: u32, clear: bool) -> MResult<u32> {
         let heap = self.heap;
@@ -1463,6 +1527,7 @@ impl Mem {
         match at {
             Some(at) => {
                 self.note_alloc(at, len);
+                self.fill_slack(at, len);
                 #[cfg(test)]
                 self.refresh_heads();
                 Ok(at)
@@ -1549,8 +1614,8 @@ impl Mem {
         if let Some(&head) = heads.get(at) {
             if head < end {
                 panic!(
-                    "a write of {len} byte(s) at {start:#010x} lands on the node header at {head:#010x} (+{:#x} into it): the heap keeps twelve bytes of its own metadata there, and this store is not the allocator's",
-                    start - head
+                    "a write of {len} byte(s) at {start:#010x}..{end:#010x} lands on the node header at {head:#010x}..{:#010x}: the heap keeps twelve bytes of its own metadata there, and this store is not the allocator's",
+                    head + heap::NODE
                 );
             }
         }
@@ -1774,7 +1839,10 @@ impl Mem {
             let sup = supers[si].as_mut().expect("just created");
             let pi = page & (SUPER_PAGES - 1);
             let off = pi * PAGE_SIZE;
-            let bytes: [u8; PAGE_SIZE] = st.take(PAGE_SIZE)?.try_into().expect("the page is always 4 KiB");
+            let bytes: [u8; PAGE_SIZE] = st
+                .take(PAGE_SIZE)?
+                .try_into()
+                .expect("the page is always 4 KiB");
             sup.bytes_mut()[off..off + PAGE_SIZE].copy_from_slice(&bytes);
             sup.set_mapped_bit(pi);
         }

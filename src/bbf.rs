@@ -1,4 +1,4 @@
-//! The delivered bitmap-font container: `BBF`, as `AEEBBF.h` describes it and the three
+//! The delivered bitmap-font container: `BBF`, as the font declarations describes it and the three
 //! `*_NewFromBBF` bodies in `AEEBitFont.c`, `AEEVarBitFont.c` and `AEEMonoBitFont.c` read it.
 //!
 //! A BBF file is one header followed by four sections, each starting on a 32-bit boundary:
@@ -63,6 +63,21 @@ pub struct Header {
 pub struct Range {
     pub base: u16,
     pub count: u16,
+}
+
+/// What a range table's keys name.
+///
+/// A face the host builds — the 5x8 grid and the system font it rasterizes — is keyed by Unicode
+/// code points. A face a handset reference is keyed by `AECHAR` units, which are the device's own
+/// encoding and whose byte order is the guest's. The two cannot be told apart from the file's
+/// numbers alone (a device unit such as `0xcd82` also names a Unicode code point), so a loader that
+/// knows says with [`Bbf::with_key_space`]; a file parsed without that hint is Unicode-keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySpace {
+    /// Keys are Unicode code points.
+    Unicode,
+    /// Keys are `AECHAR` units in the device's encoding.
+    Device,
 }
 
 /// What went wrong while reading a file.
@@ -137,6 +152,8 @@ enum Widths {
 pub struct Bbf {
     header: Header,
     ranges: Vec<Range>,
+    /// What the range table is addressed by; see [`KeySpace`].
+    key_space: KeySpace,
     widths: Widths,
     bitmap: std::sync::Arc<[u8]>,
     /// Bytes per bitmap row, padded to a 32-bit boundary.
@@ -175,6 +192,7 @@ impl Bbf {
             return Err(Error::BadRanges);
         }
         let ranges = read_ranges(&bytes[ranges_at..widths_at], header.range_count);
+        let key_space = KeySpace::Unicode;
         let (widths, widths_len, _data_end, cell_height, half_widths) = match header.version {
             0 => {
                 let encoded = header.width_count as usize;
@@ -266,6 +284,7 @@ impl Bbf {
         Ok(Bbf {
             header,
             ranges,
+            key_space,
             widths,
             bitmap: bytes[bitmap_at..bitmap_end].into(),
             pitch,
@@ -300,8 +319,62 @@ impl Bbf {
         self.header.glyph_count
     }
 
-    /// The glyph a code unit maps to, or `None` when the range table has no entry for it.
+    /// What the range table is addressed by.
+    pub fn key_space(&self) -> KeySpace {
+        self.key_space
+    }
+
+    /// Name the key space instead of accepting the parsed default.
     ///
+    /// A face the host rasterized itself is Unicode-keyed by construction. A face read from a
+    /// handset is keyed by the device's units, which the file does not identify; the loader that
+    /// knows what it read says so here.
+    pub fn with_key_space(mut self, key_space: KeySpace) -> Self {
+        self.key_space = key_space;
+        self
+    }
+
+    /// A copy with every ink pixel extended one column to the right, within its own cell.
+    ///
+    /// This is the host's synthetic bold for a CJK face whose source font has no bold cut — the
+    /// same one-column thickening the built-in grid's bold applies to its five-bit rows. Only a
+    /// version-2 single-cell face is dilated: a variable-width face is not laid out on a fixed
+    /// grid, and a pixel at one cell's edge must not bleed into its neighbour.
+    pub fn emboldened(&self) -> Bbf {
+        let Widths::Cell(cell) = &self.widths else {
+            return self.clone();
+        };
+        let cell = *cell as usize;
+        if cell == 0 {
+            return self.clone();
+        }
+        let width = self.header.width as usize;
+        let height = self.header.height as usize;
+        let pitch = self.pitch;
+        let mut bytes = self.bitmap.to_vec();
+        let cols = width / cell;
+        for row in 0..height {
+            let base = row * pitch;
+            for col in 0..cols {
+                let x0 = col * cell;
+                let x1 = (x0 + cell).min(width);
+                if x1 <= x0 + 1 {
+                    continue;
+                }
+                // Right to left, so a pixel this pass sets is not itself a source.
+                for x in (x0..x1 - 1).rev() {
+                    if bytes[base + x / 8] & (0x80 >> (x % 8)) != 0 {
+                        bytes[base + (x + 1) / 8] |= 0x80 >> ((x + 1) % 8);
+                    }
+                }
+            }
+        }
+        let mut out = self.clone();
+        out.bitmap = bytes.into();
+        out
+    }
+
+    /// The glyph a code unit maps to, or `None` when the range table has no entry for it.
     /// This is `CharToGlyph` from `AEEBitFont.c`, including its two cursor entries. A code unit
     /// the table does not name is *not* an error yet: the caller substitutes
     /// [`Header::undef_glyph`], which is what the delivered `GetGlyph` does.

@@ -51,11 +51,51 @@ impl Runtime {
         Ok(())
     }
 
+    /// The `AEECallback` that stands for a thread's resume hook, made on first use.
+    ///
+    /// The struct is real guest memory laid out from the ABI tables, because the pack holds it and
+    /// hands it to whatever it is blocking on (a timer, `IDispatcher`, `IShell::Resume`).
+    /// `pfnNotify` stays 0 on purpose: a handset keeps the AEE's own context switch there rather
+    /// than app code, which is why the header warns "Do not call `CALLBACK_Init` on the resulting
+    /// AEECallback". [`Runtime::resume`] therefore finds the thread by the struct's address instead
+    /// of calling through a pointer that was never the app's to make. `Start` hands this same
+    /// record to the dispatcher for the thread's first turn, exactly as the delivered
+    /// `IThread_Start` calls `IShell::Resume` on it.
+    fn thread_resume_cbk(&mut self, idx: usize) -> Result<u32, Error> {
+        let known = self.threads[idx].resume_cbk;
+        if known != 0 {
+            return Ok(known);
+        }
+        let size = abi::struct_info("_AEECallback")
+            .map(|s| s.size)
+            .unwrap_or(28);
+        let pcb = self.heap_alloc(size)?;
+        if pcb == 0 {
+            // A pointer-shaped answer has to signal failure with the null pointer. The body that
+            // would say which is not in this set (`CThread_GetResumeCBK`: 0 definitions, 0
+            // references), so answering an error code here — as this arm did until the
+            // partial-answer audit read it — would hand the caller `2` as an address.
+            return Ok(0);
+        }
+        for off in 0..size {
+            self.cpu.mem.write_u8(pcb + off, 0)?;
+        }
+        self.threads[idx].resume_cbk = pcb;
+        Ok(pcb)
+    }
+
     /// Every `IThread` slot. A thread on this host is a saved [`Context`] plus a stack the pack sized
-    /// itself, and the switch happens only where the guest hands the machine over, because
-    /// The header
-    /// here to model, and a host OS thread would cost a scripted run the reproducibility it exists for.
-    pub(crate) fn ithread(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    /// itself. The switch happens only where the guest hands the machine over, and a thread is
+    /// entered only by a dispatch of its resume callback — the delivered `IThread_Start` queues that
+    /// callback instead of calling the body (see the `Start` arm). A host OS thread would cost a
+    /// scripted run the reproducibility it exists for.
+    pub(crate) fn ithread(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -111,6 +151,13 @@ impl Runtime {
                 if pfn == 0 {
                     return Ok(g::AEE_EBADPARM);
                 }
+                // The resume record is made before the stack so a failed stack allocation cannot
+                // leave a started thread with no way to be entered. It is the same struct
+                // `GetResumeCBK` hands out, embedded in the delivered object.
+                let pcb = self.thread_resume_cbk(idx)?;
+                if pcb == 0 {
+                    return Ok(g::AEE_ENOMEMORY);
+                }
                 // The delivered body's literal pool says `0x803`: two kilobytes of system-call room
                 // and three bytes so the rounding does not lose any of the caller's own.
                 let need = stack_sz
@@ -146,15 +193,21 @@ impl Runtime {
                 self.cpu.r = caller.r;
                 self.cpu.cpsr = caller.cpsr;
                 self.cpu.pc = caller.pc;
-                let t = &mut self.threads[idx];
-                t.ctx = ctx;
-                t.stack = stack;
-                t.state = ThreadState::Running;
-                // The new thread runs now, and `Start` does not answer until it blocks. That ordering
-                // is the handset's, not a simplification: `IThread::Start` on a cooperative scheduler
-                // hands the machine over, and the applet that started a thread which never yields has
-                // no applet to blame for what it then waits for.
-                self.run_thread(idx)?;
+                {
+                    let t = &mut self.threads[idx];
+                    t.ctx = ctx;
+                    t.stack = stack;
+                    // Started, not running: the delivered thread begins parked in the same state a
+                    // `Suspend` leaves it in. The first turn is a dispatch of its resume callback.
+                    t.state = ThreadState::Suspended;
+                }
+                // The delivered `IThread_Start` ends by handing the thread's resume callback to the
+                // shell — `IShell::Resume(pShell, GetResumeCBK(me))` — and answering SUCCESS. It
+                // never calls `pfStart` itself. The dispatcher's dispatch of that callback is the
+                // only door a thread is entered through, which is what keeps the running thread and
+                // the guest's idea of the current thread from drifting apart. `Runtime::resume`
+                // is the other end of this queue.
+                self.dispatcher_resume(pcb, false)?;
                 Ok(g::AEE_SUCCESS)
             }
             "Exit" => {
@@ -177,15 +230,18 @@ impl Runtime {
                 Ok(g::AEE_SUCCESS)
             }
             "Suspend" => {
+                // The delivered body is one gate: `if (!me->bCurThread) return;` — and that flag is
+                // set only while the dispatcher has this thread's own frame on the machine. A call
+                // from another thread (or from the primordial) changes nothing, not even the state,
+                // which is why it may keep polling without parking someone else's thread.
+                if self.running_thread != this {
+                    return Ok(0);
+                }
                 if self.threads[idx].state != ThreadState::Running {
                     return Ok(0);
                 }
                 self.threads[idx].state = ThreadState::Suspended;
-                if self.running_thread == this {
-                    // The header's sentence is the whole contract: this "returns the execution state to
-                    // that of the primordial BREW thread", so the caller of `Start` is what runs next.
-                    self.thread_yield = Some(this);
-                }
+                self.thread_yield = Some(this);
                 Ok(0)
             }
             "Join" => {
@@ -208,31 +264,9 @@ impl Runtime {
             }
             "GetResumeCBK" => {
                 // The struct is real guest memory laid out from the ABI tables, because the pack holds
-                // it and hands it to whatever it is blocking on. `pfnNotify` stays 0 on purpose: a
-                // handset keeps the AEE's own resume stub there rather than app code, which is why the
-                // header warns "Do not call `CALLBACK_Init` on the resulting AEECallback". So
-                // [`Runtime::resume`] finds the thread by the struct's address instead of calling
-                // through a pointer that was never the app's to make.
-                let known = self.threads[idx].resume_cbk;
-                if known != 0 {
-                    return Ok(known);
-                }
-                let size = abi::struct_info("_AEECallback")
-                    .map(|s| s.size)
-                    .unwrap_or(28);
-                let pcb = self.heap_alloc(size)?;
-                if pcb == 0 {
-                    // A pointer-shaped answer has to signal failure with the null pointer. The body
-                    // that would say which is not in this set (`CThread_GetResumeCBK`: 0 definitions,
-                    // 0 references), so answering an error code here — as this arm did until the
-                    // partial-answer audit read it — would hand the caller `2` as an address.
-                    return Ok(0);
-                }
-                for off in 0..size {
-                    self.cpu.mem.write_u8(pcb + off, 0)?;
-                }
-                self.threads[idx].resume_cbk = pcb;
-                Ok(pcb)
+                // it and hands it to whatever it is blocking on. See [`Runtime::thread_resume_cbk`]
+                // for why `pfnNotify` stays zero and how the state change behind it is recognised.
+                self.thread_resume_cbk(idx)
             }
             _ => Err(Error::Hle(unimplemented())),
         }
@@ -370,7 +404,13 @@ impl Runtime {
     /// `EVT_WDG_WINDOWSTATUS`". Nothing in this host fails a window after the fact — there is no
     /// compositor to lose it — so no such event is ever sent, and that is a fact about the host rather than a
     /// slot left unhandled.
-    pub(crate) fn iwindowmgr0(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn iwindowmgr0(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -472,7 +512,13 @@ impl Runtime {
     /// (,), and anything else needs a privilege this host does not model. Since the one
     /// applet here is the only class it knows, an id that is neither zero nor that applet is the
     /// "invalid class ID" the header answers `EBADPARM` for.
-    pub(crate) fn ialarmmgr(&mut self, id: u32, this: u32, label: &str, name: &str) -> HResult<u32> {
+    pub(crate) fn ialarmmgr(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> HResult<u32> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -699,7 +745,13 @@ impl Runtime {
     }
 
     /// `ISignal` — the notification side, four slots of which one is this host's to answer.
-    pub(crate) fn isignal(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn isignal(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -779,7 +831,13 @@ impl Runtime {
     }
 
     /// Every `IHID` slot: the console's human-interface devices, which for this host is one joystick.
-    pub(crate) fn ihid(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ihid(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -795,7 +853,7 @@ impl Runtime {
             }
             "GetConnectedDevices" => {
                 // `(nDeviceType, pnDevHandles, nLen, pnDevHandlesLenReq)`. A caller sizes its own array
-                // first — `GetConnectedDevices(type, NULL, 0, &n)` — and the SDK's gamepad layer does
+                // first — `GetConnectedDevices(type, NULL, 0, &n)` — and the platform's gamepad layer does
                 // exactly that, then branches on the count rather than on the code. Sizing a list the
                 // host has is not a failure, so the count is answered and `AEE_SUCCESS` returned; and a
                 // type this console has no device for is answered with a count of zero, which is the
@@ -846,7 +904,7 @@ impl Runtime {
             "GetNextConnectEvent" => {
                 // `(pnDevHandle, pnStatus, pbDroppedEvents)`, and every one of the three may be NULL:
                 // the gamepad layer's own drain call is `GetNextConnectEvent(NULL, NULL, NULL)`.
-                // `nStatus` is 0 for "this device is here" — the SDK's sample compares it against
+                // `nStatus` is 0 for "this device is here" — the platform's sample compares it against
                 // `AEE_SUCCESS` before creating the device, so a non-zero here reads as a removal.
                 let [phandle, pstatus, pdropped] = self.args()?;
                 if self.pads[at].announced {
@@ -883,7 +941,13 @@ impl Runtime {
     }
 
     /// Every `IHIDDevice` slot for the virtual pad.
-    pub(crate) fn ihiddevice(&mut self, id: u32, this: u32, label: &str, name: &str) -> Result<u32, Error> {
+    pub(crate) fn ihiddevice(
+        &mut self,
+        id: u32,
+        this: u32,
+        label: &str,
+        name: &str,
+    ) -> Result<u32, Error> {
         let unimplemented = || HleError::Unimplemented {
             id,
             label: label.to_string(),
@@ -964,7 +1028,7 @@ impl Runtime {
                 if info != 0 {
                     self.clear_struct("AEEHIDButtonInfo", info)?;
                     self.put_int("AEEHIDButtonInfo", info, "nButtonID", button as i32)?;
-                    // `nState` is compared `== TRUE` and `== FALSE` by the SDK's own handler, so it
+                    // `nState` is compared `== TRUE` and `== FALSE` by the platform's own handler, so it
                     // carries 1 for down and 0 for up and nothing else.
                     self.put_int("AEEHIDButtonInfo", info, "nState", i32::from(down))?;
                     self.put_int("AEEHIDButtonInfo", info, "nButtonUID", uid as i32)?;
@@ -1185,7 +1249,7 @@ impl Runtime {
     }
 
     /// `AClock_Redraw`, drawn with the host's own `IGraphics` primitives —
-    /// the same three shapes the shipped body draws: a disc for the face (when no picture covers it),
+    /// the same three shapes the documented behaviour draws: a disc for the face (when no picture covers it),
     /// the picture itself, then a line for the seconds and two quads for the other hands.
     pub(crate) fn aclock_redraw(&mut self, this: u32) -> HResult<u32> {
         let clock = self
@@ -1409,5 +1473,4 @@ impl Runtime {
         self.cpu.mem.write_u32(cb + at("pfnCancel"), 0)?;
         Ok(self.cpu.mem.write_u32(cb + at("pCancelData"), 0)?)
     }
-
 }

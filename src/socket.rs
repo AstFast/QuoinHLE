@@ -5,7 +5,7 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 
 /// `NET_ERROR_BASE` — 3.1.2 the header. The names are that header's; the numbers are what
-/// the shipped bodies store in `[+180]`, so the numbers are what the tests pin.
+/// the platform's own routines store in `[+180]`, so the numbers are what the tests pin.
 pub const NET_ERROR_BASE: u32 = 0x200;
 /// `AEE_NET_EBADF` "Invalid socket descriptor" — the `[+184]` bit0 gate, in every slot but `OpenEx`.
 pub const EBADF: u32 = NET_ERROR_BASE + 0x02;
@@ -77,13 +77,13 @@ pub const CLS_SOCKPORT: u32 = 0x01012d97;
 /// out `me + 4`; **this** object's pool does not name it, so asking a host socket for the `ISocket`
 /// face is a `3`, not a `13`.
 pub const CLS_SOCKET: u32 = 0x0100102d;
-/// The three other ids in the shipped `QueryInterface` list: `AEEIID_IQI`, `AEECLSID_SOURCE` (which is
+/// The three other ids in the reference `QueryInterface` list: `AEEIID_IQI`, `AEECLSID_SOURCE` (which is
 /// why an `ISource`-shaped caller works on this object) and `AEECLSID_PORT`.
 pub const IID_IQI: u32 = 0x01000001;
 pub const CLS_SOURCE: u32 = 0x01001012;
 pub const CLS_PORT: u32 = 0x01001018;
 
-/// The two families `OpenEx` accepts; anything else answers `EINVAL`. The 3.1.2 SDK declares neither —
+/// The two families `OpenEx` accepts; anything else answers `EINVAL`. The 3.1.2 platform declares neither —
 /// its only socket-bearing header (72 018 bytes, 317 "sock" hits) has neither these nor
 /// the interfaces — so the two numbers rest on the bodies alone.
 pub const FAMILY_LOCAL: u16 = 1;
@@ -101,18 +101,18 @@ pub const DATAGRAMS: usize = 4;
 /// loopback socket is ever handed a reserved port.
 pub const PORT_FLOOR: u16 = 0x400;
 /// `EventOccurred`'s two bits, named by 3.1.2 the header (`AEE_NET_WRITE_EVENT 0x01`,
-/// `AEE_NET_READ_EVENT 0x02`). The shipped body fires the **writeable** chain for bit0 and the
+/// `AEE_NET_READ_EVENT 0x02`). The documented behaviour fires the **writeable** chain for bit0 and the
 /// **readable** chain for bit1; `Close` sends `3`, both.
 pub const EVENT_WRITE: u32 = 0x01;
 pub const EVENT_READ: u32 = 0x02;
 /// The value a chain entry carries in its notify slot when the entry is a **socket source** rather
-/// than a caller's callback block. The shipped source registers `SockSource_ReadableCB`, a function of
+/// than a caller's callback block. The published description registers `SockSource_ReadableCB`, a function of
 /// the runtime itself — so what the chain has to remember is not an address but the fact that waking
 /// this entry means draining that source's own list. The number itself carries no meaning; the arm
 /// that parks it is the only reader, and it only asks whether the slot is non-zero.
 pub const RUNTIME_NOTIFY: u32 = 1;
 
-/// One slot's answer, with everything the shipped body did beside it.
+/// One slot's answer, with everything the documented behaviour did beside it.
 ///
 /// `error` distinguishes the two things a reader would otherwise merge: `Some(n)` is "the body wrote
 /// `n` into `[+180]`" — including `Some(0)`, which several success paths do — and `None` is "the field
@@ -204,7 +204,7 @@ pub enum Pipe {
     Datagrams { queue: Vec<Datagram> },
 }
 
-/// What a slot reads and writes about one object — the shipped record's fields, by their offsets.
+/// What a slot reads and writes about one object — the reference record's fields, by their offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// `[+8]`. The object handed to the constructor, held by one reference.
@@ -249,7 +249,7 @@ impl Default for Record {
 }
 
 /// What a successful `Connect` hands the runtime: the slot of the **server-side socket it created**,
-/// and the chains to run — which are not in the caller's return value, because the shipped body fires
+/// and the chains to run — which are not in the caller's return value, because the documented behaviour fires
 /// them before it returns 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connected {
@@ -300,7 +300,7 @@ pub struct Traffic {
     pub down: u64,
 }
 
-/// The shipped file-scope state of the member: the `bss$2` list, its two per-protocol ephemeral port
+/// The reference file-scope state of the member: the `bss$2` list, its two per-protocol ephemeral port
 /// counters, and the order the scans walk in. Owned by one `Runtime`, never global — a second emulator
 /// run must not see the first one's sockets, and cannot inherit its port counter.
 #[derive(Debug, Default)]
@@ -501,7 +501,7 @@ impl Manager {
         if slot == self.slots.len() {
             self.slots.push(None);
         }
-        // The one reference the constructor establishes lives where the shipped body puts it — `[+4]`
+        // The one reference the constructor establishes lives where the documented behaviour puts it — `[+4]`
         // of the record, which is the word the host's object layer counts — so the model stores none.
         self.slots[slot] = Some(Record {
             owner,
@@ -664,7 +664,7 @@ impl Manager {
         Done::ok()
     }
 
-    /// A refusal that still lands in `[+180]` — the shipped bodies write the errno before returning in
+    /// A refusal that still lands in `[+180]` — the platform's own routines write the errno before returning in
     /// every case, including the pointer gates.
     fn touch(&mut self, slot: usize, error: u32) {
         let mut record = self.take(slot);
@@ -1011,7 +1011,7 @@ impl Manager {
             fires: Vec::new(),
             released: Vec::new(),
         };
-        // `if (peer != 0 && held_now + taken == 512) EventOccurred(peer, WRITE)`: the shipped condition
+        // `if (peer != 0 && held_now + taken == 512) EventOccurred(peer, WRITE)`: the reference condition
         // is about the ring having been **full** when this read ran, not about it being empty now — a
         // partial drain of a full ring still wakes the writer, and a full drain of a short one does not.
         if let Some(peer) = peer {
@@ -1419,9 +1419,9 @@ impl Manager {
         done
     }
 
-    /// Take a chain out of the record, in the order the shipped `EventOccurred` walks it.
+    /// Take a chain out of the record, in the order the reference `EventOccurred` walks it.
     ///
-    /// ⚠ **This is where the host deliberately stops following the body.** The shipped walk is
+    /// ⚠ **This is where the host deliberately stops following the body.** The reference walk is
     /// `for (i = head; i != 0; i = head)` — it re-reads the head **after** each resume, so a callback whose
     /// own notify re-arms it is fired again by the same event, and one that re-arms unconditionally never
     /// leaves the loop. Draining first means one event fires each parked callback once. Kept as a
@@ -1446,10 +1446,10 @@ impl Manager {
         }
     }
 
-    /// Whether a block is armed on either list — the same question the shipped hook answers by reading
+    /// Whether a block is armed on either list — the same question the reference hook answers by reading
     /// `block[+8]`, which is only an address once a registration has written one.
     ///
-    /// A block lives on at most one list, because [`Manager::arm`] cancels before it re-arms; the shipped
+    /// A block lives on at most one list, because [`Manager::arm`] cancels before it re-arms; the reference
     /// hook unlinks the chain named inside the block, and this host keeps the membership on its own side,
     /// so the question has to be asked of both lists.
     pub fn armed(&self, slot: usize, entry: usize) -> bool {
@@ -1943,7 +1943,7 @@ pub enum Accept2 {
     /// The server-side socket to hand the caller. The body returns 0 from this branch without writing
     /// `[+180]`, so whatever the previous refusal left there is still what `GetLastError` reports.
     Taken(usize),
-    /// -2 with `EWOULDBLOCK`, the shipped empty-queue answer.
+    /// -2 with `EWOULDBLOCK`, the reference empty-queue answer.
     Blocked(Done),
     /// -1 with the errno in the record.
     Refused(Done),
@@ -1963,7 +1963,7 @@ pub enum Send {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
-    /// `pcb[+16]` was zero: the shipped body touches nothing at all.
+    /// `pcb[+16]` was zero: the documented behaviour touches nothing at all.
     Ignored,
     /// The predicate already says yes, so the body resumes the callback instead of parking it.
     Resume,
